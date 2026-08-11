@@ -1,0 +1,68 @@
+name: pgmigrate-e2e
+
+services:
+  source:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_slot_wal_keep_size=1GB
+      - -c
+      - track_commit_timestamp=on
+    ports:
+      - "${SOURCE_PORT:-55432}:5432"
+    volumes:
+      - source-data:/var/lib/postgresql/data
+      - ./docker/source-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app && psql -U app -d app -Atqc 'SELECT 1 FROM e2e.seed_metadata'"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    stop_grace_period: 10s
+
+  target:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+    ports:
+      - "${TARGET_PORT:-55433}:5432"
+    volumes:
+      - target-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    stop_grace_period: 10s
+
+  traffic:
+    image: postgres:17
+    environment:
+      PGCONNECT_TIMEOUT: "5"
+      SOURCE_URL: postgres://app:app@source:5432/app
+      TRAFFIC_INTERVAL: "${TRAFFIC_INTERVAL:-0.10}"
+    depends_on:
+      source:
+        condition: service_healthy
+    volumes:
+      - ./scripts:/e2e/scripts:ro
+    entrypoint: ["/e2e/scripts/traffic.sh"]
+    restart: unless-stopped
+    stop_grace_period: 5s
+
+volumes:
+  source-data:
+  target-data:

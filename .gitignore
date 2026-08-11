@@ -1,0 +1,26 @@
+# Build and test output
+/bin/
+/dist/
+/pgmigrate
+*.test
+*.out
+coverage.*
+*.prof
+*.pprof
+
+# Go workspace files, which are always local to one checkout
+go.work
+go.work.sum
+
+# Local migration state. A state directory is wherever --dir points, so this
+# only covers the conventional location; the e2e scripts stage theirs in TMPDIR.
+/migration/
+*.db-wal
+*.db-shm
+
+# Local environment and editor state
+.env
+.env.*
+.DS_Store
+.idea/
+.vscode/
