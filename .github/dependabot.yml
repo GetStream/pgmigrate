@@ -1,0 +1,15 @@
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    # One PR for the graph, not one per CVE. A Go 1.25 floor change still
+    # wants a human, so majors stay ungrouped.
+    groups:
+      go-modules:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
