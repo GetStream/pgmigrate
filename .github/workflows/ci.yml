@@ -10,12 +10,12 @@ permissions:
 
 jobs:
   test:
-    name: fmt, vet, test, race
+    name: fmt, vet, govulncheck, test, race
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       # The version go.mod declares, rather than the latest, because that is the
-      # one the README promises works.
+      # one the README promises works. The toolchain line is the patched stdlib.
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
@@ -28,6 +28,10 @@ jobs:
             exit 1
           fi
       - run: make vet
+      # Reachability, not Dependabot's module list: the released binary, not the
+      # integration-tagged testcontainers graph.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./cmd/pgmigrate ./internal/...
       # Compiles the integration-tagged files without running them; those and the
       # Compose end-to-end suites need PostgreSQL and are run by hand.
       - run: make test

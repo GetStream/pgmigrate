@@ -202,7 +202,7 @@ against.
 
 ## Installing pgmigrate
 
-With Go 1.23 or newer, from a checkout:
+With Go 1.25 or newer, from a checkout:
 
 ```bash
 $ go build -o pgmigrate ./cmd/pgmigrate
