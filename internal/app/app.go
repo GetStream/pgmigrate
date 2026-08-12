@@ -183,7 +183,7 @@ func (a App) Preflight(ctx context.Context, cfg config.Config) error {
 		RequiredExtensions:  preflightSelection.Extensions,
 		AcknowledgeWarnings: cfg.AckWarnings, AllowCollationChange: cfg.AllowCollationChange,
 		PGDumpPath: cfg.PGDumpPath, PGRestorePath: cfg.PGRestorePath,
-		WALSampleDuration: cfg.WALSampleDuration,
+		SequenceOffset: cfg.SequenceOffset, WALSampleDuration: cfg.WALSampleDuration,
 	}
 	if err := applyTuningPreflight(cfg, &preflightConfig); err != nil {
 		return err
@@ -402,7 +402,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		SourceDSN: cfg.Source, TargetDSN: cfg.Target, Tables: toPreflight(tables),
 		AcknowledgeWarnings: cfg.AckWarnings, AllowCollationChange: cfg.AllowCollationChange,
 		PGDumpPath: cfg.PGDumpPath, PGRestorePath: cfg.PGRestorePath,
-		WALSampleDuration: cfg.WALSampleDuration,
+		SequenceOffset: cfg.SequenceOffset, WALSampleDuration: cfg.WALSampleDuration,
 	}
 	if err := applyTuningPreflight(cfg, &preflightConfig); err != nil {
 		return err
@@ -2184,6 +2184,45 @@ func (a App) Verify(ctx context.Context, cfg config.Config) error {
 	return nil
 }
 
+// Sequences advances the target's sequences without cutting over, so the target
+// can accept writes while the source still holds the traffic. Cutover runs the
+// same step again against the source's final values.
+func (a App) Sequences(ctx context.Context, cfg config.Config) error {
+	if cfg.SequenceOffset < 0 {
+		return errors.New("sequence offset must not be negative")
+	}
+	store, err := state.OpenControl(ctx, cfg.Dir)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	if err := validateTargetIdentity(ctx, cfg, store); err != nil {
+		return err
+	}
+	migration, err := store.Migration(ctx)
+	if err != nil {
+		return err
+	}
+	switch migration.Phase {
+	case state.PhaseFollow, state.PhaseDrained, state.PhaseCutover, state.PhaseComplete:
+	default:
+		return fmt.Errorf("sequences requires follow phase or later, current phase is %s", migration.Phase)
+	}
+	schemaSelection, err := loadSchemaSelection(ctx, store)
+	if err != nil {
+		return err
+	}
+	selected := make([]cutover.Sequence, len(schemaSelection.DependentRelations))
+	for i, sequence := range schemaSelection.DependentRelations {
+		selected[i] = cutover.Sequence{Schema: sequence.Schema, Name: sequence.Name}
+	}
+	results, err := cutover.SynchronizeSequences(ctx, connector(cfg.Source), connector(cfg.Target), cfg.SequenceOffset, selected)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(a.output()).Encode(results)
+}
+
 func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 	store, err := state.OpenControl(ctx, cfg.Dir)
 	if err != nil {
@@ -2254,8 +2293,9 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 	}
 	report, err := cutover.Run(ctx, cutover.Config{
 		Source: connector(cfg.Source), Target: connector(cfg.Target), State: store, Dir: cfg.Dir,
-		WaitDrain: waitDrain,
-		Sequences: selectedSequences,
+		WaitDrain:      waitDrain,
+		Sequences:      selectedSequences,
+		SequenceOffset: cfg.SequenceOffset,
 		EmitBoundary: func(ctx context.Context) (string, error) {
 			conn, err := pgx.Connect(ctx, cfg.Source)
 			if err != nil {

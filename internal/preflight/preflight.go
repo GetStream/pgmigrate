@@ -74,6 +74,10 @@ type Config struct {
 	AllowCollationChange bool
 	PGDumpPath           string
 	PGRestorePath        string
+	// SequenceOffset is how far past the source's values the cutover will set the
+	// target's sequences, which is the room each one has to have left for that to
+	// be possible at all.
+	SequenceOffset int64
 	// WALSampleDuration controls the WAL-rate sample. Zero uses one minute.
 	WALSampleDuration time.Duration
 	// WALRetentionDuration is the period of generated WAL that must fit within
@@ -149,6 +153,9 @@ func RunConnections(ctx context.Context, source, target *pgx.Conn, cfg Config) (
 	})
 	runCheck(add, "replica-identity", func() ([]Finding, error) {
 		return checkReplicaIdentity(ctx, source, cfg.Tables)
+	})
+	runCheck(add, "source-sequences", func() ([]Finding, error) {
+		return checkSequences(ctx, source, cfg.Tables, cfg.SequenceOffset)
 	})
 	runCheck(add, "target-empty", func() ([]Finding, error) {
 		return checkTargetEmpty(ctx, target)
@@ -443,6 +450,146 @@ func replicaIdentityFindings(relations []replident.Relation) []Finding {
 					"unique non-partial index over NOT NULL columns with REPLICA IDENTITY USING INDEX, "+
 					"avoids that",
 				relation.Describe(), relation.Reason(),
+			),
+		})
+	}
+	return findings
+}
+
+// sequenceHeadroomWarning is the room a sequence has to have left before
+// preflight stops mentioning it. It is generous on purpose: the number that
+// matters is how many values the application will consume between now and the
+// moment traffic moves, nobody knows that in advance, and a sequence with ten
+// million values left is one an operator should have heard about while there was
+// still time to widen it.
+const sequenceHeadroomWarning = 10_000_000
+
+// sequenceState is one source sequence a selected table owns or draws its column
+// default from, which is exactly the set the cutover advances.
+type sequenceState struct {
+	OID       uint32
+	Schema    string
+	Name      string
+	Current   int64
+	Min       int64
+	Max       int64
+	Increment int64
+	Cycles    bool
+}
+
+func (s sequenceState) descending() bool { return s.Increment < 0 }
+
+// headroom is how many values the sequence can still hand out before it reaches
+// the bound it moves toward. The arithmetic is unsigned because sequence bounds
+// span the whole of int64: a sequence sitting at a large negative value under a
+// large positive maximum has room to spare, and the signed subtraction of the two
+// would overflow and report it as exhausted.
+func (s sequenceState) headroom() uint64 {
+	if s.descending() {
+		if s.Current <= s.Min {
+			return 0
+		}
+		return uint64(s.Current) - uint64(s.Min)
+	}
+	if s.Current >= s.Max {
+		return 0
+	}
+	return uint64(s.Max) - uint64(s.Current)
+}
+
+func checkSequences(ctx context.Context, conn *pgx.Conn, tables []Table, offset int64) ([]Finding, error) {
+	oids := make([]uint32, len(tables))
+	for i, table := range tables {
+		oids[i] = table.OID
+	}
+	// The dependency predicate is the one the run uses to build the dump
+	// selection, so this reports on the sequences the cutover will actually set.
+	// last_value is null for a sequence never read from, whose next value is its
+	// start, and for one the migration role cannot read, where the start is the
+	// best available guess and the privilege checks report the real problem.
+	rows, err := conn.Query(ctx, `
+		SELECT c.oid, s.schemaname, s.sequencename, COALESCE(s.last_value, s.start_value),
+		       s.min_value, s.max_value, s.increment_by, s.cycle
+		FROM pg_catalog.pg_sequences s
+		JOIN pg_catalog.pg_namespace n ON n.nspname=s.schemaname
+		JOIN pg_catalog.pg_class c ON c.relnamespace=n.oid AND c.relname=s.sequencename AND c.relkind='S'
+		WHERE EXISTS (
+			SELECT 1 FROM pg_catalog.pg_depend d
+			WHERE d.classid='pg_catalog.pg_class'::regclass AND d.objid=c.oid
+			  AND d.refclassid='pg_catalog.pg_class'::regclass AND d.refobjid=ANY($1::oid[])
+		) OR EXISTS (
+			SELECT 1 FROM pg_catalog.pg_attrdef ad
+			JOIN pg_catalog.pg_depend d
+			  ON d.classid='pg_catalog.pg_attrdef'::regclass AND d.objid=ad.oid
+			WHERE ad.adrelid=ANY($1::oid[])
+			  AND d.refclassid='pg_catalog.pg_class'::regclass AND d.refobjid=c.oid
+		)
+		ORDER BY s.schemaname,s.sequencename`, oids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var sequences []sequenceState
+	for rows.Next() {
+		var sequence sequenceState
+		if err := rows.Scan(&sequence.OID, &sequence.Schema, &sequence.Name, &sequence.Current,
+			&sequence.Min, &sequence.Max, &sequence.Increment, &sequence.Cycles); err != nil {
+			return nil, err
+		}
+		sequences = append(sequences, sequence)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return sequenceFindings(sequences, offset), nil
+}
+
+// sequenceFindings reports every sequence too close to exhaustion for the cutover
+// to leave the source room to keep allocating.
+//
+// The severity split follows what PostgreSQL will do. A sequence with less room
+// left than the offset is an error: setval rejects a value past the bound, so the
+// cutover would fail at its sequence step no matter how willing the operator is.
+// Anything else short of the threshold is a warning, because how much room is
+// enough depends on how fast the application allocates and how long the source
+// keeps serving, which only the operator knows.
+func sequenceFindings(sequences []sequenceState, offset int64) []Finding {
+	var findings []Finding
+	for _, sequence := range sequences {
+		room := sequence.headroom()
+		blocks := offset > 0 && room < uint64(offset)
+		if !blocks && room >= sequenceHeadroomWarning {
+			continue
+		}
+		qualified := fmt.Sprintf("%s.%s", sequence.Schema, sequence.Name)
+		bound, wrap := fmt.Sprintf("maximum %d", sequence.Max), sequence.Min
+		if sequence.descending() {
+			bound, wrap = fmt.Sprintf("minimum %d", sequence.Min), sequence.Max
+		}
+		cycles := ""
+		if sequence.Cycles {
+			cycles = fmt.Sprintf(" It cycles, so rather than failing there it wraps to %d and hands "+
+				"out values the target already has.", wrap)
+		}
+		id := fmt.Sprintf("sequence-%d-headroom", sequence.OID)
+		if blocks {
+			findings = append(findings, errorFinding(id, "sequence", fmt.Sprintf(
+				"%s has %d values left before its %s, fewer than the %d pgmigrate sets the target's "+
+					"copy ahead by, so setval would be rejected and the cutover would fail at its "+
+					"sequence step.%s Lower --sequence-offset below what is left, or give the sequence "+
+					"room with ALTER SEQUENCE, widening the column to bigint where the type is the limit",
+				qualified, room, bound, offset, cycles,
+			)))
+			continue
+		}
+		findings = append(findings, Finding{
+			ID: id, Kind: "sequence", Severity: SeverityWarning,
+			Message: fmt.Sprintf(
+				"%s has %d values left before its %s. pgmigrate sets the target's copy %d past the "+
+					"source's while the source keeps allocating from where it is, so what is left has to "+
+					"cover both until traffic moves.%s Widen it with ALTER SEQUENCE, lower "+
+					"--sequence-offset, or acknowledge this with --ack-warnings",
+				qualified, room, bound, offset, cycles,
 			),
 		})
 	}

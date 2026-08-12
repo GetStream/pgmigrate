@@ -2,6 +2,7 @@ package preflight
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -341,6 +342,90 @@ func TestReplicaIdentityFindingsNoLongerOfferTheRemovedFlag(t *testing.T) {
 		if strings.Contains(finding.Message, "force-replica-identity-full") {
 			t.Errorf("%s still points at the removed flag: %q", finding.ID, finding.Message)
 		}
+	}
+}
+
+// TestSequenceFindingsReportWhatIsLeftBeforeExhaustion pins the severity split.
+// A sequence that cannot fit the offset is an error because setval will refuse
+// the value, and one merely running low is a warning because only the operator
+// knows how fast the application allocates.
+func TestSequenceFindingsReportWhatIsLeftBeforeExhaustion(t *testing.T) {
+	const offset = 1_000_000
+	findings := sequenceFindings([]sequenceState{
+		{OID: 1, Schema: "app", Name: "roomy", Current: 1000, Max: 1 << 62, Increment: 1},
+		{OID: 2, Schema: "app", Name: "low", Current: 2_000_000, Max: 6_000_000, Increment: 1},
+		{OID: 3, Schema: "app", Name: "serial4", Current: 2_147_000_000, Max: 2_147_483_647, Increment: 1},
+		{OID: 4, Schema: "app", Name: "descending", Current: -90, Min: -1000, Max: -1, Increment: -1},
+		{OID: 5, Schema: "app", Name: "cycling", Current: 900, Min: 1, Max: 1000, Increment: 1, Cycles: true},
+	}, offset)
+	byID := make(map[string]Finding, len(findings))
+	for _, finding := range findings {
+		byID[finding.ID] = finding
+	}
+	if len(findings) != 4 {
+		t.Fatalf("findings = %+v, want one per sequence short of room only", findings)
+	}
+	if _, reported := byID["sequence-1-headroom"]; reported {
+		t.Error("a sequence with 2^62 values left was reported")
+	}
+
+	low := byID["sequence-2-headroom"]
+	if low.Severity != SeverityWarning || low.Kind != "sequence" {
+		t.Fatalf("low finding = %+v, want a sequence warning --ack-warnings can consent to", low)
+	}
+	// The operator decides by the numbers: what is left, what the bump needs, and
+	// which knob moves which.
+	for _, want := range []string{
+		"app.low", "4000000 values left", "maximum 6000000", "1000000 past", "--sequence-offset",
+		"--ack-warnings", "ALTER SEQUENCE",
+	} {
+		if !strings.Contains(low.Message, want) {
+			t.Errorf("warning omits %q:\n%s", want, low.Message)
+		}
+	}
+
+	exhausted := byID["sequence-3-headroom"]
+	if exhausted.Severity != SeverityError {
+		t.Fatalf("severity with less room than the offset = %q, want error: setval would be rejected",
+			exhausted.Severity)
+	}
+	for _, want := range []string{"483647 values left", "setval would be rejected", "bigint"} {
+		if !strings.Contains(exhausted.Message, want) {
+			t.Errorf("error omits %q:\n%s", want, exhausted.Message)
+		}
+	}
+
+	// A descending sequence runs out at its minimum, and the offset it is set by
+	// is negative, so the room that matters is below it rather than above.
+	descending := byID["sequence-4-headroom"]
+	if descending.Severity != SeverityError ||
+		!strings.Contains(descending.Message, "910 values left before its minimum -1000") {
+		t.Errorf("descending finding = %+v", descending)
+	}
+
+	if cycling := byID["sequence-5-headroom"].Message; !strings.Contains(cycling, "wraps to 1") {
+		t.Errorf("cycling message does not say it hands out values again:\n%s", cycling)
+	}
+}
+
+// TestSequenceHeadroomSpansTheWholeOfInt64 covers the bounds a signed
+// subtraction cannot: the difference between them overflows int64 and would
+// report a sequence with every value still available as exhausted.
+func TestSequenceHeadroomSpansTheWholeOfInt64(t *testing.T) {
+	widest := sequenceState{Current: math.MinInt64, Min: math.MinInt64, Max: math.MaxInt64, Increment: 1}
+	if room := widest.headroom(); room != math.MaxUint64 {
+		t.Errorf("headroom() = %d, want %d", room, uint64(math.MaxUint64))
+	}
+	if findings := sequenceFindings([]sequenceState{widest}, math.MaxInt64); len(findings) != 0 {
+		t.Errorf("findings = %+v, want none for a sequence at its minimum with all of int64 left", findings)
+	}
+	spent := sequenceState{Current: math.MaxInt64, Max: math.MaxInt64, Increment: 1}
+	if room := spent.headroom(); room != 0 {
+		t.Errorf("exhausted headroom() = %d, want 0", room)
+	}
+	descended := sequenceState{Current: math.MinInt64, Min: math.MinInt64, Increment: -1}
+	if room := descended.headroom(); room != 0 {
+		t.Errorf("exhausted descending headroom() = %d, want 0", room)
 	}
 }
 

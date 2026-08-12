@@ -35,6 +35,7 @@ type Config struct {
 	StatusWatch            time.Duration
 	NoCleanup              bool
 	EndPosition            string
+	SequenceOffset         int64
 	WALSampleDuration      time.Duration
 	SegmentPruneInterval   time.Duration
 	RetryBaseCopy          bool
@@ -118,6 +119,7 @@ func FromEnvironment() Config {
 		RestoreJobs:          max(1, runtime.NumCPU()/2),
 		WALSampleDuration:    time.Minute,
 		SegmentPruneInterval: time.Minute,
+		SequenceOffset:       1_000_000,
 
 		VerifyWorkers:         1,
 		VerifySampleRows:      1_000_000,
