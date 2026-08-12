@@ -2271,6 +2271,7 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 		Cleanup: func(ctx context.Context) error {
 			return cleanupAfterCutover(ctx, cfg, store, snapshot, sourceTables)
 		},
+		ToolVersion: Version(),
 		AuditConfig: map[string]string{"workers": strconv.Itoa(cfg.Workers)},
 	})
 	if err != nil {

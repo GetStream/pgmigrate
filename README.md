@@ -173,6 +173,7 @@ step log trimmed:
 ```json
 {
   "version": 1,
+  "tool_version": "v0.1.0",
   "completed_at": "2026-08-11T07:40:10.07482Z",
   "end_position": "0/1BE9D08",
   "sequences": [
@@ -183,9 +184,11 @@ step log trimmed:
 }
 ```
 
-`end_position` is the boundary the target was drained through, and it is the line
-between what this migration carried and what it did not: anything the source wrote
-after it stayed behind. `sequences` records that `order_id_seq` was left 1000 ahead
+`tool_version` is the build that ran the cutover: a released binary names its
+version, and one built from a checkout names the commit it came from and whether
+that tree was clean. `end_position` is the boundary the target was drained
+through, and it is the line between what this migration carried and what it did
+not: anything the source wrote after it stayed behind. `sequences` records that `order_id_seq` was left 1000 ahead
 of the source, so the application cannot collide with an existing key. `steps` is
 the durable log the cutover resumed against.
 
