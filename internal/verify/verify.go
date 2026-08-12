@@ -592,30 +592,6 @@ func (r Result) Coverage() float64 {
 	return coverage
 }
 
-// SampledFraction is the share of the rows in the tables that were checked that
-// were actually compared.
-//
-// Tables with no key are left out on both sides of the ratio. They were not
-// compared and their own coverage is zero, but folding that into one number would
-// report a run as having sampled nothing because one unverifiable table existed,
-// which is a different and much worse claim.
-func (r Result) SampledFraction() float64 {
-	var sampled, estimated int64
-	for _, table := range r.Tables {
-		if !table.Table.Key.present() {
-			continue
-		}
-		sampled += table.Source.Rows
-		// reltuples is an estimate, and on a table nobody has analyzed it is zero.
-		// Reading fewer rows than were read is not a denominator.
-		estimated += max(table.Source.Estimated, table.Source.Rows)
-	}
-	if estimated <= 0 {
-		return 1
-	}
-	return min(float64(sampled)/float64(estimated), 1)
-}
-
 // CDCKeys and CDCObserved are how many applier-recorded rows the run checked and
 // how many changes the applier saw. They are reported next to the sampled figures
 // and never merged with them: one says the base copy landed, the other says

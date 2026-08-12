@@ -228,40 +228,6 @@ func TestResultReportsTheWorstTableNotTheAverage(t *testing.T) {
 	}
 }
 
-// TestSampledFractionIgnoresTablesThatCouldNotBeChecked pins the number the cutover
-// report quotes. A keyless table has zero coverage of its own, but folding that into
-// the run's fraction would report a whole migration as having sampled nothing
-// because one unverifiable table existed.
-func TestSampledFractionIgnoresTablesThatCouldNotBeChecked(t *testing.T) {
-	t.Parallel()
-	keyed := Key{Columns: []KeyColumn{{Name: "id"}}, Primary: true}
-	result := Result{Tables: []TableResult{
-		{
-			Table: Table{Schema: "s", Name: "big", Key: keyed}, Coverage: 0.01,
-			Source: SourceResult{Rows: 1000, Estimated: 100_000},
-		},
-		{
-			Table: Table{Schema: "s", Name: "small", Key: keyed}, Coverage: 1,
-			Source: SourceResult{Rows: 900, Estimated: 900},
-		},
-		{Table: Table{Schema: "s", Name: "keyless", Keyless: "no primary key"}, Coverage: 0},
-	}}
-	if got, want := result.SampledFraction(), 1900.0/100_900.0; got != want {
-		t.Fatalf("SampledFraction() = %v, want %v", got, want)
-	}
-	// An unanalyzed table estimates no rows at all, which must not read as coverage
-	// above one.
-	unanalyzed := Result{Tables: []TableResult{
-		{
-			Table:  Table{Schema: "s", Name: "fresh", Key: keyed},
-			Source: SourceResult{Rows: 40, Estimated: 0},
-		},
-	}}
-	if got := unanalyzed.SampledFraction(); got != 1 {
-		t.Fatalf("SampledFraction() = %v, want 1", got)
-	}
-}
-
 func TestChooseKeyPrefersThePrimaryKeyThenTheNarrowestNotNullUnique(t *testing.T) {
 	t.Parallel()
 	key, keyless, err := chooseKey(context.Background(), keyLadder{

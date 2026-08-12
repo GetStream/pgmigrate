@@ -35,7 +35,6 @@ type Config struct {
 	StatusWatch            time.Duration
 	NoCleanup              bool
 	EndPosition            string
-	SkipWriteCheck         bool
 	WALSampleDuration      time.Duration
 	SegmentPruneInterval   time.Duration
 	RetryBaseCopy          bool

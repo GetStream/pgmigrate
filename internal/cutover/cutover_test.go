@@ -9,13 +9,13 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/tgross/pgmigrate/internal/state"
-	"github.com/tgross/pgmigrate/internal/verify"
 )
 
 type resumeState struct {
-	mu         sync.Mutex
-	steps      map[string]bool
-	failReport bool
+	mu          sync.Mutex
+	steps       map[string]bool
+	endPosition string
+	failReport  bool
 }
 
 func (s *resumeState) StepCompleted(_ context.Context, name string) (bool, error) {
@@ -35,9 +35,17 @@ func (s *resumeState) CompleteStep(_ context.Context, name, _ string) error {
 	return nil
 }
 
-func (*resumeState) SetEndPosition(context.Context, string) error { return nil }
-func (*resumeState) Migration(context.Context) (state.Migration, error) {
-	return state.Migration{EndPosition: "0/123"}, nil
+func (s *resumeState) SetEndPosition(_ context.Context, position string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.endPosition = position
+	return nil
+}
+
+func (s *resumeState) Migration(context.Context) (state.Migration, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return state.Migration{EndPosition: s.endPosition}, nil
 }
 
 func (s *resumeState) ListSteps(context.Context) ([]state.Step, error) {
@@ -53,10 +61,10 @@ func (s *resumeState) ListSteps(context.Context) ([]state.Step, error) {
 func TestReportResumesAfterMarkerFailure(t *testing.T) {
 	t.Parallel()
 	steps := map[string]bool{
-		stepWriteCheck: true, stepEndPosition: true, stepDrain: true,
-		stepVerify: true, stepSequences: true, stepCleanup: true,
+		stepEndPosition: true, stepDrain: true,
+		stepSequences: true, stepCleanup: true,
 	}
-	store := &resumeState{steps: steps, failReport: true}
+	store := &resumeState{steps: steps, endPosition: "0/123", failReport: true}
 	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
 	connector := func(context.Context) (*pgx.Conn, error) {
 		t.Fatal("completed step unexpectedly opened PostgreSQL")
@@ -64,17 +72,13 @@ func TestReportResumesAfterMarkerFailure(t *testing.T) {
 	}
 	cfg := Config{
 		Source: connector, Target: connector, State: store, Dir: t.TempDir(),
-		SampleActivity: func(context.Context) (ActivitySample, error) {
-			return ActivitySample{}, nil
+		EmitBoundary: func(context.Context) (string, error) {
+			t.Fatal("a recorded end position was unexpectedly emitted again")
+			return "", nil
 		},
-		ReadFlushLSN: func(context.Context) (string, error) { return "0/123", nil },
 		WaitDrain: func(context.Context, string) error {
 			t.Fatal("completed drain unexpectedly reran")
 			return nil
-		},
-		Verify: func(context.Context) (verify.Result, error) {
-			t.Fatal("completed verification unexpectedly reran")
-			return verify.Result{}, nil
 		},
 		Cleanup: func(context.Context) error {
 			t.Fatal("completed cleanup unexpectedly reran")
@@ -102,81 +106,47 @@ func TestReportResumesAfterMarkerFailure(t *testing.T) {
 	}
 }
 
-func TestResumeRerunsWriteFreezeAfterMarker(t *testing.T) {
+// The boundary is emitted once and then reused for the life of the migration.
+// A second attempt that emitted a fresh one would move the line between what
+// this cutover migrated and what it abandoned, after the target had already been
+// drained to the first.
+func TestResumeReusesTheBoundaryTheFirstAttemptEmitted(t *testing.T) {
 	t.Parallel()
-	store := &resumeState{steps: map[string]bool{}}
-	calls := 0
-	resumed := false
+	// Sequences and cleanup start marked done because they need PostgreSQL and this
+	// test is about the boundary. Nothing before them is marked, so both attempts
+	// run the end-position and drain steps for real.
+	store := &resumeState{steps: map[string]bool{stepSequences: true, stepCleanup: true}}
+	emitted := 0
+	drained := false
 	cfg := Config{
 		Source: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unexpected source connection") },
 		Target: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unexpected target connection") },
 		State:  store, Dir: t.TempDir(),
-		SampleActivity: func(context.Context) (ActivitySample, error) {
-			calls++
-			if resumed {
-				return ActivitySample{Writes: 1}, ErrWritesObserved
+		EmitBoundary: func(context.Context) (string, error) {
+			emitted++
+			return "0/500", nil
+		},
+		WaitDrain: func(context.Context, string) error {
+			if !drained {
+				return errors.New("apply has not reached the end position")
 			}
-			if calls == 2 {
-				return ActivitySample{}, errors.New("injected crash")
-			}
-			return ActivitySample{}, nil
+			return nil
 		},
-		ReadFlushLSN: func(context.Context) (string, error) { return "0/123", nil },
-		WaitDrain:    func(context.Context, string) error { return nil },
-		Verify:       func(context.Context) (verify.Result, error) { return verify.Result{Converged: true}, nil },
-		Cleanup:      func(context.Context) error { return nil },
+		Cleanup: func(context.Context) error { return nil },
 	}
-	if _, err := Run(context.Background(), cfg); err == nil || !store.steps[stepWriteCheck] {
-		t.Fatalf("first run error = %v, steps = %#v", err, store.steps)
+	if _, err := Run(context.Background(), cfg); err == nil {
+		t.Fatal("expected the first attempt to fail draining")
 	}
-	resumed = true
-	if _, err := Run(context.Background(), cfg); !errors.Is(err, ErrWritesObserved) {
-		t.Fatalf("resume error = %v, want ErrWritesObserved", err)
+	drained = true
+	report, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("resume cutover: %v", err)
 	}
-}
-
-func TestExistingEndPositionRejectsLaterSourceWAL(t *testing.T) {
-	t.Parallel()
-	store := &resumeState{steps: map[string]bool{
-		stepWriteCheck: true, stepEndPosition: true,
-	}}
-	cfg := Config{
-		Source: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unexpected source connection") },
-		Target: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unexpected target connection") },
-		State:  store, Dir: t.TempDir(),
-		SampleActivity: func(context.Context) (ActivitySample, error) {
-			return ActivitySample{}, nil
-		},
-		ReadFlushLSN: func(context.Context) (string, error) { return "0/124", nil },
-		WaitDrain:    func(context.Context, string) error { return nil },
-		Verify:       func(context.Context) (verify.Result, error) { return verify.Result{Converged: true}, nil },
-		Cleanup:      func(context.Context) error { return nil },
+	if emitted != 1 {
+		t.Errorf("the boundary was emitted %d times, want once", emitted)
 	}
-	if _, err := Run(context.Background(), cfg); !errors.Is(err, ErrWritesObserved) {
-		t.Fatalf("Run error = %v, want ErrWritesObserved", err)
-	}
-}
-
-func TestVerifierExecutionErrorIsClassifiedForFollowRecovery(t *testing.T) {
-	t.Parallel()
-	store := &resumeState{steps: map[string]bool{
-		stepWriteCheck: true, stepEndPosition: true, stepDrain: true,
-	}}
-	cfg := Config{
-		Source: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unused") },
-		Target: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unused") },
-		State:  store, Dir: t.TempDir(),
-		SampleActivity: func(context.Context) (ActivitySample, error) {
-			return ActivitySample{}, nil
-		},
-		ReadFlushLSN: func(context.Context) (string, error) { return "0/123", nil },
-		WaitDrain:    func(context.Context, string) error { return nil },
-		Verify:       func(context.Context) (verify.Result, error) { return verify.Result{}, errors.New("query timeout") },
-		Cleanup:      func(context.Context) error { return nil },
-	}
-	_, err := Run(context.Background(), cfg)
-	if !errors.Is(err, ErrVerificationExecution) {
-		t.Fatalf("error = %v, want ErrVerificationExecution", err)
+	if report.EndPosition != "0/500" {
+		t.Errorf("end position = %q, want the emitted 0/500", report.EndPosition)
 	}
 }
 
@@ -199,10 +169,10 @@ func (s *phaseStore) TransitionPhase(_ context.Context, phase state.Phase) error
 func TestLifecycleTransitionsAndReportConfiguration(t *testing.T) {
 	t.Parallel()
 	store := &phaseStore{
-		resumeState: resumeState{steps: map[string]bool{
-			stepWriteCheck: true, stepEndPosition: true,
-			stepSequences: true, stepCleanup: true,
-		}},
+		resumeState: resumeState{
+			steps:       map[string]bool{stepEndPosition: true, stepSequences: true, stepCleanup: true},
+			endPosition: "0/123",
+		},
 		phase: state.PhaseFollow,
 	}
 	cfg := Config{
@@ -210,13 +180,8 @@ func TestLifecycleTransitionsAndReportConfiguration(t *testing.T) {
 		Target: func(context.Context) (*pgx.Conn, error) { return nil, errors.New("unexpected target connection") },
 		State:  store, Dir: t.TempDir(), ToolVersion: "test-version",
 		AuditConfig: map[string]string{"profile": "safe"},
-		SampleActivity: func(context.Context) (ActivitySample, error) {
-			return ActivitySample{}, nil
-		},
-		ReadFlushLSN: func(context.Context) (string, error) { return "0/123", nil },
-		WaitDrain:    func(context.Context, string) error { return nil },
-		Verify:       func(context.Context) (verify.Result, error) { return verify.Result{Converged: true}, nil },
-		Cleanup:      func(context.Context) error { return nil },
+		WaitDrain:   func(context.Context, string) error { return nil },
+		Cleanup:     func(context.Context) error { return nil },
 	}
 	report, err := Run(context.Background(), cfg)
 	if err != nil {

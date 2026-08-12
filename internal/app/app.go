@@ -2254,7 +2254,7 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 	}
 	report, err := cutover.Run(ctx, cutover.Config{
 		Source: connector(cfg.Source), Target: connector(cfg.Target), State: store, Dir: cfg.Dir,
-		AllowWrites: cfg.SkipWriteCheck, WaitDrain: waitDrain,
+		WaitDrain: waitDrain,
 		Sequences: selectedSequences,
 		EmitBoundary: func(ctx context.Context) (string, error) {
 			conn, err := pgx.Connect(ctx, cfg.Source)
@@ -2268,23 +2268,12 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 				cdc.CutoverMessagePrefix, migrationID(cfg.Dir)).Scan(&lsn)
 			return lsn, err
 		},
-		Verify: func(ctx context.Context) (verify.Result, error) {
-			return verification(ctx, cfg, store, a.progressOutput())
-		},
 		Cleanup: func(ctx context.Context) error {
 			return cleanupAfterCutover(ctx, cfg, store, snapshot, sourceTables)
 		},
 		AuditConfig: map[string]string{"workers": strconv.Itoa(cfg.Workers)},
 	})
 	if err != nil {
-		if errors.Is(err, cutover.ErrVerificationFailed) || errors.Is(err, cutover.ErrVerificationExecution) {
-			if recoveryErr := store.RecoverCutover(ctx); recoveryErr != nil {
-				return errors.Join(err, recoveryErr)
-			}
-			if recoveryErr := waitSlotActive(ctx, cfg.Source, snapshot.Slot); recoveryErr != nil {
-				return errors.Join(err, recoveryErr)
-			}
-		}
 		return err
 	}
 	return json.NewEncoder(a.output()).Encode(report)
@@ -2339,32 +2328,6 @@ func waitSlotInactive(ctx context.Context, sourceDSN, slot string) error {
 			"SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name=$1", slot).Scan(&active)
 		conn.Close(context.Background())
 		if errors.Is(err, pgx.ErrNoRows) || err == nil && !active {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		timer := time.NewTimer(100 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
-func waitSlotActive(ctx context.Context, sourceDSN, slot string) error {
-	for {
-		conn, err := pgx.Connect(ctx, sourceDSN)
-		if err != nil {
-			return err
-		}
-		var active bool
-		err = conn.QueryRow(ctx,
-			"SELECT active FROM pg_catalog.pg_replication_slots WHERE slot_name=$1", slot).Scan(&active)
-		conn.Close(context.Background())
-		if err == nil && active {
 			return nil
 		}
 		if err != nil {

@@ -54,10 +54,11 @@ target DML commits in the same transaction as
 authoritative apply position. Finalized segments that have been applied are
 pruned every `--segment-prune-interval`, retaining one safety segment.
 
-`pgmigrate cutover` then checks that source tuple writes have stopped, emits a
-logical boundary message, drains exactly through it, verifies the two databases,
-advances target sequences with headroom, reverts what the migration changed on
-both servers, and atomically writes `cutover-report.json`.
+`pgmigrate cutover` then emits a logical boundary message, drains exactly through
+it, advances target sequences with headroom, reverts what the migration changed on
+both servers, and atomically writes `cutover-report.json`. It moves data and
+metadata and judges neither: freezing application writes and deciding the copy is
+good enough to serve are the operator's, done before it runs.
 
 ## Documentation
 
@@ -169,38 +170,28 @@ be following, because it is the process that drains the stream:
 $ pgmigrate cutover --dir ./migration
 ```
 
-Cutover prints the report it wrote to `cutover-report.json`. Formatted, and with
-the per-table verification and the step log trimmed:
+Cutover prints the report it wrote to `cutover-report.json`. Formatted, with the
+step log trimmed:
 
 ```json
 {
   "version": 1,
   "completed_at": "2026-08-11T07:40:10.07482Z",
   "end_position": "0/1BE9D08",
-  "activity": {
-    "started_at": "2026-08-11T07:40:04.507161Z",
-    "ended_at": "2026-08-11T07:40:09.513096Z",
-    "interval": 5000000000,
-    "before": 8316,
-    "after": 8316,
-    "writes": 0,
-    "overridden": false
-  },
-  "verified_fraction": 1,
   "sequences": [
     {"schema": "e2e", "name": "order_id_seq", "source_value": 1143, "target_value": 2143, "is_called": true}
   ],
-  "configuration": {"sample_interval": 5000000000, "allow_writes": false, "sequence_offset": 1000, "values": {"workers": "16"}},
-  "verification": {"tables": [], "complete": true, "converged": true},
+  "configuration": {"sequence_offset": 1000, "values": {"workers": "16"}},
   "steps": []
 }
 ```
 
-`activity` is the write-freeze check: `before` and `after` are source tuple-write
-counters sampled five seconds apart, and `writes: 0` is what allowed the cutover
-to proceed. `sequences` records that `order_id_seq` was left 1000 ahead of the
-source, so the application cannot collide with an existing key; the reasoning is
-in [docs/design-sequences.md](docs/design-sequences.md).
+`end_position` is the boundary the target was drained through, and it is the line
+between what this migration carried and what it did not: anything the source wrote
+after it stayed behind. `sequences` records that `order_id_seq` was left 1000 ahead
+of the source, so the application cannot collide with an existing key; the
+reasoning is in [docs/design-sequences.md](docs/design-sequences.md). `steps` is
+the durable log the cutover resumed against.
 
 ## Installing pgmigrate
 
@@ -313,12 +304,17 @@ standard error. A named divergence, or a table stopped early, exits non-zero.
 ### pgmigrate cutover
 
 Performs the cutover as a sequence of durably recorded steps: validate the
-target identity, check that source writes have stopped, emit and record an end
-position, wait for `run` to drain exactly through it, verify, advance sequences,
-clean up, and write the report. Re-running resumes at the first incomplete step
-and repeats the write-freeze check. It requires an active `run` in the `follow`
-phase, and prints the report as JSON when it finishes. Run against an already
-complete migration, it re-prints the stored report.
+target identity, emit and record an end position, wait for `run` to drain exactly
+through it, advance sequences, clean up, and write the report. Re-running resumes
+at the first incomplete step and reuses the recorded end position. It requires an
+active `run` in the `follow` phase, and prints the report as JSON when it
+finishes. Run against an already complete migration, it re-prints the stored
+report.
+
+**It checks nothing.** Writes made on the source after the end position are not
+migrated and nothing here will notice, so freeze application writes before running
+it. It does not verify: run `pgmigrate verify` while `run` is still following, read
+the result, and decide for yourself.
 
 | flag | default | what it does |
 |---|---|---|
@@ -326,16 +322,7 @@ complete migration, it re-prints the stored report.
 | `--source <dsn>` | `PGMIGRATE_SOURCE` | source connection string |
 | `--target <dsn>` | `PGMIGRATE_TARGET` | target connection string |
 | `--endpos <LSN>` | the boundary cutover emits | explicit inclusive end position, for advanced use. Must resolve to an exact durable transaction or boundary |
-| `--skip-write-check` | false | cut over despite observed source tuple writes. This weakens a safety gate and is recorded in the report |
 | `--no-cleanup` | false | retain the source replication objects and target migration metadata. Target tuning and target replica identities are still reverted, because the target is about to serve production |
-| `--verify-workers <n>` | `1` | as for `verify`; cutover's verification uses the same settings |
-| `--verify-sample-rows <n>` | `1000000` | as for `verify` |
-| `--verify-sample-windows <n>` | `128` | as for `verify` |
-| `--verify-batch-rows <n>` | `5000` | as for `verify` |
-| `--verify-duty-cycle <fraction>` | `1` | as for `verify` |
-| `--verify-table-timeout <duration>` | `20m` | as for `verify` |
-| `--verify-converge-timeout <duration>` | `1m` | as for `verify` |
-| `--verify-cdc-rows <n>` | `100000` | as for `verify` |
 
 ## Dependencies
 
@@ -360,7 +347,7 @@ copy, indexing, catch-up, and follow, plus temporary space for exceptionally
 large source transactions.
 
 DDL is neither replicated nor detected, so the source schema must be frozen for
-the whole run. Application writes may continue until the cutover freeze.
+the whole run. Application writes may continue until you freeze them for cutover.
 
 ## Table filters
 
@@ -622,8 +609,7 @@ database compares everything it holds.
 A table with no primary key and no `NOT NULL` unique index **cannot be checked at
 all**, because there is nothing to look its rows up on the target by. It is
 skipped with a warning naming it and reported with zero coverage. It does not fail
-the run: an unverifiable table is not evidence of a broken copy, and failing over
-it would block cutover for good rather than telling anyone anything.
+the run: an unverifiable table is not evidence of a broken copy.
 
 Two workers took a 2-vCPU production source from 16% to sustained 100% CPU in
 three minutes, so verification has its own concurrency, `--verify-workers`,
@@ -635,9 +621,12 @@ check cost little at these magnitudes: three runs over 110 tables, against
 reservoirs drawn from 12k, 52k and 93k applied changes, each took about 5m25s,
 against 7m56s for the heap sample alone before it existed.
 
-Cutover requires every table complete and converged, and records the figures and
-the sampled fraction in `cutover-report.json`. That gate catches a named
-divergence; it is not evidence that the copy is sound, because no sample can be.
+**Cutover does not run this, or consult it.** Nothing stops a cutover over a
+divergence, so the decision is yours: run `verify` while `run` is still following,
+read the result, and cut over or don't. Verification is also worth more there than
+it would be inside a cutover, because it costs no downtime and can be repeated as
+often as you like. What it can never do, wherever it runs, is prove the copy is
+sound — it samples, so it finds divergence and reports what it compared.
 
 ## Crash recovery
 
@@ -658,7 +647,9 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
   transport failures reconnect automatically; corruption, protocol errors,
   divergence, and prolonged handoff backpressure stop the run for diagnosis.
 - Cutover records each successful step and resumes at the first incomplete one,
-  while repeating the write-freeze validation.
+  reusing the end position the first attempt recorded. It never moves that
+  boundary: the target has already been drained to it, and a fresh one would
+  silently redefine what the migration carried.
 
 Cleanup validates ownership and expected object shape before removing source or
 target objects, and refuses to adopt or drop unexpected objects.
@@ -742,6 +733,10 @@ schema.
   for, cannot check a table with no primary key and no `NOT NULL` unique index at
   all, and checks the rows replication wrote as a capped sample of what the
   applier reported rather than exhaustively from the decoded stream.
+- Cutover enforces nothing. It does not check that application writes stopped and
+  does not verify the copy, so writes made after the end position are left behind
+  silently and a divergent table will not stop it. Both are the operator's to
+  establish beforehand, the second with `verify`.
 - Local microbenchmarks (`make bench`) cover in-memory and file primitives only.
   They establish no sustainable CDC rate, cutover duration, or managed-cloud
   performance.

@@ -51,7 +51,6 @@ func NewRootCommand() *cobra.Command {
 	flags.DurationVar(&cfg.StatusWatch, "watch", 0, "refresh status at this interval")
 	flags.BoolVar(&cfg.NoCleanup, "no-cleanup", false, "retain replication and target metadata")
 	flags.StringVar(&cfg.EndPosition, "endpos", "", "explicit cutover end LSN")
-	flags.BoolVar(&cfg.SkipWriteCheck, "skip-write-check", false, "allow cutover despite observed source writes")
 	flags.DurationVar(&cfg.WALSampleDuration, "wal-sample-duration", cfg.WALSampleDuration, "source WAL-rate sample duration")
 	flags.DurationVar(&cfg.SegmentPruneInterval, "segment-prune-interval", cfg.SegmentPruneInterval, "minimum interval between applied CDC segment pruning")
 	flags.BoolVar(&cfg.RetryBaseCopy, "retry-base-copy", false, "restart the base copy even though the last attempts failed the same way")

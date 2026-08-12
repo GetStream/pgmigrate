@@ -196,72 +196,14 @@ echo "apply advanced during verification: $applied_before -> $applied_after"
 
 "$E2E_DIR/scripts/pause-traffic.sh"
 
-echo "testing failed-cutover recovery"
-source_label=$(source_sql -Atqc "SELECT label FROM public.restart_fixture WHERE id=1")
-target_sql -Atqc "UPDATE public.restart_fixture SET label='injected-divergence' WHERE id=1"
-if "$binary" cutover \
-    --source "$source_url" \
-    --target "$target_url" \
-    --dir "$migration_dir" >/dev/null 2>&1; then
-    echo "cutover unexpectedly accepted injected divergence" >&2
-    exit 1
-fi
-status=$("$binary" status --dir "$migration_dir" --json)
-case "$status" in
-    *'"phase":"follow"'*|*'"phase": "follow"'*) ;;
-    *) echo "failed cutover did not recover follow phase: $status" >&2; exit 1 ;;
-esac
-target_sql -Atqc "UPDATE public.restart_fixture SET label='$source_label' WHERE id=1"
-source_sql -Atqc "UPDATE public.restart_fixture SET label=label || '-after-recovery' WHERE id=1"
-attempt=0
-while ! "$binary" verify \
-    --source "$source_url" \
-    --target "$target_url" \
-    --dir "$migration_dir" >/dev/null 2>&1; do
-    attempt=$((attempt + 1))
-    if [ "$attempt" -ge 10 ]; then
-        echo "CDC did not resume after failed cutover" >&2
-        exit 1
-    fi
-    sleep 1
-done
-target_sql -Atqc "ALTER TABLE public.restart_fixture RENAME TO restart_fixture_hidden"
-if "$binary" cutover \
-    --source "$source_url" \
-    --target "$target_url" \
-    --dir "$migration_dir" >/dev/null 2>&1; then
-    echo "cutover unexpectedly accepted verifier execution failure" >&2
-    exit 1
-fi
-status=$("$binary" status --dir "$migration_dir" --json)
-case "$status" in
-    *'"phase":"follow"'*|*'"phase": "follow"'*) ;;
-    *) echo "verifier error did not recover follow phase: $status" >&2; exit 1 ;;
-esac
-target_sql -Atqc "ALTER TABLE public.restart_fixture_hidden RENAME TO restart_fixture"
-source_sql -Atqc "UPDATE public.restart_fixture SET label=label || '-after-verify-error' WHERE id=1"
-attempt=0
-while ! "$binary" verify \
-    --source "$source_url" \
-    --target "$target_url" \
-    --dir "$migration_dir" >/dev/null 2>&1; do
-    attempt=$((attempt + 1))
-    if [ "$attempt" -ge 10 ]; then
-        echo "CDC did not resume after verifier execution failure" >&2
-        exit 1
-    fi
-    sleep 1
-done
-
-echo "running live verification"
+# Verification is the operator's decision to make before cutting over, and this is
+# where the fixture makes it: cutover itself checks nothing, so a divergence found
+# here is the only thing standing between a bad copy and production.
+echo "running verification before cutover"
 "$binary" verify \
     --source "$source_url" \
     --target "$target_url" \
     --dir "$migration_dir" >/dev/null
-# PostgreSQL may publish the final short-lived psql backend's cumulative tuple
-# counters asynchronously. Let that publication settle before sampling the
-# write-freeze baseline; the cutover gate itself remains unchanged.
-sleep 5
 
 "$binary" cutover \
     --source "$source_url" \

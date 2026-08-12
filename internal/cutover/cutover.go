@@ -12,17 +12,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/tgross/pgmigrate/internal/state"
-	"github.com/tgross/pgmigrate/internal/verify"
 )
 
 const (
-	stepWriteCheck  = "cutover.write_check"
 	stepEndPosition = "cutover.end_position"
 	stepDrain       = "cutover.drain"
-	stepVerify      = "cutover.verify"
 	stepSequences   = "cutover.sequences"
 	stepCleanup     = "cutover.cleanup"
 	stepReport      = "cutover.report"
@@ -42,17 +38,6 @@ type State interface {
 
 type phaseState interface {
 	TransitionPhase(context.Context, state.Phase) error
-}
-
-// ActivitySample records source writes observed during a quiet-period sample.
-type ActivitySample struct {
-	StartedAt  time.Time     `json:"started_at"`
-	EndedAt    time.Time     `json:"ended_at"`
-	Interval   time.Duration `json:"interval"`
-	Before     int64         `json:"before"`
-	After      int64         `json:"after"`
-	Writes     int64         `json:"writes"`
-	Overridden bool          `json:"overridden"`
 }
 
 // SequenceResult records one absolute target sequence synchronization.
@@ -77,76 +62,48 @@ type Report struct {
 	Configuration ReportConfiguration `json:"configuration"`
 	CompletedAt   time.Time           `json:"completed_at"`
 	EndPosition   string              `json:"end_position"`
-	Activity      *ActivitySample     `json:"activity,omitempty"`
-	Verification  *verify.Result      `json:"verification,omitempty"`
-	// VerifiedFraction is the share of the rows in the checked tables that
-	// verification actually compared. It is recorded on its own because it is the
-	// size of what the gate below established, and verification samples: reading
-	// this as a promise that the copy is sound would be reading it as more than it
-	// is.
-	VerifiedFraction float64          `json:"verified_fraction"`
-	Sequences        []SequenceResult `json:"sequences,omitempty"`
-	Steps            []state.Step     `json:"steps"`
+	Sequences     []SequenceResult    `json:"sequences,omitempty"`
+	Steps         []state.Step        `json:"steps"`
 }
 
-// ReportConfiguration captures the safety-relevant cutover settings.
+// ReportConfiguration captures the settings that shaped this cutover.
 type ReportConfiguration struct {
-	SampleInterval time.Duration     `json:"sample_interval"`
-	AllowWrites    bool              `json:"allow_writes"`
 	SequenceOffset int64             `json:"sequence_offset"`
 	Values         map[string]string `json:"values,omitempty"`
 }
 
 // Config controls the ordered, rerunnable cutover steps.
+//
+// Cutover moves data and metadata; it does not judge either. It neither samples
+// the source for writes nor verifies the copy, so freezing application writes and
+// deciding that the data is good enough to serve are the operator's, done before
+// this runs. Nothing here will stop a cutover that loses writes made after the
+// end position.
 type Config struct {
 	Source, Target Connector
 	State          State
 	Dir            string
-	SampleInterval time.Duration
-	AllowWrites    bool
 	SequenceOffset int64
 	Sequences      []Sequence
 	WaitDrain      func(context.Context, string) error
-	Verify         func(context.Context) (verify.Result, error)
 	Cleanup        func(context.Context) error
 	Now            func() time.Time
-	Sleep          func(context.Context, time.Duration) error
 	ToolVersion    string
 	AuditConfig    map[string]string
 
-	// SampleActivity and ReadFlushLSN are test seams. Production callers should
-	// leave them nil to use source PostgreSQL.
-	SampleActivity func(context.Context) (ActivitySample, error)
-	ReadFlushLSN   func(context.Context) (string, error)
-	EmitBoundary   func(context.Context) (string, error)
+	// EmitBoundary is a test seam, and the hook production uses to mark the end
+	// position in the stream itself rather than inferring it. Left nil it falls
+	// back to the source's current flush position.
+	EmitBoundary func(context.Context) (string, error)
 }
 
-// ErrWritesObserved prevents unsafe cutover while source writes continue.
-var ErrWritesObserved = errors.New("source writes observed during cutover sample")
-
-// ErrVerificationFailed is the hard gate before sequence changes.
-//
-// It is not an authority on whether the copy is sound, and must not be read as
-// one: verification samples each table, so passing this gate means the rows it
-// compared agreed. What it does catch is a named divergence, which is worth
-// refusing a cutover over.
-var ErrVerificationFailed = errors.New("verification failed")
-
-// ErrVerificationExecution means verification could not produce a verdict at all.
-// The application must recover follow before source writes resume.
-var ErrVerificationExecution = errors.New("verification execution failed")
-
-// Run executes incomplete steps in safety order. A marker is written only after
-// its action succeeds, so process restarts safely resume from the first missing
+// Run executes incomplete steps in order. A marker is written only after its
+// action succeeds, so process restarts safely resume from the first missing
 // marker.
 func Run(ctx context.Context, cfg Config) (Report, error) {
 	if cfg.Source == nil || cfg.Target == nil || cfg.State == nil ||
-		cfg.WaitDrain == nil || cfg.Verify == nil || cfg.Cleanup == nil ||
-		strings.TrimSpace(cfg.Dir) == "" {
-		return Report{}, errors.New("source, target, state, directory, drain, verify, and cleanup are required")
-	}
-	if cfg.SampleInterval <= 0 {
-		cfg.SampleInterval = 5 * time.Second
+		cfg.WaitDrain == nil || cfg.Cleanup == nil || strings.TrimSpace(cfg.Dir) == "" {
+		return Report{}, errors.New("source, target, state, directory, drain, and cleanup are required")
 	}
 	if cfg.SequenceOffset == 0 {
 		cfg.SequenceOffset = 1000
@@ -157,16 +114,8 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	if cfg.Now == nil {
 		cfg.Now = func() time.Time { return time.Now().UTC() }
 	}
-	if cfg.Sleep == nil {
-		cfg.Sleep = sleep
-	}
-	if cfg.SampleActivity == nil {
-		cfg.SampleActivity = func(ctx context.Context) (ActivitySample, error) {
-			return sampleWrites(ctx, cfg)
-		}
-	}
-	if cfg.ReadFlushLSN == nil {
-		cfg.ReadFlushLSN = func(ctx context.Context) (string, error) {
+	if cfg.EmitBoundary == nil {
+		cfg.EmitBoundary = func(ctx context.Context) (string, error) {
 			conn, err := cfg.Source(ctx)
 			if err != nil {
 				return "", err
@@ -182,29 +131,10 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 		return Report{}, err
 	}
 	if done {
-		if _, tracksPhases := cfg.State.(phaseState); tracksPhases {
-			migration, err := cfg.State.Migration(ctx)
-			if err != nil {
-				return Report{}, err
-			}
-			if migration.Phase != state.PhaseComplete {
-				if _, err := cfg.SampleActivity(ctx); err != nil {
-					return Report{}, fmt.Errorf("%s: %w", stepWriteCheck, err)
-				}
-				currentLSN, err := cfg.ReadFlushLSN(ctx)
-				if err != nil {
-					return Report{}, fmt.Errorf("read source flush position: %w", err)
-				}
-				if advanced, err := lsnAfter(currentLSN, migration.EndPosition); err != nil {
-					return Report{}, err
-				} else if advanced {
-					return Report{}, fmt.Errorf("%w: source WAL advanced from cutover end %s to %s",
-						ErrWritesObserved, migration.EndPosition, currentLSN)
-				}
-				if err := transitionOptional(ctx, cfg.State, state.PhaseComplete); err != nil {
-					return Report{}, err
-				}
-			}
+		// A crash between publishing the report and recording the phase leaves a
+		// finished cutover looking unfinished. Finish it and hand back what it wrote.
+		if err := transitionOptional(ctx, cfg.State, state.PhaseComplete); err != nil {
+			return Report{}, err
 		}
 		return readReport(cfg.Dir)
 	}
@@ -212,61 +142,26 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 		Version:     1,
 		ToolVersion: cfg.ToolVersion,
 		Configuration: ReportConfiguration{
-			SampleInterval: cfg.SampleInterval,
-			AllowWrites:    cfg.AllowWrites,
 			SequenceOffset: cfg.SequenceOffset,
 			Values:         cloneStrings(cfg.AuditConfig),
 		},
 	}
 
-	// Unlike ordinary steps, write-freeze validation is intentionally repeated
-	// on every incomplete command invocation. Its marker is audit-only.
-	sample, err := cfg.SampleActivity(ctx)
-	report.Activity = &sample
-	if err != nil {
-		return Report{}, fmt.Errorf("%s: %w", stepWriteCheck, err)
-	}
-	if err := runStep(ctx, cfg.State, stepWriteCheck, func() (string, error) {
-		data, marshalErr := json.Marshal(sample)
-		return string(data), marshalErr
-	}); err != nil {
-		return Report{}, err
-	}
-
-	// Sample again directly before observing the flush position. This closes the
-	// resume window between the invocation-level check and end-position reuse.
-	sample, err = cfg.SampleActivity(ctx)
-	report.Activity = &sample
-	if err != nil {
-		return Report{}, fmt.Errorf("%s: %w", stepEndPosition, err)
-	}
 	migration, err := cfg.State.Migration(ctx)
 	if err != nil {
 		return Report{}, err
 	}
+	// An end position recorded by an earlier attempt is reused as it stands. It is
+	// the point the target was already drained to, and moving it would silently
+	// redefine what this cutover migrated.
 	report.EndPosition = migration.EndPosition
 	if report.EndPosition == "" {
-		emit := cfg.ReadFlushLSN
-		if cfg.EmitBoundary != nil {
-			emit = cfg.EmitBoundary
-		}
-		report.EndPosition, err = emit(ctx)
+		report.EndPosition, err = cfg.EmitBoundary(ctx)
 		if err != nil {
 			return Report{}, fmt.Errorf("emit cutover boundary: %w", err)
 		}
 		if err := cfg.State.SetEndPosition(ctx, report.EndPosition); err != nil {
 			return Report{}, err
-		}
-	} else {
-		currentLSN, err := cfg.ReadFlushLSN(ctx)
-		if err != nil {
-			return Report{}, fmt.Errorf("read source flush position: %w", err)
-		}
-		if advanced, err := lsnAfter(currentLSN, report.EndPosition); err != nil {
-			return Report{}, err
-		} else if advanced {
-			return Report{}, fmt.Errorf("%w: source WAL advanced from cutover end %s to %s",
-				ErrWritesObserved, report.EndPosition, currentLSN)
 		}
 	}
 	if err := runStep(ctx, cfg.State, stepEndPosition, func() (string, error) {
@@ -284,37 +179,17 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 		return Report{}, err
 	}
 
-	if err := runStep(ctx, cfg.State, stepVerify, func() (string, error) {
-		result, err := cfg.Verify(ctx)
-		report.Verification = &result
-		report.VerifiedFraction = result.SampledFraction()
-		if err != nil {
-			return "", fmt.Errorf("%w: %v", ErrVerificationExecution, err)
-		}
-		// A check that stopped early is a gate that never closed, not data that
-		// disagreed, and cutover must refuse it for a different stated reason.
-		if cut := result.CutShort(); len(cut) > 0 {
-			return "", fmt.Errorf("%w: verification stopped before checking every table: %s",
-				ErrVerificationFailed, strings.Join(cut, "; "))
-		}
-		if !result.Converged {
-			return "", fmt.Errorf("%w: %s", ErrVerificationFailed, strings.Join(result.DivergedTables(), ", "))
-		}
-		data, _ := json.Marshal(result)
-		return string(data), nil
-	}); err != nil {
-		return Report{}, err
-	}
-	if err := transitionOptional(ctx, cfg.State, state.PhaseCutover); err != nil {
-		return Report{}, err
-	}
-
 	if err := runStep(ctx, cfg.State, stepSequences, func() (string, error) {
 		sequences, err := synchronizeSequences(ctx, cfg.Source, cfg.Target, cfg.SequenceOffset, cfg.Sequences)
 		report.Sequences = sequences
 		data, _ := json.Marshal(sequences)
 		return string(data), err
 	}); err != nil {
+		return Report{}, err
+	}
+	// Advancing the target's sequences is where a cutover stops being reversible,
+	// so that is where the phase says one is under way.
+	if err := transitionOptional(ctx, cfg.State, state.PhaseCutover); err != nil {
 		return Report{}, err
 	}
 
@@ -377,18 +252,6 @@ func transitionOptional(ctx context.Context, store State, phase state.Phase) err
 	return nil
 }
 
-func lsnAfter(current, end string) (bool, error) {
-	currentLSN, err := pglogrepl.ParseLSN(current)
-	if err != nil {
-		return false, fmt.Errorf("parse current source LSN %q: %w", current, err)
-	}
-	endLSN, err := pglogrepl.ParseLSN(end)
-	if err != nil {
-		return false, fmt.Errorf("parse cutover end LSN %q: %w", end, err)
-	}
-	return currentLSN > endLSN, nil
-}
-
 func cloneStrings(values map[string]string) map[string]string {
 	if values == nil {
 		return nil
@@ -405,26 +268,8 @@ func hydrateReportDetails(report *Report) {
 		if !step.Completed || step.Detail == "" {
 			continue
 		}
-		switch step.Name {
-		case stepWriteCheck:
-			if report.Activity == nil {
-				var value ActivitySample
-				if json.Unmarshal([]byte(step.Detail), &value) == nil {
-					report.Activity = &value
-				}
-			}
-		case stepVerify:
-			if report.Verification == nil {
-				var value verify.Result
-				if json.Unmarshal([]byte(step.Detail), &value) == nil {
-					report.Verification = &value
-					report.VerifiedFraction = value.SampledFraction()
-				}
-			}
-		case stepSequences:
-			if report.Sequences == nil {
-				_ = json.Unmarshal([]byte(step.Detail), &report.Sequences)
-			}
+		if step.Name == stepSequences && report.Sequences == nil {
+			_ = json.Unmarshal([]byte(step.Detail), &report.Sequences)
 		}
 	}
 }
@@ -446,44 +291,6 @@ func runStep(ctx context.Context, store State, name string, action func() (strin
 	}
 	return nil
 }
-
-func sampleWrites(ctx context.Context, cfg Config) (ActivitySample, error) {
-	conn, err := cfg.Source(ctx)
-	if err != nil {
-		return ActivitySample{}, err
-	}
-	defer conn.Close(context.Background())
-	sample := ActivitySample{StartedAt: cfg.Now(), Interval: cfg.SampleInterval, Overridden: cfg.AllowWrites}
-	if _, err := conn.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
-		return sample, fmt.Errorf("clear initial source statistics snapshot: %w", err)
-	}
-	if err := conn.QueryRow(ctx, writeCounterSQL).Scan(&sample.Before); err != nil {
-		return sample, fmt.Errorf("read initial source write counter: %w", err)
-	}
-	if err := cfg.Sleep(ctx, cfg.SampleInterval); err != nil {
-		return sample, err
-	}
-	if _, err := conn.Exec(ctx, "SELECT pg_catalog.pg_stat_clear_snapshot()"); err != nil {
-		return sample, fmt.Errorf("clear final source statistics snapshot: %w", err)
-	}
-	if err := conn.QueryRow(ctx, writeCounterSQL).Scan(&sample.After); err != nil {
-		return sample, fmt.Errorf("read final source write counter: %w", err)
-	}
-	sample.EndedAt = cfg.Now()
-	sample.Writes = sample.After - sample.Before
-	if sample.Writes < 0 {
-		// Statistics were reset during the sample; treat that as unsafe activity.
-		sample.Writes = 1
-	}
-	if sample.Writes > 0 && !cfg.AllowWrites {
-		return sample, fmt.Errorf("%w: %d tuple changes in %s", ErrWritesObserved, sample.Writes, cfg.SampleInterval)
-	}
-	return sample, nil
-}
-
-const writeCounterSQL = `
-	SELECT (tup_inserted+tup_updated+tup_deleted)::bigint
-	FROM pg_catalog.pg_stat_database WHERE datname=current_database()`
 
 func synchronizeSequences(
 	ctx context.Context,
@@ -564,17 +371,6 @@ func synchronizeSequences(
 
 // QuoteIdentifier safely quotes a PostgreSQL identifier or qualified name.
 func QuoteIdentifier(parts ...string) string { return pgx.Identifier(parts).Sanitize() }
-
-func sleep(ctx context.Context, duration time.Duration) error {
-	timer := time.NewTimer(duration)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
 
 func reportPath(dir string) string { return filepath.Join(dir, "cutover-report.json") }
 

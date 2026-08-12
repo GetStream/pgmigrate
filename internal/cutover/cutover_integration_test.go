@@ -4,15 +4,13 @@ package cutover
 
 import (
 	"context"
-	"errors"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/tgross/pgmigrate/internal/pgtest"
 )
 
-func TestPostgres17WriteCheckAndSequences(t *testing.T) {
+func TestPostgres17SequenceSynchronization(t *testing.T) {
 	sourceInstance := pgtest.Start(t, 17)
 	targetInstance := pgtest.Start(t, 17)
 	ctx := context.Background()
@@ -20,7 +18,6 @@ func TestPostgres17WriteCheckAndSequences(t *testing.T) {
 	target := targetInstance.Connect(t)
 	ddl := `
 		CREATE SCHEMA "odd""schema";
-		CREATE TABLE "odd""schema".writes(id bigint);
 		CREATE SEQUENCE "odd""schema"."never called";
 		CREATE SEQUENCE "odd""schema"."called";
 		CREATE SEQUENCE "odd""schema"."descending" INCREMENT BY -1 MINVALUE -10000 MAXVALUE -1 START -1`
@@ -66,26 +63,5 @@ func TestPostgres17WriteCheckAndSequences(t *testing.T) {
 	}
 	if never != 1010 || called != 1021 || descending != -1021 {
 		t.Fatalf("next sequence values = %d, %d, %d", never, called, descending)
-	}
-
-	cfg := Config{
-		Source: connect(sourceInstance.URI), SampleInterval: time.Millisecond,
-		Now: func() time.Time { return time.Now().UTC() },
-		Sleep: func(context.Context, time.Duration) error {
-			if _, err := source.Exec(ctx, `INSERT INTO "odd""schema".writes VALUES (1)`); err != nil {
-				return err
-			}
-			_, err := source.Exec(ctx, "SELECT pg_catalog.pg_stat_force_next_flush()")
-			return err
-		},
-	}
-	sample, err := sampleWrites(ctx, cfg)
-	if !errors.Is(err, ErrWritesObserved) {
-		t.Fatalf("sampleWrites error = %v, sample %#v", err, sample)
-	}
-	cfg.AllowWrites = true
-	cfg.Sleep = func(context.Context, time.Duration) error { return nil }
-	if _, err := sampleWrites(ctx, cfg); err != nil {
-		t.Fatalf("override sample: %v", err)
 	}
 }

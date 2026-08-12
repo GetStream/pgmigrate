@@ -81,45 +81,6 @@ func TestResetBaseCopyForcesFreshSnapshotState(t *testing.T) {
 	}
 }
 
-func TestRecoverCutoverClearsBoundaryAndSteps(t *testing.T) {
-	ctx := context.Background()
-	store, err := Open(ctx, t.TempDir(), testFingerprints)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	for _, phase := range []Phase{PhaseSetup, PhaseSchema, PhaseCopy, PhaseIndexes, PhaseCatchup, PhaseFollow, PhaseDrained} {
-		if err := store.TransitionPhase(ctx, phase); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := store.SetEndPosition(ctx, "0/100"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.CompleteStep(ctx, "cutover.end_position", "0/100"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.RecoverCutover(ctx); err != nil {
-		t.Fatal(err)
-	}
-	migration, err := store.Migration(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if migration.Phase != PhaseFollow || migration.EndPosition != "" {
-		t.Fatalf("recovered migration = %#v", migration)
-	}
-	steps, err := store.ListSteps(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, step := range steps {
-		if len(step.Name) >= len("cutover.") && step.Name[:len("cutover.")] == "cutover." {
-			t.Fatalf("cutover step survived recovery: %#v", step)
-		}
-	}
-}
-
 func TestTargetCleanupRequestCanBeDurablyCleared(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, t.TempDir(), testFingerprints)

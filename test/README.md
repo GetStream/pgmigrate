@@ -9,7 +9,7 @@ Unit tests live beside the package under test as `*_test.go` and do not require
 PostgreSQL. They cover pure logic and controlled I/O, including filters,
 fingerprints, phase transitions, TOC classification, COPY planning and retry
 classification, pgoutput decoding, transaction codecs, segment recovery,
-spill cleanup, verification strike tracking, cutover step resumption, status,
+spill cleanup, verification result reporting, cutover step resumption, status,
 and metrics.
 
 ```sh

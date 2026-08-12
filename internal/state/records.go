@@ -94,30 +94,6 @@ func (s *Store) ClearFailedAttempt(ctx context.Context) error {
 	})
 }
 
-// RecoverCutover returns a failed drained/cutover attempt to follow. It clears
-// the obsolete boundary and every cutover step atomically so a later cutover
-// must emit and drain to a fresh KEEP marker.
-func (s *Store) RecoverCutover(ctx context.Context) error {
-	return s.write(ctx, func(tx *sql.Tx) error {
-		var phase Phase
-		if err := tx.QueryRowContext(ctx, "SELECT phase FROM migration WHERE id=1").Scan(&phase); err != nil {
-			return fmt.Errorf("read cutover recovery phase: %w", err)
-		}
-		if phase != PhaseDrained && phase != PhaseCutover {
-			return fmt.Errorf("cutover recovery requires drained or cutover phase (current %s)", phase)
-		}
-		if _, err := tx.ExecContext(ctx, "DELETE FROM steps WHERE name LIKE 'cutover.%'"); err != nil {
-			return fmt.Errorf("clear cutover steps: %w", err)
-		}
-		if _, err := tx.ExecContext(ctx, `
-			UPDATE migration SET phase=?, end_position='', updated_at=? WHERE id=1`,
-			PhaseFollow, time.Now().UTC().UnixNano()); err != nil {
-			return fmt.Errorf("recover cutover phase: %w", err)
-		}
-		return nil
-	})
-}
-
 // SetTargetCleanupRequested durably coordinates final target metadata cleanup
 // between the cutover controller and the run process.
 func (s *Store) SetTargetCleanupRequested(ctx context.Context, requested bool) error {
