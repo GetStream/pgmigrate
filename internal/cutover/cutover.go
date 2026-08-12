@@ -105,9 +105,6 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 		cfg.WaitDrain == nil || cfg.Cleanup == nil || strings.TrimSpace(cfg.Dir) == "" {
 		return Report{}, errors.New("source, target, state, directory, drain, and cleanup are required")
 	}
-	if cfg.SequenceOffset == 0 {
-		cfg.SequenceOffset = 1000
-	}
 	if cfg.SequenceOffset < 0 {
 		return Report{}, errors.New("sequence offset must not be negative")
 	}
@@ -180,7 +177,7 @@ func Run(ctx context.Context, cfg Config) (Report, error) {
 	}
 
 	if err := runStep(ctx, cfg.State, stepSequences, func() (string, error) {
-		sequences, err := synchronizeSequences(ctx, cfg.Source, cfg.Target, cfg.SequenceOffset, cfg.Sequences)
+		sequences, err := SynchronizeSequences(ctx, cfg.Source, cfg.Target, cfg.SequenceOffset, cfg.Sequences)
 		report.Sequences = sequences
 		data, _ := json.Marshal(sequences)
 		return string(data), err
@@ -292,7 +289,11 @@ func runStep(ctx context.Context, store State, name string, action func() (strin
 	return nil
 }
 
-func synchronizeSequences(
+// SynchronizeSequences sets each selected target sequence to the source's value
+// plus offset. It is absolute, so rerunning it is safe, and the offset is the
+// room the source has left to keep allocating: run it before the source stops
+// and anything it allocates beyond the offset collides with the target.
+func SynchronizeSequences(
 	ctx context.Context,
 	sourceConnect, targetConnect Connector,
 	offset int64,

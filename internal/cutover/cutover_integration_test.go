@@ -20,7 +20,7 @@ func TestPostgres17SequenceSynchronization(t *testing.T) {
 		CREATE SCHEMA "odd""schema";
 		CREATE SEQUENCE "odd""schema"."never called";
 		CREATE SEQUENCE "odd""schema"."called";
-		CREATE SEQUENCE "odd""schema"."descending" INCREMENT BY -1 MINVALUE -10000 MAXVALUE -1 START -1`
+		CREATE SEQUENCE "odd""schema"."descending" INCREMENT BY -1 MINVALUE -2000000 MAXVALUE -1 START -1`
 	if _, err := source.Exec(ctx, ddl); err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestPostgres17SequenceSynchronization(t *testing.T) {
 		{Schema: `odd"schema`, Name: "called"},
 		{Schema: `odd"schema`, Name: "descending"},
 	}
-	results, err := synchronizeSequences(ctx, connect(sourceInstance.URI), connect(targetInstance.URI), 1000, selected)
+	results, err := SynchronizeSequences(ctx, connect(sourceInstance.URI), connect(targetInstance.URI), 1_000_000, selected)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestPostgres17SequenceSynchronization(t *testing.T) {
 	if err := target.QueryRow(ctx, `SELECT nextval('"odd""schema"."descending"')`).Scan(&descending); err != nil {
 		t.Fatal(err)
 	}
-	if never != 1010 || called != 1021 || descending != -1021 {
+	if never != 1_000_010 || called != 1_000_021 || descending != -1_000_021 {
 		t.Fatalf("next sequence values = %d, %d, %d", never, called, descending)
 	}
 }

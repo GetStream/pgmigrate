@@ -386,3 +386,10 @@ func TestCommentSelectionAndLookupUseTheEntryNamespace(t *testing.T) {
 		t.Errorf("materialized view comment lookup = %v, %v", args, err)
 	}
 }
+
+func TestSequencesRejectsNegativeOffset(t *testing.T) {
+	err := App{}.Sequences(context.Background(), config.Config{SequenceOffset: -1})
+	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
+		t.Errorf("Sequences with a negative offset = %v, want a negative-offset error", err)
+	}
+}

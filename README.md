@@ -60,6 +60,12 @@ both servers, and atomically writes `cutover-report.json`. It moves data and
 metadata and judges neither: freezing application writes and deciding the copy is
 good enough to serve are the operator's, done before it runs.
 
+`pgmigrate sequences` runs that one step on its own, from `follow` onwards, for a
+cutover that moves traffic before it moves the database. Sequences are set
+absolutely, so it is rerunnable and `cutover` redoes it against the source's final
+values. `--sequence-offset` is the room the source keeps: whatever it allocates
+beyond that collides with the target.
+
 ## Documentation
 
 This README is the documentation. [Design considerations](#design-considerations-why-oh-why)
@@ -69,7 +75,7 @@ explains why the mechanism is what it is and what each choice cost,
 [Limitations](#limitations) what the tool does not do. Test patterns and
 environment controls are in [test/README.md](test/README.md).
 
-There are five commands:
+There are six commands:
 
 | command | what it does |
 |---|---|
@@ -77,6 +83,7 @@ There are five commands:
 | `run` | starts or resumes the migration, and waits in `follow` until cutover completes |
 | `status` | reads local state only, so it is safe to run beside `run` |
 | `verify` | samples each table against the target and checks what replication wrote |
+| `sequences` | advances target sequences alone, so the target can take writes before the cutover |
 | `cutover` | performs the rerunnable, durably stepped cutover |
 
 Every command takes `--dir`. All but `status` also need source and target
@@ -177,9 +184,9 @@ step log trimmed:
   "completed_at": "2026-08-11T07:40:10.07482Z",
   "end_position": "0/1BE9D08",
   "sequences": [
-    {"schema": "e2e", "name": "order_id_seq", "source_value": 1143, "target_value": 2143, "is_called": true}
+    {"schema": "e2e", "name": "order_id_seq", "source_value": 1143, "target_value": 1001143, "is_called": true}
   ],
-  "configuration": {"sequence_offset": 1000, "values": {"workers": "16"}},
+  "configuration": {"sequence_offset": 1000000, "values": {"workers": "16"}},
   "steps": []
 }
 ```
@@ -188,9 +195,10 @@ step log trimmed:
 version, and one built from a checkout names the commit it came from and whether
 that tree was clean. `end_position` is the boundary the target was drained
 through, and it is the line between what this migration carried and what it did
-not: anything the source wrote after it stayed behind. `sequences` records that `order_id_seq` was left 1000 ahead
-of the source, so the application cannot collide with an existing key. `steps` is
-the durable log the cutover resumed against.
+not: anything the source wrote after it stayed behind. `sequences` records that
+`order_id_seq` was left 1,000,000 ahead of the source, so the application cannot
+collide with an existing key. `steps` is the durable log the cutover resumed
+against.
 
 ## Installing pgmigrate
 
@@ -216,10 +224,17 @@ others are ignored. `--source` and `--target` default to `PGMIGRATE_SOURCE` and
 ### pgmigrate preflight
 
 Inventories the selected tables and checks server versions, logical-replication
-settings, replica identity, WAL headroom, collations, extensions, target state,
-privileges, and client-tool versions. Findings are persisted in the migration
-directory, so `status` shows them later. Warnings block until acknowledged, and
-`run` repeats the same checks with the same gate.
+settings, replica identity, sequence headroom, WAL headroom, collations,
+extensions, target state, privileges, and client-tool versions. Findings are
+persisted in the migration directory, so `status` shows them later. Warnings block
+until acknowledged, and `run` repeats the same checks with the same gate.
+
+Sequence headroom is checked against `--sequence-offset`, for every sequence a
+selected table owns or draws a column default from. A sequence with fewer than ten
+million values left before its maximum, or its minimum when it counts down, is a
+warning: what remains has to cover both databases until traffic moves. One with
+less room than the offset is an error, because `setval` refuses a value past the
+bound and the cutover would fail at its sequence step.
 
 | flag | default | what it does |
 |---|---|---|
@@ -232,6 +247,7 @@ directory, so `status` shows them later. Warnings block until acknowledged, and
 | `--pg-dump <path>` | found on `PATH` | `pg_dump` executable, whose version is checked here |
 | `--pg-restore <path>` | found on `PATH` | `pg_restore` executable, whose version is checked here |
 | `--wal-sample-duration <duration>` | `1m` | how long to sample the source WAL rate when judging slot retention headroom |
+| `--sequence-offset <n>` | `1000000` | the gap the cutover will leave, which is the room each selected sequence is checked for |
 | `--workers <n>` | host CPU count | index-build concurrency the tuning plan is sized for, so preflight reports the plan `run` would apply |
 | `--skip-target-tuning` | false | report no tuning plan, because the run will not tune |
 | `--target-memory <size>` | estimated from `shared_buffers` | target memory the plan is sized against, for example `64GB` |
@@ -306,6 +322,28 @@ standard error. A named divergence, or a table stopped early, exits non-zero.
 | `--verify-converge-timeout <duration>` | `1m` | how long a row that appears to differ is given to settle against a fixed WAL position before it is reported |
 | `--verify-cdc-rows <n>` | `100000` | applier-recorded keys per table checked alongside the heap sample. `0` falls back to the default |
 
+### pgmigrate sequences
+
+Runs the cutover's sequence step on its own, from the `follow` phase onwards, for
+a cutover that moves traffic before it moves the database. It reads each selected
+sequence's next value on the source and sets the target's copy that far past it, so
+the target can accept writes while the source is still serving. Every sequence a
+selected table owns or draws a column default from is included. The results are
+written to standard output as JSON.
+
+Values are set absolutely rather than advanced, so running it again is harmless,
+and `cutover` runs the same step against the source's final values. The offset is
+the room the source keeps: whatever it allocates beyond that collides with what the
+target has already handed out, so size it above what the source can consume before
+traffic moves.
+
+| flag | default | what it does |
+|---|---|---|
+| `--dir <path>` | required | migration state directory holding the schema selection |
+| `--source <dsn>` | `PGMIGRATE_SOURCE` | source connection string |
+| `--target <dsn>` | `PGMIGRATE_TARGET` | target connection string |
+| `--sequence-offset <n>` | `1000000` | values each target sequence is set past the source's. `0` leaves no gap, which is only safe once the source will never allocate again |
+
 ### pgmigrate cutover
 
 Performs the cutover as a sequence of durably recorded steps: validate the
@@ -327,6 +365,7 @@ the result, and decide for yourself.
 | `--source <dsn>` | `PGMIGRATE_SOURCE` | source connection string |
 | `--target <dsn>` | `PGMIGRATE_TARGET` | target connection string |
 | `--endpos <LSN>` | the boundary cutover emits | explicit inclusive end position, for advanced use. Must resolve to an exact durable transaction or boundary |
+| `--sequence-offset <n>` | `1000000` | values each target sequence is set past the source's; see [pgmigrate sequences](#pgmigrate-sequences) |
 | `--no-cleanup` | false | retain the source replication objects and target migration metadata. Target tuning and target replica identities are still reverted, because the target is about to serve production |
 
 ## Dependencies

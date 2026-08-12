@@ -51,6 +51,8 @@ func NewRootCommand() *cobra.Command {
 	flags.DurationVar(&cfg.StatusWatch, "watch", 0, "refresh status at this interval")
 	flags.BoolVar(&cfg.NoCleanup, "no-cleanup", false, "retain replication and target metadata")
 	flags.StringVar(&cfg.EndPosition, "endpos", "", "explicit cutover end LSN")
+	flags.Int64Var(&cfg.SequenceOffset, "sequence-offset", cfg.SequenceOffset,
+		"values each target sequence is set past the source's, leaving the source room to keep allocating")
 	flags.DurationVar(&cfg.WALSampleDuration, "wal-sample-duration", cfg.WALSampleDuration, "source WAL-rate sample duration")
 	flags.DurationVar(&cfg.SegmentPruneInterval, "segment-prune-interval", cfg.SegmentPruneInterval, "minimum interval between applied CDC segment pruning")
 	flags.BoolVar(&cfg.RetryBaseCopy, "retry-base-copy", false, "restart the base copy even though the last attempts failed the same way")
@@ -77,6 +79,7 @@ func NewRootCommand() *cobra.Command {
 		newDatabaseCommand("run", "Start or resume a migration", &cfg, application.Run),
 		newStateCommand("status", "Show migration progress", &cfg, false, application.Status),
 		newStateCommand("verify", "Verify source and target data", &cfg, true, application.Verify),
+		newStateCommand("sequences", "Advance target sequences past the source", &cfg, true, application.Sequences),
 		newStateCommand("cutover", "Finalize a migration for cutover", &cfg, true, application.Cutover),
 	)
 
