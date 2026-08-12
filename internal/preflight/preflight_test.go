@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tgross/pgmigrate/internal/collation"
-	"github.com/tgross/pgmigrate/internal/replident"
-	"github.com/tgross/pgmigrate/internal/tuning"
+	"github.com/GetStream/pgmigrate/internal/collation"
+	"github.com/GetStream/pgmigrate/internal/replident"
+	"github.com/GetStream/pgmigrate/internal/tuning"
 )
 
 func TestParseToolMajor(t *testing.T) {

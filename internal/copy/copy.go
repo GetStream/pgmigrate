@@ -13,10 +13,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/tuning"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/tgross/pgmigrate/internal/state"
-	"github.com/tgross/pgmigrate/internal/tuning"
 )
 
 // SelectTable is called for every ordinary or partitioned source table.

@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/tgross/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/pgtest"
 )
 
 // memoryRecorder stands in for the state store, and enforces the same rule: an

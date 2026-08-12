@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/collation"
+	"github.com/GetStream/pgmigrate/internal/pgtest"
 	"github.com/jackc/pgx/v5"
-	"github.com/tgross/pgmigrate/internal/collation"
-	"github.com/tgross/pgmigrate/internal/pgtest"
 )
 
 // TestCollationRiskDetection validates the ordering- and equality-sensitive

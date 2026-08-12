@@ -9,10 +9,10 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/GetStream/pgmigrate/internal/postgres"
+	"github.com/GetStream/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/tuning"
 	"github.com/jackc/pgx/v5"
-	"github.com/tgross/pgmigrate/internal/postgres"
-	"github.com/tgross/pgmigrate/internal/state"
-	"github.com/tgross/pgmigrate/internal/tuning"
 )
 
 type Index struct {

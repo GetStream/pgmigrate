@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tgross/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/state"
 )
 
 type staticProvider struct{ status state.Status }

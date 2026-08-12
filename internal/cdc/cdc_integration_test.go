@@ -13,9 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/jackc/pglogrepl"
-	"github.com/tgross/pgmigrate/internal/pgtest"
-	"github.com/tgross/pgmigrate/internal/postgres"
 )
 
 func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {

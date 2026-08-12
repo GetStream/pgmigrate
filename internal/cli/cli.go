@@ -11,8 +11,8 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/tgross/pgmigrate/internal/app"
-	"github.com/tgross/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/app"
+	"github.com/GetStream/pgmigrate/internal/config"
 )
 
 // Execute runs the root command.

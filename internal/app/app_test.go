@@ -12,13 +12,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/GetStream/pgmigrate/internal/cdc"
+	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/copy"
+	"github.com/GetStream/pgmigrate/internal/preflight"
+	"github.com/GetStream/pgmigrate/internal/schema"
+	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/tgross/pgmigrate/internal/cdc"
-	"github.com/tgross/pgmigrate/internal/config"
-	"github.com/tgross/pgmigrate/internal/copy"
-	"github.com/tgross/pgmigrate/internal/preflight"
-	"github.com/tgross/pgmigrate/internal/schema"
-	"github.com/tgross/pgmigrate/internal/state"
 )
 
 func TestWALHeadroomAlarm(t *testing.T) {

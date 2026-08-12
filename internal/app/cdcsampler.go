@@ -10,9 +10,9 @@ import (
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/tgross/pgmigrate/internal/cdc"
-	"github.com/tgross/pgmigrate/internal/state"
-	"github.com/tgross/pgmigrate/internal/verify"
+	"github.com/GetStream/pgmigrate/internal/cdc"
+	"github.com/GetStream/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/verify"
 )
 
 const (

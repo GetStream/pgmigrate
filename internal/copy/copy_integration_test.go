@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/jackc/pgx/v5"
-	"github.com/tgross/pgmigrate/internal/pgtest"
-	"github.com/tgross/pgmigrate/internal/state"
 )
 
 type crashCompletionState struct {

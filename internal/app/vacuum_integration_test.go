@@ -9,9 +9,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/tgross/pgmigrate/internal/config"
-	"github.com/tgross/pgmigrate/internal/pgtest"
-	"github.com/tgross/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/state"
 )
 
 // TestPG17VacuumTargetTidiesTheHeapGathersStatisticsAndResumes covers what the

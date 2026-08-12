@@ -10,7 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/tgross/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/pgtest"
 )
 
 // memoryRecorder is the crash-safety contract in miniature: an original is

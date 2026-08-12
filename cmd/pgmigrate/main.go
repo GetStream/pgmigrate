@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/tgross/pgmigrate/internal/cli"
+	"github.com/GetStream/pgmigrate/internal/cli"
 )
 
 func main() {

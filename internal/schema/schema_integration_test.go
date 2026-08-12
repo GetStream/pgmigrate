@@ -12,8 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/GetStream/pgmigrate/internal/pgtest"
 	"github.com/jackc/pgx/v5"
-	"github.com/tgross/pgmigrate/internal/pgtest"
 )
 
 // TestArchiveTOCParsesExoticObjects dumps object classes whose descriptions are

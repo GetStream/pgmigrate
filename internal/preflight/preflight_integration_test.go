@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tgross/pgmigrate/internal/pgtest"
-	"github.com/tgross/pgmigrate/internal/preflight"
+	"github.com/GetStream/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/preflight"
 )
 
 // TestPG17ReplicationPrivilegeProbe checks that replication capability is

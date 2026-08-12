@@ -11,9 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/jackc/pglogrepl"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/tgross/pgmigrate/internal/state"
 )
 
 // Provider is implemented by state.Store.

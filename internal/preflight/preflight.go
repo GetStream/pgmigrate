@@ -12,13 +12,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/collation"
+	"github.com/GetStream/pgmigrate/internal/postgres"
+	"github.com/GetStream/pgmigrate/internal/replident"
+	"github.com/GetStream/pgmigrate/internal/tuning"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/tgross/pgmigrate/internal/collation"
-	"github.com/tgross/pgmigrate/internal/postgres"
-	"github.com/tgross/pgmigrate/internal/replident"
-	"github.com/tgross/pgmigrate/internal/tuning"
 )
 
 // Severity controls whether a finding blocks setup.

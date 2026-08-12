@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/jackc/pgx/v5"
-	"github.com/tgross/pgmigrate/internal/state"
 )
 
 const (

@@ -191,10 +191,16 @@ the durable log the cutover resumed against.
 
 ## Installing pgmigrate
 
-Build from source with Go 1.23 or newer:
+With Go 1.23 or newer, from a checkout:
 
 ```bash
 $ go build -o pgmigrate ./cmd/pgmigrate
+```
+
+Or without one:
+
+```bash
+$ go install github.com/GetStream/pgmigrate/cmd/pgmigrate@main
 ```
 
 ## Commands

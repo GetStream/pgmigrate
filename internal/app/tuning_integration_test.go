@@ -9,11 +9,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/tgross/pgmigrate/internal/config"
-	"github.com/tgross/pgmigrate/internal/pgtest"
-	"github.com/tgross/pgmigrate/internal/setup"
-	"github.com/tgross/pgmigrate/internal/state"
-	"github.com/tgross/pgmigrate/internal/tuning"
+	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/setup"
+	"github.com/GetStream/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/tuning"
 )
 
 func tuningStore(t *testing.T) *state.Store {

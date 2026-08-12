@@ -6,8 +6,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/GetStream/pgmigrate/internal/pgtest"
 	"github.com/jackc/pgx/v5"
-	"github.com/tgross/pgmigrate/internal/pgtest"
 )
 
 func TestPostgres17SequenceSynchronization(t *testing.T) {

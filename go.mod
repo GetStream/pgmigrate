@@ -1,4 +1,4 @@
-module github.com/tgross/pgmigrate
+module github.com/GetStream/pgmigrate
 
 go 1.23.0
 

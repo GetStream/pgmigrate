@@ -12,11 +12,11 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/tgross/pgmigrate/internal/config"
-	pgcopy "github.com/tgross/pgmigrate/internal/copy"
-	"github.com/tgross/pgmigrate/internal/pgtest"
-	"github.com/tgross/pgmigrate/internal/setup"
-	"github.com/tgross/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/config"
+	pgcopy "github.com/GetStream/pgmigrate/internal/copy"
+	"github.com/GetStream/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/setup"
+	"github.com/GetStream/pgmigrate/internal/state"
 )
 
 // replidentFixtures mixes relations that must be left alone with every shape that

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/tgross/pgmigrate/internal/tuning"
+	"github.com/GetStream/pgmigrate/internal/tuning"
 )
 
 const (

@@ -4,8 +4,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tgross/pgmigrate/internal/config"
-	"github.com/tgross/pgmigrate/internal/testutil"
+	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/testutil"
 )
 
 func TestParseFilter(t *testing.T) {

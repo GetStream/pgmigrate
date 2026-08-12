@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tgross/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/config"
 )
 
 func TestFromEnvironment(t *testing.T) {

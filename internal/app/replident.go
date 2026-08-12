@@ -9,10 +9,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/tgross/pgmigrate/internal/config"
-	pgcopy "github.com/tgross/pgmigrate/internal/copy"
-	"github.com/tgross/pgmigrate/internal/replident"
-	"github.com/tgross/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/config"
+	pgcopy "github.com/GetStream/pgmigrate/internal/copy"
+	"github.com/GetStream/pgmigrate/internal/replident"
+	"github.com/GetStream/pgmigrate/internal/state"
 )
 
 // replidentStepPrefix names the steps holding the replica identity each relation

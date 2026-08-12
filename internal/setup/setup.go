@@ -16,10 +16,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/tgross/pgmigrate/internal/postgres"
 )
 
 // SnapshotState is implemented by state.Store.

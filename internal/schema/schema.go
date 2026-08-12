@@ -14,8 +14,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/jackc/pgx/v5"
-	"github.com/tgross/pgmigrate/internal/postgres"
 )
 
 // Tools names the PostgreSQL client programs. Empty values use PATH defaults.

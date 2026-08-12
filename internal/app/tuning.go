@@ -10,10 +10,10 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
-	"github.com/tgross/pgmigrate/internal/config"
-	"github.com/tgross/pgmigrate/internal/preflight"
-	"github.com/tgross/pgmigrate/internal/state"
-	"github.com/tgross/pgmigrate/internal/tuning"
+	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/preflight"
+	"github.com/GetStream/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/tuning"
 )
 
 // tuningStepPrefix names the steps that hold what target tuning has to undo.

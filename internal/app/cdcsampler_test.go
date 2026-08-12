@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tgross/pgmigrate/internal/cdc"
-	"github.com/tgross/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/cdc"
+	"github.com/GetStream/pgmigrate/internal/state"
 )
 
 func openSamplerStore(t *testing.T, dir string) *state.Store {

@@ -10,10 +10,10 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
-	"github.com/tgross/pgmigrate/internal/config"
-	"github.com/tgross/pgmigrate/internal/pgtest"
-	"github.com/tgross/pgmigrate/internal/postgres"
-	"github.com/tgross/pgmigrate/internal/state"
+	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/postgres"
+	"github.com/GetStream/pgmigrate/internal/state"
 )
 
 // TestMarkerReachesDiskOnAnIdleSource is the property the recheck rule depends on
