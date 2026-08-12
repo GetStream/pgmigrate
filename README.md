@@ -62,15 +62,12 @@ good enough to serve are the operator's, done before it runs.
 
 ## Documentation
 
-`design.md` is the original specification. Delivered differences and deferred
-work are in [docs/design-deviations.md](docs/design-deviations.md). The
-verification design and its measurements are in
-[docs/design-verify-sampled.md](docs/design-verify-sampled.md),
-[docs/design-verify-tid-ranges.md](docs/design-verify-tid-ranges.md), and
-[docs/design-verify-cdc-stratum.md](docs/design-verify-cdc-stratum.md).
-Throughput the current design leaves on the table, none of it a defect, is in
-[docs/copy-perf-improvements.md](docs/copy-perf-improvements.md). Every report
-under `docs/bug-*.md` is fixed and carries its resolution.
+This README is the documentation. [Design considerations](#design-considerations-why-oh-why)
+explains why the mechanism is what it is and what each choice cost,
+[Verification](#verification) what a check does and does not establish,
+[Crash recovery](#crash-recovery) what a restart keeps and what it discards, and
+[Limitations](#limitations) what the tool does not do. Test patterns and
+environment controls are in [test/README.md](test/README.md).
 
 There are five commands:
 
@@ -189,8 +186,7 @@ step log trimmed:
 `end_position` is the boundary the target was drained through, and it is the line
 between what this migration carried and what it did not: anything the source wrote
 after it stayed behind. `sequences` records that `order_id_seq` was left 1000 ahead
-of the source, so the application cannot collide with an existing key; the
-reasoning is in [docs/design-sequences.md](docs/design-sequences.md). `steps` is
+of the source, so the application cannot collide with an existing key. `steps` is
 the durable log the cutover resumed against.
 
 ## Installing pgmigrate
@@ -565,7 +561,6 @@ cannot be allowed through at all, because collation there decides structure
 rather than output: a nondeterministic collation backing a unique index or
 primary key, where text equality itself changes, and a range-partitioned table
 with a collatable partition key, where rows can route to a different partition.
-[docs/collation.md](docs/collation.md) has the full comparison rules.
 
 ## Verification
 
@@ -740,3 +735,7 @@ schema.
 - Local microbenchmarks (`make bench`) cover in-memory and file primitives only.
   They establish no sustainable CDC rate, cutover duration, or managed-cloud
   performance.
+
+## License
+
+Apache License 2.0. The full text is in [LICENSE](LICENSE).
