@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/GetStream/pgmigrate/internal/collation"
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/replident"
 	"github.com/GetStream/pgmigrate/internal/tuning"
 )
@@ -117,6 +118,37 @@ func TestCollationVersionRemainsAcknowledgeable(t *testing.T) {
 	}
 	if got := collationFinding(difference, nil, true); got.Severity != SeverityInfo {
 		t.Errorf("--allow-collation-change did not cover the weaker case: %+v", got)
+	}
+}
+
+func TestSessionTimeoutFindingsWarnWhenInheritedAndStaySilentWhenDisabled(t *testing.T) {
+	findings := sessionTimeoutFindings("source", []postgres.SessionTimeout{
+		{Name: "statement_timeout", Milliseconds: 60000},
+		{Name: "lock_timeout", Milliseconds: 0},
+		{Name: "idle_in_transaction_session_timeout", Milliseconds: 1500},
+		{Name: "idle_session_timeout", Milliseconds: 0},
+	})
+	if len(findings) != 2 {
+		t.Fatalf("findings = %+v, want one per non-zero timeout", findings)
+	}
+	byID := map[string]Finding{}
+	for _, finding := range findings {
+		byID[finding.ID] = finding
+		if finding.Severity != SeverityWarning || finding.Kind != "timeout" {
+			t.Errorf("finding = %+v, want an acknowledgeable timeout warning", finding)
+		}
+	}
+	if msg := byID["source-statement-timeout"].Message; !strings.Contains(msg, "60s") ||
+		!strings.Contains(msg, "one statement") {
+		t.Errorf("statement_timeout message = %q", msg)
+	}
+	if msg := byID["source-idle-in-transaction-session-timeout"].Message; !strings.Contains(msg, "1500ms") {
+		t.Errorf("idle_in_transaction message = %q", msg)
+	}
+	if extra := sessionTimeoutFindings("target", []postgres.SessionTimeout{
+		{Name: "statement_timeout", Milliseconds: 0},
+	}); len(extra) != 0 {
+		t.Errorf("disabled timeouts = %+v", extra)
 	}
 }
 

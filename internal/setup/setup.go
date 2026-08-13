@@ -150,12 +150,12 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 		return nil, errors.New("source DSN, target DSN, directory, and selected tables are required")
 	}
 
-	source, err := pgx.Connect(ctx, cfg.SourceDSN)
+	source, err := postgres.Connect(ctx, cfg.SourceDSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect source setup: %w", err)
 	}
 	defer source.Close(context.Background())
-	target, err := pgx.Connect(ctx, cfg.TargetDSN)
+	target, err := postgres.Connect(ctx, cfg.TargetDSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect target setup: %w", err)
 	}
@@ -232,7 +232,7 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 	if err := postgres.EnsureProgressTable(ctx, target); err != nil {
 		return nil, fmt.Errorf("create target progress table: %w", err)
 	}
-	monitor, err := pgx.Connect(ctx, cfg.SourceDSN)
+	monitor, err := postgres.Connect(ctx, cfg.SourceDSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect snapshot monitor: %w", err)
 	}
@@ -352,7 +352,7 @@ func RecoverStale(ctx context.Context, cfg Config, confirmation ResumeConfirmati
 	}
 	publication, slot := Names(SourceFingerprint(system.SystemID, system.DBName), cfg.MigrationID)
 
-	conn, err := pgx.Connect(ctx, cfg.SourceDSN)
+	conn, err := postgres.Connect(ctx, cfg.SourceDSN)
 	if err != nil {
 		return fmt.Errorf("connect source recovery: %w", err)
 	}
@@ -512,7 +512,7 @@ func CleanupOwned(
 	tables []Table,
 	expectFailover bool,
 ) error {
-	conn, err := pgx.Connect(ctx, sourceDSN)
+	conn, err := postgres.Connect(ctx, sourceDSN)
 	if err != nil {
 		return fmt.Errorf("connect validated source cleanup: %w", err)
 	}

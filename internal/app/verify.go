@@ -78,7 +78,7 @@ func (m *marker) flushWAL(ctx context.Context) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.nudge == nil {
-		conn, err := pgx.Connect(ctx, m.dsn)
+		conn, err := postgres.Connect(ctx, m.dsn)
 		if err != nil {
 			return fmt.Errorf("connect to flush the verification marker: %w", err)
 		}
@@ -114,7 +114,7 @@ func (m *marker) close() {
 
 // sourceCapabilities reads what the source's release supports.
 func sourceCapabilities(ctx context.Context, dsn string) (postgres.Capabilities, error) {
-	conn, err := pgx.Connect(ctx, dsn)
+	conn, err := postgres.Connect(ctx, dsn)
 	if err != nil {
 		return postgres.Capabilities{}, err
 	}

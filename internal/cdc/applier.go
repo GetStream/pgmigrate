@@ -119,7 +119,7 @@ func (a *Applier) WaitUntil(ctx context.Context, boundary LSN) error {
 	effectiveBoundary := boundary
 	resolved := false
 	for {
-		conn, err := pgx.Connect(ctx, a.config.ConnString)
+		conn, err := postgres.Connect(ctx, a.config.ConnString)
 		if err != nil {
 			return fmt.Errorf("cdc: connect catch-up observer: %w", err)
 		}
@@ -152,7 +152,7 @@ func (a *Applier) WaitUntil(ctx context.Context, boundary LSN) error {
 }
 
 func (a *Applier) runConnection(ctx context.Context) error {
-	conn, err := pgx.Connect(ctx, a.config.ConnString)
+	conn, err := postgres.Connect(ctx, a.config.ConnString)
 	if err != nil {
 		return fmt.Errorf("cdc: connect applier: %w", err)
 	}

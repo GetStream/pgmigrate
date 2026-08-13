@@ -8,9 +8,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/preflight"
 	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/GetStream/pgmigrate/internal/tuning"
@@ -69,7 +68,7 @@ func tuneTarget(ctx context.Context, cfg config.Config, store *state.Store) (map
 	if err != nil {
 		return nil, err
 	}
-	conn, err := pgx.Connect(ctx, cfg.Target)
+	conn, err := postgres.Connect(ctx, cfg.Target)
 	if err != nil {
 		return nil, err
 	}
@@ -203,7 +202,7 @@ func revertTargetTuning(ctx context.Context, targetDSN string, store *state.Stor
 	if len(changes) == 0 {
 		return nil
 	}
-	conn, err := pgx.Connect(ctx, targetDSN)
+	conn, err := postgres.Connect(ctx, targetDSN)
 	if err != nil {
 		return err
 	}

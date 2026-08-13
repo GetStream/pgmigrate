@@ -483,6 +483,17 @@ func retryableConnectionError(err error) bool {
 	return pgconn.SafeToRetry(err)
 }
 
+func annotateCopyError(side string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "57014" {
+		return fmt.Errorf("%s: query canceled (SQLSTATE 57014); pgmigrate already set statement_timeout, lock_timeout, idle_in_transaction_session_timeout, and idle_session_timeout to 0 on this session, so this is an external cancel: %w", side, err)
+	}
+	return fmt.Errorf("%s: %w", side, err)
+}
+
 // LargestFirst returns a stable, independently owned worker schedule.
 func LargestFirst(parts []Part) []Part {
 	result := append([]Part(nil), parts...)
@@ -593,13 +604,7 @@ func (r Runner) copyPart(ctx context.Context, p Part) error {
 	_ = pr.CloseWithError(targetErr)
 	src := <-ch
 	if src.err != nil || targetErr != nil {
-		if src.err != nil {
-			src.err = fmt.Errorf("copy out of source: %w", src.err)
-		}
-		if targetErr != nil {
-			targetErr = fmt.Errorf("copy into target: %w", targetErr)
-		}
-		return errors.Join(src.err, targetErr)
+		return errors.Join(annotateCopyError("copy out of source", src.err), annotateCopyError("copy into target", targetErr))
 	}
 	if _, err := ttx.Exec(ctx, `
 		INSERT INTO pgmigrate_internal.copy_parts(table_oid, part_id, rows_copied, bytes_copied)

@@ -129,7 +129,7 @@ func vacuumOne(
 // settings, which is what lets one vacuum use the memory and parallel workers the
 // target was sized for.
 func vacuumSession(ctx context.Context, cfg config.Config, sessionGUCs map[string]string) (*pgx.Conn, error) {
-	conn, err := pgx.Connect(ctx, cfg.Target)
+	conn, err := postgres.Connect(ctx, cfg.Target)
 	if err != nil {
 		return nil, err
 	}

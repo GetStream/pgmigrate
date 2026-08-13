@@ -91,6 +91,50 @@ func roleDSN(t testing.TB, uri, user, password string) string {
 	return parsed.String()
 }
 
+func TestPG17SessionTimeouts(t *testing.T) {
+	source := pgtest.Start(t, 17)
+	target := pgtest.Start(t, 17)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	sourceConn := source.Connect(t)
+	if _, err := sourceConn.Exec(ctx, "CREATE TABLE selected (id bigint PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceConn.Exec(ctx, "ALTER DATABASE pgmigrate SET statement_timeout = '60s'"); err != nil {
+		t.Fatal(err)
+	}
+	var oid uint32
+	if err := sourceConn.QueryRow(ctx, "SELECT 'selected'::regclass::oid").Scan(&oid); err != nil {
+		t.Fatal(err)
+	}
+	tool := filepath.Join(t.TempDir(), "pg-tool")
+	if err := os.WriteFile(tool, []byte("#!/bin/sh\necho 'pg_dump (PostgreSQL) 17.1'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	result, err := preflight.Run(ctx, preflight.Config{
+		SourceDSN: source.URI, TargetDSN: target.URI,
+		Tables:     []preflight.Table{{OID: oid, Schema: "public", Name: "selected"}},
+		PGDumpPath: tool, PGRestorePath: tool, WALSampleDuration: 10 * time.Millisecond,
+		AcknowledgeWarnings: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var found preflight.Finding
+	for _, finding := range result.Findings {
+		if finding.ID == "source-statement-timeout" {
+			found = finding
+		}
+	}
+	if found.Severity != preflight.SeverityWarning || !strings.Contains(found.Message, "60s") {
+		t.Fatalf("source-statement-timeout = %+v findings=%+v", found, result.Findings)
+	}
+	if !result.Allowed {
+		t.Fatalf("acknowledgeable timeout blocked: %+v", result.Findings)
+	}
+}
+
 // TestPG17SequenceHeadroom checks the headroom report against real sequences: a
 // sequence with less room left than --sequence-offset stops the migration because
 // the cutover's setval would be rejected, one merely running low is

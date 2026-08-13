@@ -335,7 +335,7 @@ func (s Service) RestoreDeferred(ctx context.Context, targetURI, archive, useLis
 	if s.DeferredMarkers == nil || s.InspectDeferred == nil {
 		return errors.New("deferred markers and exact inspector are required")
 	}
-	conn, err := pgx.Connect(ctx, targetURI)
+	conn, err := postgres.Connect(ctx, targetURI)
 	if err != nil {
 		return fmt.Errorf("connect deferred restore target: %w", err)
 	}
@@ -489,7 +489,7 @@ func (s Service) Clean(ctx context.Context, targetURI, archive string) error {
 	if err != nil {
 		return err
 	}
-	conn, err := pgx.Connect(ctx, targetURI)
+	conn, err := postgres.Connect(ctx, targetURI)
 	if err != nil {
 		return fmt.Errorf("connect target archive cleanup: %w", err)
 	}
@@ -522,6 +522,7 @@ func run(ctx context.Context, name string, args ...string) error {
 
 func output(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = withSessionTimeoutPGOPTIONS(os.Environ())
 	var combined bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &combined, &combined
 	err := cmd.Run()
@@ -529,4 +530,15 @@ func output(ctx context.Context, name string, args ...string) ([]byte, error) {
 		return nil, &CommandError{Command: name, Args: append([]string(nil), args...), Output: combined.String(), Err: err}
 	}
 	return combined.Bytes(), nil
+}
+
+func withSessionTimeoutPGOPTIONS(env []string) []string {
+	out := append([]string(nil), env...)
+	for i, kv := range out {
+		if strings.HasPrefix(kv, "PGOPTIONS=") {
+			out[i] = kv + " " + postgres.SessionTimeoutPGOPTIONS
+			return out
+		}
+	}
+	return append(out, "PGOPTIONS="+postgres.SessionTimeoutPGOPTIONS)
 }

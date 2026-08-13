@@ -236,6 +236,13 @@ warning: what remains has to cover both databases until traffic moves. One with
 less room than the offset is an error, because `setval` refuses a value past the
 bound and the cutover would fail at its sequence step.
 
+Inherited `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`,
+and `idle_session_timeout` on the source or target are warnings. pgmigrate sets
+those GUCs to 0 on every SQL session it opens, including `pg_dump` and
+`pg_restore`, so a COPY that would otherwise die at 60s can finish. The warning
+is so the inherited values are visible before a long run, not a request to
+`ALTER ROLE` for pgmigrate.
+
 | flag | default | what it does |
 |---|---|---|
 | `--dir <path>` | required | migration state directory, created if absent |
@@ -689,6 +696,10 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
 - Copy parts retry classified connection failures up to five times. CDC
   transport failures reconnect automatically; corruption, protocol errors,
   divergence, and prolonged handoff backpressure stop the run for diagnosis.
+  SQLSTATE 57014 is not a connection failure: after pgmigrate has set
+  `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`,
+  and `idle_session_timeout` to 0 on its SQL sessions, a cancel is external
+  (`pg_cancel_backend`, a proxy idle timeout) and stops the part.
 - Cutover records each successful step and resumes at the first incomplete one,
   reusing the end position the first attempt recorded. It never moves that
   boundary: the target has already been drained to it, and a fresh one would
@@ -718,6 +729,10 @@ the same reason rather than resuming the loop. Resolve the cause and pass
 `--retry-base-copy` once; the record clears by itself as soon as the run reaches
 `indexes`, after which restarts resume instead of discarding work. A process
 killed outright, or stopped with a signal, is not a failed attempt.
+`--retry-base-copy` is not the fix for SQLSTATE 57014: pgmigrate already
+disables the session timeouts that cancel long COPY, dump, and restore. If a
+cancel still happens, it is external, and retrying the whole base copy will
+hit it again.
 
 ## Security
 
