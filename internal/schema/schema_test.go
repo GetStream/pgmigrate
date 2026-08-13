@@ -9,6 +9,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/GetStream/pgmigrate/internal/postgres"
 )
 
 func TestParseTOCAndUseList(t *testing.T) {
@@ -333,5 +335,27 @@ func TestFilterTOCPreservesArchiveOrder(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Errorf("filtered order = %v, want %v", got, want)
+	}
+}
+
+func TestWithSessionTimeoutPGOPTIONSAppendsOrSets(t *testing.T) {
+	got := withSessionTimeoutPGOPTIONS([]string{"HOME=/tmp", "PGOPTIONS=-c extra_float_digits=3"})
+	if !slices.Contains(got, "HOME=/tmp") {
+		t.Fatalf("lost unrelated env: %v", got)
+	}
+	var options string
+	for _, kv := range got {
+		if strings.HasPrefix(kv, "PGOPTIONS=") {
+			options = kv
+		}
+	}
+	if !strings.Contains(options, "-c extra_float_digits=3") ||
+		!strings.Contains(options, "statement_timeout=0") ||
+		!strings.Contains(options, "idle_in_transaction_session_timeout=0") {
+		t.Fatalf("PGOPTIONS = %q", options)
+	}
+	fresh := withSessionTimeoutPGOPTIONS([]string{"HOME=/tmp"})
+	if !slices.Contains(fresh, "PGOPTIONS="+postgres.SessionTimeoutPGOPTIONS) {
+		t.Fatalf("missing PGOPTIONS: %v", fresh)
 	}
 }

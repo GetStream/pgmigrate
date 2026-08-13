@@ -7,10 +7,9 @@ import (
 	"io"
 	"strings"
 
-	"github.com/jackc/pgx/v5"
-
 	"github.com/GetStream/pgmigrate/internal/config"
 	pgcopy "github.com/GetStream/pgmigrate/internal/copy"
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/replident"
 	"github.com/GetStream/pgmigrate/internal/state"
 )
@@ -60,7 +59,7 @@ func (r replidentRecorder) Record(ctx context.Context, record replident.Record) 
 func (a App) applyReplicaIdentityFallback(
 	ctx context.Context, cfg config.Config, store *state.Store, tables []pgcopy.Table,
 ) error {
-	conn, err := pgx.Connect(ctx, cfg.Source)
+	conn, err := postgres.Connect(ctx, cfg.Source)
 	if err != nil {
 		return err
 	}
@@ -157,7 +156,7 @@ func restoreReplicaIdentities(ctx context.Context, sourceDSN string, store *stat
 	if len(records) == 0 {
 		return nil
 	}
-	conn, err := pgx.Connect(ctx, sourceDSN)
+	conn, err := postgres.Connect(ctx, sourceDSN)
 	if err != nil {
 		return err
 	}
@@ -191,7 +190,7 @@ func restoreTargetReplicaIdentities(ctx context.Context, targetDSN string, store
 	if len(records) == 0 {
 		return nil
 	}
-	conn, err := pgx.Connect(ctx, targetDSN)
+	conn, err := postgres.Connect(ctx, targetDSN)
 	if err != nil {
 		return err
 	}

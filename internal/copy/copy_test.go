@@ -65,6 +65,24 @@ func TestRetryClassification(t *testing.T) {
 	if retryableConnectionError(&pgconn.PgError{Code: "22000"}) {
 		t.Fatal("data exception was retryable")
 	}
+	if retryableConnectionError(&pgconn.PgError{Code: "57014"}) {
+		t.Fatal("query_canceled was retryable")
+	}
+}
+
+func TestAnnotateCopyErrorNamesExternalCancel(t *testing.T) {
+	err := annotateCopyError("copy out of source", &pgconn.PgError{Code: "57014", Message: "canceling statement due to statement timeout"})
+	if err == nil || !strings.Contains(err.Error(), "SQLSTATE 57014") ||
+		!strings.Contains(err.Error(), "external cancel") {
+		t.Fatalf("annotated 57014 = %v", err)
+	}
+	plain := annotateCopyError("copy into target", errors.New("pipe closed"))
+	if plain == nil || !strings.Contains(plain.Error(), "copy into target: pipe closed") {
+		t.Fatalf("annotated plain error = %v", plain)
+	}
+	if got := annotateCopyError("copy out of source", nil); got != nil {
+		t.Fatalf("nil error = %v", got)
+	}
 }
 
 type retryError struct{}

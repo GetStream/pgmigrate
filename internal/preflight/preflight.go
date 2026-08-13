@@ -97,12 +97,12 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if strings.TrimSpace(cfg.SourceDSN) == "" || strings.TrimSpace(cfg.TargetDSN) == "" {
 		return Result{}, errors.New("source and target DSNs are required")
 	}
-	source, err := pgx.Connect(ctx, cfg.SourceDSN)
+	source, err := postgres.Connect(ctx, cfg.SourceDSN)
 	if err != nil {
 		return Result{}, fmt.Errorf("connect source: %w", err)
 	}
 	defer source.Close(context.Background())
-	target, err := pgx.Connect(ctx, cfg.TargetDSN)
+	target, err := postgres.Connect(ctx, cfg.TargetDSN)
 	if err != nil {
 		return Result{}, fmt.Errorf("connect target: %w", err)
 	}
@@ -148,6 +148,12 @@ func RunConnections(ctx context.Context, source, target *pgx.Conn, cfg Config) (
 		return decide(result, cfg), nil
 	}
 
+	runCheck(add, "source-timeouts", func() ([]Finding, error) {
+		return checkSessionTimeouts(ctx, source, "source")
+	})
+	runCheck(add, "target-timeouts", func() ([]Finding, error) {
+		return checkSessionTimeouts(ctx, target, "target")
+	})
 	runCheck(add, "source-replication", func() ([]Finding, error) {
 		return checkSourceReplication(ctx, source, cfg.WALSampleDuration, cfg.WALRetentionDuration)
 	})
@@ -378,6 +384,43 @@ func walRetentionFinding(
 		}
 	}
 	return nil
+}
+
+func checkSessionTimeouts(ctx context.Context, conn *pgx.Conn, side string) ([]Finding, error) {
+	timeouts, err := postgres.InheritedSessionTimeouts(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	return sessionTimeoutFindings(side, timeouts), nil
+}
+
+// sessionTimeoutFindings warns when a role or parameter group would cancel a
+// COPY part. pgmigrate sets these to 0 on its own sessions, so the finding is
+// acknowledgeable rather than blocking.
+func sessionTimeoutFindings(side string, timeouts []postgres.SessionTimeout) []Finding {
+	var findings []Finding
+	for _, timeout := range timeouts {
+		if timeout.Milliseconds == 0 {
+			continue
+		}
+		findings = append(findings, Finding{
+			ID:       side + "-" + strings.ReplaceAll(timeout.Name, "_", "-"),
+			Kind:     "timeout",
+			Severity: SeverityWarning,
+			Message: fmt.Sprintf(
+				"%s %s is %s; a COPY part is one statement and holds its transaction until it finishes, so pgmigrate sets this to 0 on its own SQL sessions",
+				side, timeout.Name, formatMilliseconds(timeout.Milliseconds),
+			),
+		})
+	}
+	return findings
+}
+
+func formatMilliseconds(ms int64) string {
+	if ms%1000 == 0 {
+		return fmt.Sprintf("%ds", ms/1000)
+	}
+	return fmt.Sprintf("%dms", ms)
 }
 
 func checkReplicaIdentity(ctx context.Context, conn *pgx.Conn, tables []Table) ([]Finding, error) {

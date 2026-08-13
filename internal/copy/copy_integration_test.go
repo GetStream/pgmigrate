@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/GetStream/pgmigrate/internal/pgtest"
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/jackc/pgx/v5"
 )
@@ -432,6 +433,70 @@ func TestPG17PartsCopyIntoTheirOwnTable(t *testing.T) {
 	}
 	if err := dst.QueryRow(ctx, "SELECT count(*) FROM events").Scan(&count); err != nil || count != 6 {
 		t.Fatalf("replayed partitioned rows=%d err=%v", count, err)
+	}
+}
+
+func TestPG17CopySurvivesInheritedStatementTimeout(t *testing.T) {
+	source := pgtest.Start(t, 17)
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	src := source.Connect(t)
+	dst := target.Connect(t)
+	if _, err := src.Exec(ctx, `
+		CREATE TABLE timeout_rows (id bigint PRIMARY KEY, value text);
+		INSERT INTO timeout_rows SELECT i, repeat('x', 100) FROM generate_series(1, 5000) i`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(ctx, "CREATE TABLE timeout_rows (id bigint PRIMARY KEY, value text)"); err != nil {
+		t.Fatal(err)
+	}
+	exporter, err := pgx.Connect(ctx, source.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exporter.Close(ctx)
+	tx, err := exporter.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	var snapshot string
+	if err := tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Exec(ctx, "ALTER DATABASE pgmigrate SET statement_timeout = '1ms'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(ctx, "ALTER DATABASE pgmigrate SET statement_timeout = '1ms'"); err != nil {
+		t.Fatal(err)
+	}
+	tables, err := InventorySnapshot(ctx, func(ctx context.Context) (*pgx.Conn, error) {
+		return postgres.Connect(ctx, source.URI)
+	}, snapshot, func(_, name string) bool { return name == "timeout_rows" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tables) != 1 {
+		t.Fatalf("inventory tables=%d, want 1", len(tables))
+	}
+	store, err := state.Open(ctx, t.TempDir(), state.Fingerprints{Source: "source", Filter: "timeout"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runner := Runner{
+		Source:   func(ctx context.Context) (*pgx.Conn, error) { return postgres.Connect(ctx, source.URI) },
+		Target:   func(ctx context.Context) (*pgx.Conn, error) { return postgres.Connect(ctx, target.URI) },
+		Snapshot: snapshot,
+		Workers:  1,
+		State:    store,
+	}
+	if err := runner.Run(ctx, Plan(tables[0], 0, 1, Binary)); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := dst.QueryRow(ctx, "SELECT count(*) FROM timeout_rows").Scan(&count); err != nil || count != 5000 {
+		t.Fatalf("copied rows=%d err=%v", count, err)
 	}
 }
 

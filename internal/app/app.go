@@ -60,7 +60,7 @@ func (a App) progressOutput() io.Writer {
 }
 
 func connector(dsn string) func(context.Context) (*pgx.Conn, error) {
-	return func(ctx context.Context) (*pgx.Conn, error) { return pgx.Connect(ctx, dsn) }
+	return func(ctx context.Context) (*pgx.Conn, error) { return postgres.Connect(ctx, dsn) }
 }
 
 func loadFilter(path string) (config.Filter, error) {
@@ -89,7 +89,7 @@ func sourceFingerprint(ctx context.Context, dsn string) (string, error) {
 }
 
 func inventory(ctx context.Context, cfg config.Config, filter config.Filter) ([]pgcopy.Table, error) {
-	conn, err := pgx.Connect(ctx, cfg.Source)
+	conn, err := postgres.Connect(ctx, cfg.Source)
 	if err != nil {
 		return nil, fmt.Errorf("connect source inventory: %w", err)
 	}
@@ -260,7 +260,7 @@ func loadCDCBinaryMode(ctx context.Context, store *state.Store) (bool, error) {
 }
 
 func initializeTargetProgress(ctx context.Context, targetDSN, streamID, generation string) error {
-	conn, err := pgx.Connect(ctx, targetDSN)
+	conn, err := postgres.Connect(ctx, targetDSN)
 	if err != nil {
 		return err
 	}
@@ -286,7 +286,7 @@ func initializeTargetProgress(ctx context.Context, targetDSN, streamID, generati
 }
 
 func validateTargetProgress(ctx context.Context, targetDSN, streamID, generation string) error {
-	conn, err := pgx.Connect(ctx, targetDSN)
+	conn, err := postgres.Connect(ctx, targetDSN)
 	if err != nil {
 		return err
 	}
@@ -338,7 +338,7 @@ func finalizeTargetCleanup(ctx context.Context, targetDSN string, store *state.S
 	if err := validateTargetOnly(ctx, targetDSN, migration); err != nil {
 		return err
 	}
-	target, err := pgx.Connect(ctx, targetDSN)
+	target, err := postgres.Connect(ctx, targetDSN)
 	if err != nil {
 		return err
 	}
@@ -572,7 +572,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		if err := pauseForCrashTest(groupCtx, state.PhaseIndexes); err != nil {
 			return err
 		}
-		source, err := pgx.Connect(groupCtx, cfg.Source)
+		source, err := postgres.Connect(groupCtx, cfg.Source)
 		if err != nil {
 			return err
 		}
@@ -760,7 +760,7 @@ func resumeIndexes(ctx context.Context, cfg config.Config, store *state.Store) e
 	for _, table := range tables {
 		selected[table.OID] = true
 	}
-	source, err := pgx.Connect(ctx, cfg.Source)
+	source, err := postgres.Connect(ctx, cfg.Source)
 	if err != nil {
 		return err
 	}
@@ -940,7 +940,7 @@ func dumpSelection(ctx context.Context, sourceDSN, snapshot string, tables []pgc
 		selection.Tables[i] = schema.QualifiedName{Schema: table.Schema, Name: table.Name}
 		oids[i] = table.OID
 	}
-	conn, err := pgx.Connect(ctx, sourceDSN)
+	conn, err := postgres.Connect(ctx, sourceDSN)
 	if err != nil {
 		return selection, err
 	}
@@ -1125,7 +1125,7 @@ func dumpSelection(ctx context.Context, sourceDSN, snapshot string, tables []pgc
 
 func inspectDeferred(dir, sourceDSN string) schema.DeferredInspector {
 	return func(ctx context.Context, target *pgx.Conn, entry schema.TOCEntry) (schema.DeferredStatus, error) {
-		source, err := pgx.Connect(ctx, sourceDSN)
+		source, err := postgres.Connect(ctx, sourceDSN)
 		if err != nil {
 			return schema.DeferredStatus{}, err
 		}
@@ -1559,7 +1559,7 @@ func followChecks(ctx context.Context, cfg config.Config, store *state.Store, sl
 		if migration.Phase != state.PhaseFollow {
 			continue
 		}
-		conn, err := pgx.Connect(ctx, cfg.Source)
+		conn, err := postgres.Connect(ctx, cfg.Source)
 		if err != nil {
 			_ = store.UpsertFinding(ctx, state.Finding{ID: "follow-source-health", Kind: "health", Severity: "error", Message: err.Error()})
 			continue
@@ -1714,7 +1714,7 @@ func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamI
 	defer ticker.Stop()
 	nextLog := time.Now()
 	for {
-		conn, err := pgx.Connect(ctx, targetDSN)
+		conn, err := postgres.Connect(ctx, targetDSN)
 		if err != nil {
 			return err
 		}
@@ -1763,7 +1763,7 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("read prior snapshot metadata: %w", err)
 	}
-	target, err := pgx.Connect(ctx, cfg.Target)
+	target, err := postgres.Connect(ctx, cfg.Target)
 	if err != nil {
 		return err
 	}
@@ -1912,7 +1912,7 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 }
 
 func recordTargetIdentity(ctx context.Context, targetDSN, sourceFingerprint, filterFingerprint, streamID, generation string) error {
-	conn, err := pgx.Connect(ctx, targetDSN)
+	conn, err := postgres.Connect(ctx, targetDSN)
 	if err != nil {
 		return err
 	}
@@ -1975,7 +1975,7 @@ func validateTargetIdentity(ctx context.Context, cfg config.Config, store *state
 }
 
 func validateTargetOnly(ctx context.Context, targetDSN string, migration state.Migration) error {
-	conn, err := pgx.Connect(ctx, targetDSN)
+	conn, err := postgres.Connect(ctx, targetDSN)
 	if err != nil {
 		return err
 	}
@@ -2085,7 +2085,7 @@ func verificationInventory(ctx context.Context, cfg config.Config, tables []stat
 	for _, table := range tables {
 		selected[table.Schema+"\x00"+table.Name] = true
 	}
-	source, err := pgx.Connect(ctx, cfg.Source)
+	source, err := postgres.Connect(ctx, cfg.Source)
 	if err != nil {
 		return nil, err
 	}
@@ -2118,7 +2118,7 @@ func waitTargetProgress(ctx context.Context, targetDSN, streamID, wanted string)
 	var reached pglogrepl.LSN
 	advancedAt := time.Now()
 	for {
-		conn, err := pgx.Connect(ctx, targetDSN)
+		conn, err := postgres.Connect(ctx, targetDSN)
 		if err != nil {
 			return err
 		}
@@ -2297,7 +2297,7 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 		Sequences:      selectedSequences,
 		SequenceOffset: cfg.SequenceOffset,
 		EmitBoundary: func(ctx context.Context) (string, error) {
-			conn, err := pgx.Connect(ctx, cfg.Source)
+			conn, err := postgres.Connect(ctx, cfg.Source)
 			if err != nil {
 				return "", err
 			}
@@ -2360,7 +2360,7 @@ func cleanupAfterCutover(ctx context.Context, cfg config.Config, store *state.St
 
 func waitSlotInactive(ctx context.Context, sourceDSN, slot string) error {
 	for {
-		conn, err := pgx.Connect(ctx, sourceDSN)
+		conn, err := postgres.Connect(ctx, sourceDSN)
 		if err != nil {
 			return err
 		}
