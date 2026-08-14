@@ -495,6 +495,42 @@ func TestPG17WaitUntilDoesNotScanStagedSegments(t *testing.T) {
 	}
 }
 
+func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	applyConn := target.Connect(t)
+	if err := configureApplySession(ctx, applyConn); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		tx, err := applyConn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var role string
+		if err := tx.QueryRow(ctx, "SHOW session_replication_role").Scan(&role); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if role != "replica" {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("apply transaction %d role=%q, want replica", i+1, role)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	other := target.Connect(t)
+	var role string
+	if err := other.QueryRow(ctx, "SHOW session_replication_role").Scan(&role); err != nil {
+		t.Fatal(err)
+	}
+	if role != "origin" {
+		t.Fatalf("unrelated target connection role=%q, want origin", role)
+	}
+}
+
 func TestPG17ApplierStartsBeforeReadingUnappliedSuffix(t *testing.T) {
 	target := pgtest.Start(t, 17)
 	ctx := context.Background()

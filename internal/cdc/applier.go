@@ -165,6 +165,9 @@ func (a *Applier) runConnection(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("cdc: read apply progress: %w", err)
 	}
+	if err := configureApplySession(ctx, conn); err != nil {
+		return err
+	}
 	if progressExists && a.config.AfterProgress != nil {
 		if err := a.config.AfterProgress(ctx, LSN(progress)); err != nil {
 			return err
@@ -213,6 +216,16 @@ func (a *Applier) runConnection(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func configureApplySession(ctx context.Context, conn *pgx.Conn) error {
+	// This connection is dedicated to logical replay. Set replica role once so
+	// every source transaction suppresses target triggers and referential
+	// actions without paying an extra target round trip per transaction.
+	if _, err := conn.Exec(ctx, "SET session_replication_role = replica"); err != nil {
+		return classifyApplyError(nil, 0, fmt.Errorf("cdc: disable target replication triggers: %w", err))
+	}
+	return nil
 }
 
 func (a *Applier) applyAvailable(ctx context.Context, conn *pgx.Conn, progress LSN) (bool, LSN, error) {
@@ -335,12 +348,6 @@ func (a *Applier) applyTransaction(ctx context.Context, conn *pgx.Conn, transact
 		return fmt.Errorf("cdc: begin target transaction: %w", err)
 	}
 	defer tx.Rollback(context.Background())
-	// Logical replication contains the child-row changes produced by source
-	// cascades. Suppress target triggers and referential actions while replaying
-	// so those rows are changed exactly once.
-	if _, err := tx.Exec(ctx, "SET LOCAL session_replication_role = replica"); err != nil {
-		return classifyApplyError(nil, 0, fmt.Errorf("cdc: disable target replication triggers: %w", err))
-	}
 
 	relations := make(map[uint32]*targetRelation, len(transaction.Relations))
 	for i := range transaction.Relations {
