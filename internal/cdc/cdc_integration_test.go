@@ -574,6 +574,136 @@ func TestPG17TargetRelationCacheInvalidatesChangedDefinition(t *testing.T) {
 	}
 }
 
+func TestPG17TransactionalProgressUpsert(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	conn := target.Connect(t)
+	const (
+		stream     = "progress-upsert"
+		generation = "progress-upsert-generation"
+	)
+	if err := EnsureStreamProgressIdentity(ctx, conn, StreamIdentityConfig{
+		StreamID: stream, Generation: generation, FreshSetup: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "CREATE TABLE public.progress_upsert_data (id integer PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, stream, generation, 10); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var started bool
+	var identityXID string
+	if err := conn.QueryRow(ctx, `
+		SELECT progress_started, xmin::text
+		FROM `+streamIdentityTable+`
+		WHERE stream_id = $1
+	`, stream).Scan(&started, &identityXID); err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("first progress did not mark the stream identity as started")
+	}
+
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, stream, generation, 11); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var laterIdentityXID string
+	if err := conn.QueryRow(ctx, `
+		SELECT xmin::text FROM `+streamIdentityTable+` WHERE stream_id = $1
+	`, stream).Scan(&laterIdentityXID); err != nil {
+		t.Fatal(err)
+	}
+	if laterIdentityXID != identityXID {
+		t.Fatalf("later progress rewrote identity row xmin %s -> %s", identityXID, laterIdentityXID)
+	}
+
+	restarted := target.Connect(t)
+	if err := EnsureStreamProgressIdentity(ctx, restarted, StreamIdentityConfig{
+		StreamID: stream, Generation: generation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = restarted.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, stream, generation, 12); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	progress, exists, err := postgres.ReadProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || LSN(progress) != 12 {
+		t.Fatalf("restart progress=%x exists=%t, want 12", progress, exists)
+	}
+
+	tx, err = restarted.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO public.progress_upsert_data VALUES (1)"); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, stream, "wrong-generation", 13); !errors.Is(err, ErrStreamGenerationMismatch) {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("generation mismatch error=%v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := restarted.QueryRow(ctx, "SELECT count(*) FROM public.progress_upsert_data").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("generation mismatch committed %d replay rows", count)
+	}
+	progress, exists, err = postgres.ReadProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || LSN(progress) != 12 {
+		t.Fatalf("generation mismatch changed progress to %x exists=%t", progress, exists)
+	}
+
+	tx, err = restarted.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, "missing-identity", generation, 1); !errors.Is(err, ErrStreamGenerationMismatch) {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("missing identity error=%v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 	target := pgtest.Start(t, 17)
 	ctx := context.Background()
