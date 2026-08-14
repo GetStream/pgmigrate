@@ -4,6 +4,7 @@ package cdc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -493,6 +494,583 @@ func TestPG17WaitUntilDoesNotScanStagedSegments(t *testing.T) {
 	if err := applier.WaitUntil(waitCtx, 0x100); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	applyConn := target.Connect(t)
+	if err := configureApplySession(ctx, applyConn); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		tx, err := applyConn.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var role string
+		if err := tx.QueryRow(ctx, "SHOW session_replication_role").Scan(&role); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatal(err)
+		}
+		if role != "replica" {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("apply transaction %d role=%q, want replica", i+1, role)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	other := target.Connect(t)
+	var role string
+	if err := other.QueryRow(ctx, "SHOW session_replication_role").Scan(&role); err != nil {
+		t.Fatal(err)
+	}
+	if role != "origin" {
+		t.Fatalf("unrelated target connection role=%q, want origin", role)
+	}
+}
+
+func TestPG17TargetRelationCacheInvalidatesChangedDefinition(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	conn := target.Connect(t)
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.relation_cache_items (
+			id bigint PRIMARY KEY,
+			value text NOT NULL
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	cache := newTargetRelationCache()
+	source := Relation{
+		OID: 991, Namespace: "public", Name: "relation_cache_items", ReplicaIdentity: 'd',
+		Columns: []Column{{Name: "id", Type: 20, Flags: 1}, {Name: "value", Type: 25}},
+	}
+	first, err := cache.resolve(ctx, tx, &source, loadTargetRelation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := cache.resolve(ctx, tx, &source, loadTargetRelation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != again {
+		t.Fatal("identical source relation missed the target metadata cache")
+	}
+	source.ReplicaIdentity = 'f'
+	changed, err := cache.resolve(ctx, tx, &source, loadTargetRelation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == first || changed.source.ReplicaIdentity != 'f' {
+		t.Fatal("changed source relation definition reused stale target metadata")
+	}
+}
+
+func TestPG17TransactionalProgressUpsert(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	conn := target.Connect(t)
+	const (
+		stream     = "progress-upsert"
+		generation = "progress-upsert-generation"
+	)
+	if err := EnsureStreamProgressIdentity(ctx, conn, StreamIdentityConfig{
+		StreamID: stream, Generation: generation, FreshSetup: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Exec(ctx, "CREATE TABLE public.progress_upsert_data (id integer PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, stream, generation, 10); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var started bool
+	var identityXID string
+	if err := conn.QueryRow(ctx, `
+		SELECT progress_started, xmin::text
+		FROM `+streamIdentityTable+`
+		WHERE stream_id = $1
+	`, stream).Scan(&started, &identityXID); err != nil {
+		t.Fatal(err)
+	}
+	if !started {
+		t.Fatal("first progress did not mark the stream identity as started")
+	}
+
+	tx, err = conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, stream, generation, 11); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var laterIdentityXID string
+	if err := conn.QueryRow(ctx, `
+		SELECT xmin::text FROM `+streamIdentityTable+` WHERE stream_id = $1
+	`, stream).Scan(&laterIdentityXID); err != nil {
+		t.Fatal(err)
+	}
+	if laterIdentityXID != identityXID {
+		t.Fatalf("later progress rewrote identity row xmin %s -> %s", identityXID, laterIdentityXID)
+	}
+
+	restarted := target.Connect(t)
+	if err := EnsureStreamProgressIdentity(ctx, restarted, StreamIdentityConfig{
+		StreamID: stream, Generation: generation,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tx, err = restarted.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, stream, generation, 12); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	progress, exists, err := postgres.ReadProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || LSN(progress) != 12 {
+		t.Fatalf("restart progress=%x exists=%t, want 12", progress, exists)
+	}
+
+	tx, err = restarted.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, "INSERT INTO public.progress_upsert_data VALUES (1)"); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, stream, "wrong-generation", 13); !errors.Is(err, ErrStreamGenerationMismatch) {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("generation mismatch error=%v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := restarted.QueryRow(ctx, "SELECT count(*) FROM public.progress_upsert_data").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("generation mismatch committed %d replay rows", count)
+	}
+	progress, exists, err = postgres.ReadProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || LSN(progress) != 12 {
+		t.Fatalf("generation mismatch changed progress to %x exists=%t", progress, exists)
+	}
+
+	tx, err = restarted.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, tx, "missing-identity", generation, 1); !errors.Is(err, ErrStreamGenerationMismatch) {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("missing identity error=%v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	conn := target.Connect(t)
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.pipeline_mixed (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (value <> 'bad')
+		);
+		CREATE TABLE public.pipeline_missing (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_binary (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_prepared (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_progress_guard (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_deferred_commit (
+			id integer PRIMARY KEY,
+			value text,
+			UNIQUE (value) DEFERRABLE INITIALLY DEFERRED
+		);
+		CREATE TABLE public.pipeline_spill (id integer PRIMARY KEY, value integer NOT NULL);
+		INSERT INTO public.pipeline_spill
+		SELECT id, 0 FROM generate_series(1, 257) AS id;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	tuple := func(datums ...TupleDatum) *Tuple {
+		value := Tuple(datums)
+		return &value
+	}
+	text := func(value string) TupleDatum {
+		return TupleDatum{Kind: DatumText, Data: []byte(value)}
+	}
+	relation := func(oid uint32, name string, valueOID uint32) Relation {
+		return Relation{
+			OID: oid, Namespace: "public", Name: name, ReplicaIdentity: 'd',
+			Columns: []Column{
+				{Name: "id", Type: 23, Flags: 1},
+				{Name: "value", Type: valueOID},
+			},
+		}
+	}
+	relationCache := newTargetRelationCache()
+	statementCache := newApplyStatementCache(applyStatementCacheCapacity)
+	apply := func(stream string, transaction *Transaction) error {
+		generation := stream + "-generation"
+		if err := EnsureStreamProgressIdentity(ctx, conn, StreamIdentityConfig{
+			StreamID: stream, Generation: generation, FreshSetup: true,
+		}); err != nil {
+			return err
+		}
+		applier := &Applier{config: ApplierConfig{
+			StreamID: stream, StreamGeneration: generation,
+		}}
+		return applier.applyTransaction(ctx, conn, relationCache, statementCache, transaction)
+	}
+	assertProgress := func(t *testing.T, stream string, want LSN) {
+		t.Helper()
+		progress, exists, err := postgres.ReadProgress(ctx, conn, stream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (!exists && want != 0) || (exists && LSN(progress) != want) {
+			t.Fatalf("%s progress=%x exists=%t, want %x", stream, progress, exists, want)
+		}
+	}
+
+	t.Run("mixed DML remains ordered", func(t *testing.T) {
+		source := relation(1101, "pipeline_mixed", 25)
+		transaction := &Transaction{
+			CommitLSN: 10, EndLSN: 11, Relations: []Relation{source},
+			Changes: []Change{
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("1"), text("first"))},
+				{RelationOID: source.OID, Kind: ChangeUpdate, Old: tuple(text("1"), TupleDatum{Kind: DatumNull}), New: tuple(text("1"), text("updated"))},
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("2"), text("second"))},
+				{RelationOID: source.OID, Kind: ChangeDelete, Old: tuple(text("1"), TupleDatum{Kind: DatumNull})},
+			},
+		}
+		if err := apply("pipeline-mixed", transaction); err != nil {
+			t.Fatal(err)
+		}
+		var id int
+		var value string
+		if err := conn.QueryRow(ctx, "SELECT id, value FROM public.pipeline_mixed").Scan(&id, &value); err != nil {
+			t.Fatal(err)
+		}
+		if id != 2 || value != "second" {
+			t.Fatalf("mixed replay row=%d/%q, want 2/second", id, value)
+		}
+		assertProgress(t, "pipeline-mixed", transaction.EndLSN)
+	})
+
+	t.Run("prepared DML is reused across source transactions", func(t *testing.T) {
+		source := relation(1108, "pipeline_prepared", 25)
+		for id, endLSN := range []LSN{61, 62} {
+			transaction := &Transaction{
+				CommitLSN: endLSN - 1, EndLSN: endLSN, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text(fmt.Sprint(id+1)), text("prepared")),
+				}},
+			}
+			if err := apply("pipeline-prepared", transaction); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var prepared int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_catalog.pg_prepared_statements
+			WHERE statement LIKE 'INSERT INTO "public"."pipeline_prepared"%'
+		`).Scan(&prepared); err != nil {
+			t.Fatal(err)
+		}
+		if prepared != 1 {
+			t.Fatalf("prepared INSERT statements=%d, want one reused statement", prepared)
+		}
+		assertProgress(t, "pipeline-prepared", 62)
+	})
+
+	t.Run("prepared DML eviction deallocates the server statement", func(t *testing.T) {
+		evictionConn := target.Connect(t)
+		source := relation(1109, "pipeline_prepared", 25)
+		const stream = "pipeline-prepared-eviction"
+		const generation = stream + "-generation"
+		if err := EnsureStreamProgressIdentity(ctx, evictionConn, StreamIdentityConfig{
+			StreamID: stream, Generation: generation, FreshSetup: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		applier := &Applier{config: ApplierConfig{
+			StreamID: stream, StreamGeneration: generation,
+		}}
+		evictionRelations := newTargetRelationCache()
+		evictionStatements := newApplyStatementCache(1)
+		if err := applier.applyTransaction(
+			ctx, evictionConn, evictionRelations, evictionStatements,
+			&Transaction{
+				CommitLSN: 69, EndLSN: 70, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("100"), text("before")),
+				}},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		var evictedName string
+		if err := evictionConn.QueryRow(
+			ctx, `
+				SELECT name FROM pg_catalog.pg_prepared_statements
+				WHERE name LIKE 'pgmigrate_cdc_%'
+			`,
+		).Scan(&evictedName); err != nil {
+			t.Fatal(err)
+		}
+		if err := applier.applyTransaction(
+			ctx, evictionConn, evictionRelations, evictionStatements,
+			&Transaction{
+				CommitLSN: 70, EndLSN: 71, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("100"), TupleDatum{Kind: DatumNull}),
+					New: tuple(text("100"), text("after")),
+				}},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		var oldCount, preparedCount int
+		if err := evictionConn.QueryRow(ctx, `
+			SELECT count(*) FILTER (WHERE name = $1), count(*)
+			FROM pg_catalog.pg_prepared_statements
+			WHERE name LIKE 'pgmigrate_cdc_%'
+		`, evictedName).Scan(&oldCount, &preparedCount); err != nil {
+			t.Fatal(err)
+		}
+		if oldCount != 0 || preparedCount != 1 {
+			t.Fatalf("after eviction old/current prepared statements=%d/%d, want 0/1", oldCount, preparedCount)
+		}
+	})
+
+	t.Run("SQL failure rolls back data and progress", func(t *testing.T) {
+		source := relation(1102, "pipeline_checked", 25)
+		transaction := &Transaction{
+			CommitLSN: 20, EndLSN: 21, Relations: []Relation{source},
+			Changes: []Change{
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("1"), text("good"))},
+				{RelationOID: source.OID, Kind: ChangeUpdate, Old: tuple(text("1"), TupleDatum{Kind: DatumNull}), New: tuple(text("1"), text("bad"))},
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("2"), text("later"))},
+			},
+		}
+		var divergence *DivergenceError
+		if err := apply("pipeline-sql-failure", transaction); !errors.As(err, &divergence) {
+			t.Fatalf("pipeline SQL error=%v, want divergence", err)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM public.pipeline_checked").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("failed pipeline committed %d rows", count)
+		}
+		assertProgress(t, "pipeline-sql-failure", 0)
+	})
+
+	t.Run("progress mismatch aborts before queued commit", func(t *testing.T) {
+		const stream = "pipeline-progress-guard"
+		const generation = stream + "-generation"
+		if err := EnsureStreamProgressIdentity(ctx, conn, StreamIdentityConfig{
+			StreamID: stream, Generation: generation, FreshSetup: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		source := relation(1110, "pipeline_progress_guard", 25)
+		applier := &Applier{config: ApplierConfig{
+			StreamID: stream, StreamGeneration: "wrong-generation",
+		}}
+		err := applier.applyTransaction(
+			ctx, conn, relationCache, statementCache,
+			&Transaction{
+				CommitLSN: 79, EndLSN: 80, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("1"), text("must roll back")),
+				}},
+			},
+		)
+		if !errors.Is(err, ErrStreamGenerationMismatch) {
+			t.Fatalf("progress mismatch error=%v", err)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM public.pipeline_progress_guard").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("progress mismatch committed %d rows", count)
+		}
+		assertProgress(t, stream, 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after progress mismatch=%q, want idle", status)
+		}
+	})
+
+	t.Run("deferred commit failure rolls back data and progress", func(t *testing.T) {
+		source := relation(1111, "pipeline_deferred_commit", 25)
+		transaction := &Transaction{
+			CommitLSN: 89, EndLSN: 90, Relations: []Relation{source},
+			Changes: []Change{
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("1"), text("duplicate"))},
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("2"), text("duplicate"))},
+			},
+		}
+		var divergence *DivergenceError
+		if err := apply("pipeline-deferred-commit", transaction); !errors.As(err, &divergence) {
+			t.Fatalf("deferred commit error=%v, want divergence", err)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM public.pipeline_deferred_commit").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("failed commit retained %d rows", count)
+		}
+		assertProgress(t, "pipeline-deferred-commit", 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after failed commit=%q, want idle", status)
+		}
+	})
+
+	t.Run("empty source transaction advances progress", func(t *testing.T) {
+		transaction := &Transaction{CommitLSN: 99, EndLSN: 100}
+		if err := apply("pipeline-empty", transaction); err != nil {
+			t.Fatal(err)
+		}
+		assertProgress(t, "pipeline-empty", transaction.EndLSN)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after empty transaction=%q, want idle", status)
+		}
+	})
+
+	for _, kind := range []ChangeKind{ChangeUpdate, ChangeDelete} {
+		t.Run("zero-row "+changeKindName(kind)+" rolls back progress", func(t *testing.T) {
+			source := relation(1103+uint32(kind), "pipeline_missing", 25)
+			change := Change{
+				RelationOID: source.OID, Kind: kind,
+				Old: tuple(text("404"), TupleDatum{Kind: DatumNull}),
+			}
+			if kind == ChangeUpdate {
+				change.New = tuple(text("404"), text("missing"))
+			}
+			stream := "pipeline-zero-" + changeKindName(kind)
+			var divergence *DivergenceError
+			err := apply(stream, &Transaction{
+				CommitLSN: 30 + LSN(kind), EndLSN: 31 + LSN(kind),
+				Relations: []Relation{source}, Changes: []Change{change},
+			})
+			if !errors.As(err, &divergence) {
+				t.Fatalf("zero-row %s error=%v, want divergence", changeKindName(kind), err)
+			}
+			assertProgress(t, stream, 0)
+		})
+	}
+
+	t.Run("binary and null parameters", func(t *testing.T) {
+		source := relation(1106, "pipeline_binary", 25)
+		id := make([]byte, 4)
+		binary.BigEndian.PutUint32(id, 7)
+		transaction := &Transaction{
+			CommitLSN: 40, EndLSN: 41, Relations: []Relation{source},
+			Changes: []Change{{
+				RelationOID: source.OID, Kind: ChangeInsert,
+				New: tuple(
+					TupleDatum{Kind: DatumBinary, Data: id},
+					TupleDatum{Kind: DatumNull},
+				),
+			}},
+		}
+		if err := apply("pipeline-binary", transaction); err != nil {
+			t.Fatal(err)
+		}
+		var gotID int
+		var null bool
+		if err := conn.QueryRow(
+			ctx, "SELECT id, value IS NULL FROM public.pipeline_binary",
+		).Scan(&gotID, &null); err != nil {
+			t.Fatal(err)
+		}
+		if gotID != 7 || !null {
+			t.Fatalf("binary/null row=%d null=%t, want 7/true", gotID, null)
+		}
+	})
+
+	t.Run("spilled transaction crosses pipeline windows", func(t *testing.T) {
+		source := relation(1107, "pipeline_spill", 23)
+		spill, err := newTransactionSpill(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer spill.closeAndRemove()
+		for id := 1; id <= applyPipelineWindow+1; id++ {
+			change := Change{
+				RelationOID: source.OID, Kind: ChangeUpdate,
+				Old: tuple(text(fmt.Sprint(id)), TupleDatum{Kind: DatumNull}),
+				New: tuple(text(fmt.Sprint(id)), text("1")),
+			}
+			if err := spill.appendChange(&change); err != nil {
+				t.Fatal(err)
+			}
+		}
+		transaction := &Transaction{
+			CommitLSN: 50, EndLSN: 51, Relations: []Relation{source}, Spill: spill,
+		}
+		if err := apply("pipeline-spill", transaction); err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		if err := conn.QueryRow(
+			ctx, "SELECT count(*) FROM public.pipeline_spill WHERE value = 1",
+		).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != applyPipelineWindow+1 {
+			t.Fatalf("updated spill rows=%d, want %d", count, applyPipelineWindow+1)
+		}
+		assertProgress(t, "pipeline-spill", transaction.EndLSN)
+	})
 }
 
 func TestPG17ApplierStartsBeforeReadingUnappliedSuffix(t *testing.T) {
