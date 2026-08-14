@@ -4,6 +4,7 @@ package cdc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -571,6 +572,201 @@ func TestPG17TargetRelationCacheInvalidatesChangedDefinition(t *testing.T) {
 	if changed == first || changed.source.ReplicaIdentity != 'f' {
 		t.Fatal("changed source relation definition reused stale target metadata")
 	}
+}
+
+func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	conn := target.Connect(t)
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.pipeline_mixed (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (value <> 'bad')
+		);
+		CREATE TABLE public.pipeline_missing (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_binary (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_spill (id integer PRIMARY KEY, value integer NOT NULL);
+		INSERT INTO public.pipeline_spill
+		SELECT id, 0 FROM generate_series(1, 257) AS id;
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	tuple := func(datums ...TupleDatum) *Tuple {
+		value := Tuple(datums)
+		return &value
+	}
+	text := func(value string) TupleDatum {
+		return TupleDatum{Kind: DatumText, Data: []byte(value)}
+	}
+	relation := func(oid uint32, name string, valueOID uint32) Relation {
+		return Relation{
+			OID: oid, Namespace: "public", Name: name, ReplicaIdentity: 'd',
+			Columns: []Column{
+				{Name: "id", Type: 23, Flags: 1},
+				{Name: "value", Type: valueOID},
+			},
+		}
+	}
+	apply := func(stream string, transaction *Transaction) error {
+		generation := stream + "-generation"
+		if err := EnsureStreamProgressIdentity(ctx, conn, StreamIdentityConfig{
+			StreamID: stream, Generation: generation, FreshSetup: true,
+		}); err != nil {
+			return err
+		}
+		applier := &Applier{config: ApplierConfig{
+			StreamID: stream, StreamGeneration: generation,
+		}}
+		return applier.applyTransaction(ctx, conn, newTargetRelationCache(), transaction)
+	}
+	assertProgress := func(t *testing.T, stream string, want LSN) {
+		t.Helper()
+		progress, exists, err := postgres.ReadProgress(ctx, conn, stream)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if (!exists && want != 0) || (exists && LSN(progress) != want) {
+			t.Fatalf("%s progress=%x exists=%t, want %x", stream, progress, exists, want)
+		}
+	}
+
+	t.Run("mixed DML remains ordered", func(t *testing.T) {
+		source := relation(1101, "pipeline_mixed", 25)
+		transaction := &Transaction{
+			CommitLSN: 10, EndLSN: 11, Relations: []Relation{source},
+			Changes: []Change{
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("1"), text("first"))},
+				{RelationOID: source.OID, Kind: ChangeUpdate, Old: tuple(text("1"), TupleDatum{Kind: DatumNull}), New: tuple(text("1"), text("updated"))},
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("2"), text("second"))},
+				{RelationOID: source.OID, Kind: ChangeDelete, Old: tuple(text("1"), TupleDatum{Kind: DatumNull})},
+			},
+		}
+		if err := apply("pipeline-mixed", transaction); err != nil {
+			t.Fatal(err)
+		}
+		var id int
+		var value string
+		if err := conn.QueryRow(ctx, "SELECT id, value FROM public.pipeline_mixed").Scan(&id, &value); err != nil {
+			t.Fatal(err)
+		}
+		if id != 2 || value != "second" {
+			t.Fatalf("mixed replay row=%d/%q, want 2/second", id, value)
+		}
+		assertProgress(t, "pipeline-mixed", transaction.EndLSN)
+	})
+
+	t.Run("SQL failure rolls back data and progress", func(t *testing.T) {
+		source := relation(1102, "pipeline_checked", 25)
+		transaction := &Transaction{
+			CommitLSN: 20, EndLSN: 21, Relations: []Relation{source},
+			Changes: []Change{
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("1"), text("good"))},
+				{RelationOID: source.OID, Kind: ChangeUpdate, Old: tuple(text("1"), TupleDatum{Kind: DatumNull}), New: tuple(text("1"), text("bad"))},
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("2"), text("later"))},
+			},
+		}
+		var divergence *DivergenceError
+		if err := apply("pipeline-sql-failure", transaction); !errors.As(err, &divergence) {
+			t.Fatalf("pipeline SQL error=%v, want divergence", err)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM public.pipeline_checked").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("failed pipeline committed %d rows", count)
+		}
+		assertProgress(t, "pipeline-sql-failure", 0)
+	})
+
+	for _, kind := range []ChangeKind{ChangeUpdate, ChangeDelete} {
+		t.Run("zero-row "+changeKindName(kind)+" rolls back progress", func(t *testing.T) {
+			source := relation(1103+uint32(kind), "pipeline_missing", 25)
+			change := Change{
+				RelationOID: source.OID, Kind: kind,
+				Old: tuple(text("404"), TupleDatum{Kind: DatumNull}),
+			}
+			if kind == ChangeUpdate {
+				change.New = tuple(text("404"), text("missing"))
+			}
+			stream := "pipeline-zero-" + changeKindName(kind)
+			var divergence *DivergenceError
+			err := apply(stream, &Transaction{
+				CommitLSN: 30 + LSN(kind), EndLSN: 31 + LSN(kind),
+				Relations: []Relation{source}, Changes: []Change{change},
+			})
+			if !errors.As(err, &divergence) {
+				t.Fatalf("zero-row %s error=%v, want divergence", changeKindName(kind), err)
+			}
+			assertProgress(t, stream, 0)
+		})
+	}
+
+	t.Run("binary and null parameters", func(t *testing.T) {
+		source := relation(1106, "pipeline_binary", 25)
+		id := make([]byte, 4)
+		binary.BigEndian.PutUint32(id, 7)
+		transaction := &Transaction{
+			CommitLSN: 40, EndLSN: 41, Relations: []Relation{source},
+			Changes: []Change{{
+				RelationOID: source.OID, Kind: ChangeInsert,
+				New: tuple(
+					TupleDatum{Kind: DatumBinary, Data: id},
+					TupleDatum{Kind: DatumNull},
+				),
+			}},
+		}
+		if err := apply("pipeline-binary", transaction); err != nil {
+			t.Fatal(err)
+		}
+		var gotID int
+		var null bool
+		if err := conn.QueryRow(
+			ctx, "SELECT id, value IS NULL FROM public.pipeline_binary",
+		).Scan(&gotID, &null); err != nil {
+			t.Fatal(err)
+		}
+		if gotID != 7 || !null {
+			t.Fatalf("binary/null row=%d null=%t, want 7/true", gotID, null)
+		}
+	})
+
+	t.Run("spilled transaction crosses pipeline windows", func(t *testing.T) {
+		source := relation(1107, "pipeline_spill", 23)
+		spill, err := newTransactionSpill(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer spill.closeAndRemove()
+		for id := 1; id <= applyPipelineWindow+1; id++ {
+			change := Change{
+				RelationOID: source.OID, Kind: ChangeUpdate,
+				Old: tuple(text(fmt.Sprint(id)), TupleDatum{Kind: DatumNull}),
+				New: tuple(text(fmt.Sprint(id)), text("1")),
+			}
+			if err := spill.appendChange(&change); err != nil {
+				t.Fatal(err)
+			}
+		}
+		transaction := &Transaction{
+			CommitLSN: 50, EndLSN: 51, Relations: []Relation{source}, Spill: spill,
+		}
+		if err := apply("pipeline-spill", transaction); err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		if err := conn.QueryRow(
+			ctx, "SELECT count(*) FROM public.pipeline_spill WHERE value = 1",
+		).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != applyPipelineWindow+1 {
+			t.Fatalf("updated spill rows=%d, want %d", count, applyPipelineWindow+1)
+		}
+		assertProgress(t, "pipeline-spill", transaction.EndLSN)
+	})
 }
 
 func TestPG17ApplierStartsBeforeReadingUnappliedSuffix(t *testing.T) {
