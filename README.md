@@ -51,10 +51,11 @@ migration directory and fsynced at each transaction boundary; a transaction over
 256 MiB spills to temporary files beneath `cdc/spill`. Transactions that touch
 different tables replay concurrently while each table retains source order.
 Contiguous transactions already serialized by the same tables share a bounded
-target commit. Target DML commits in the same transaction as
-`pgmigrate_internal.replication_progress` on the target, which is the
-authoritative apply position. Finalized segments that have been applied are
-pruned every `--segment-prune-interval`, retaining one safety segment.
+target commit. Each parallel DML commit atomically records a durable target
+receipt; `pgmigrate_internal.replication_progress` advances only across the
+contiguous receipt prefix and remains the authoritative apply position.
+Finalized segments that have been checkpointed are pruned every
+`--segment-prune-interval`, retaining one safety segment.
 
 `pgmigrate cutover` then emits a logical boundary message, drains exactly through
 it, advances target sequences with headroom, reverts what the migration changed on
@@ -281,7 +282,7 @@ directory's writer lock.
 | `--ack-warnings` | false | accept every current preflight warning, including consenting to `REPLICA IDENTITY FULL` where it is needed |
 | `--allow-collation-change` | false | proceed to a target that collates text differently from the source |
 | `--workers <n>` | host CPU count | parallel copy and index-build workers, and the cap on parts per table |
-| `--replay-workers <n>` | host CPU count clamped to 8–32 | target sessions that replay independent tables concurrently. Transactions touching the same table wait for their predecessor, and every target batch still commits in source order |
+| `--replay-workers <n>` | host CPU count clamped to 8–32 | target sessions that replay independent tables concurrently. Transactions touching the same table wait for their predecessor; independent durable commits may finish out of order while authoritative progress advances only through their contiguous source-order prefix |
 | `--replay-batch-size <n>` | `64` | maximum contiguous dependent source transactions combined into one durable target transaction. Independent table lanes are never combined, and encoded batch data is capped at 16 MiB |
 | `--replay-window <n>` | 8 times `--replay-workers` | source transactions searched for independent table work; also bounds scheduler memory |
 | `--split-threshold <bytes>` | `1073741824` (1 GiB) | desired bytes per copy part. A table is split into at most `--workers` parts, so a table far larger than the threshold produces larger parts |
@@ -460,13 +461,13 @@ about what a partial part left behind.
 ### Apply progress lives on the target, not beside the tool
 
 `pgmigrate_internal.replication_progress` on the target is the authoritative
-apply position, and it commits in the same transaction as the DML it describes.
-The local SQLite database is a low-rate control plane whose apply LSN is
-display-only. A position recorded anywhere but next to the rows can disagree
-with them after a crash, and then replay either loses transactions or repeats
-them. A source-and-filter-derived stream generation binds copied data to that
-progress, and a resume refuses progress that is missing or belongs to another
-stream.
+apply position. Serial replay commits it with DML. Parallel replay commits a
+durable receipt with each independent DML transaction, then atomically advances
+progress and removes only the contiguous receipt prefix. A crash before that
+checkpoint leaves receipts that make already-committed DML unambiguous on
+resume. The local SQLite database is a low-rate control plane whose apply LSN is
+display-only. A source-and-filter-derived stream generation binds copied data,
+receipts, and progress; a resume refuses missing or mismatched durable identity.
 
 Every connection that reads or executes a catalog definition pins `search_path`
 to the empty path, so definitions are fully qualified and mean the same thing on
@@ -690,9 +691,11 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
 
 - A torn `.partial` CDC tail is scanned and truncated to the last valid frame.
   Receiving resumes from the latest fsynced transaction EndLSN.
-- Target DML and authoritative progress commit atomically, so a reconnect or
-  restart skips transactions already recorded on the target. Missing or
-  mismatched stream generation or progress is fatal once copied data exists.
+- Serial target DML and progress commit atomically. Parallel DML commits with a
+  durable receipt, and checkpoint progress advances while deleting the
+  contiguous receipt prefix in one target transaction. A restart therefore
+  skips every committed transaction without guessing. Missing or mismatched
+  stream generation or progress is fatal once progress has started.
 - Restarts from `indexes`, `catchup`, or `follow` retain the completed base copy
   and recover staged CDC.
 - Restarts from `setup`, `schema`, or `copy` deliberately discard **all**

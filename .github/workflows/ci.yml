@@ -48,8 +48,8 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - name: Test concurrent and batched replay
-        run: go test -race -tags=integration ./internal/cdc -run '^TestPG17(ConcurrentReplayRunsIndependentTablesTogetherAndOrdersEachTable|ReplayBatchCollapsesSerializedCommitLane)$' -count=1
+      - name: Test concurrent, durable, and batched replay
+        run: go test -race -tags=integration ./internal/cdc -run '^TestPG17(ConcurrentReplayRunsIndependentTablesTogetherAndOrdersEachTable|ConcurrentReplayRecoversAnOutOfOrderDurableCommit|ReplayBatchCollapsesSerializedCommitLane|ReplayScalesAcrossIndependentCommitLanes)$' -count=1 -timeout=3m
       - name: Run a live migration with concurrent replay
         run: make e2e
       - name: Print container logs on failure

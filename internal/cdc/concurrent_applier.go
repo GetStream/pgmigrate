@@ -58,12 +58,9 @@ type replayJob struct {
 	payloadBytes uint64
 	waiting      int
 	dependents   []*replayJob
-	prepared     bool
-	committing   bool
+	committed    bool
 	submitted    bool
 	sealed       bool
-	full         bool
-	commit       chan struct{}
 }
 
 const maxReplayBatchBytes = uint64(16 << 20)
@@ -83,8 +80,6 @@ func newReplayJob(transaction Transaction, payloadBytes uint64, batchSize int) *
 		relations:    relations,
 		payloadBytes: payloadBytes,
 		sealed:       batchSize == 1 || payloadBytes >= maxReplayBatchBytes,
-		full:         batchSize > 1 && payloadBytes >= maxReplayBatchBytes,
-		commit:       make(chan struct{}),
 	}
 }
 
@@ -94,7 +89,6 @@ func (j *replayJob) append(transaction Transaction, payloadBytes uint64, batchSi
 	}
 	if len(j.transactions) >= batchSize || j.payloadBytes+payloadBytes > maxReplayBatchBytes {
 		j.sealed = true
-		j.full = true
 		return false
 	}
 	for _, relation := range transaction.Relations {
@@ -114,8 +108,7 @@ func (j *replayJob) append(transaction Transaction, payloadBytes uint64, batchSi
 	}
 	j.transactions = append(j.transactions, transaction)
 	j.payloadBytes += payloadBytes
-	j.full = len(j.transactions) >= batchSize || j.payloadBytes >= maxReplayBatchBytes
-	j.sealed = j.full
+	j.sealed = len(j.transactions) >= batchSize || j.payloadBytes >= maxReplayBatchBytes
 	return true
 }
 
@@ -138,7 +131,12 @@ func linkReplayJob(job *replayJob, tails map[uint32]*replayJob) {
 	predecessors := make(map[*replayJob]struct{}, len(job.relations))
 	for _, relation := range job.relations {
 		if predecessor := tails[relation]; predecessor != nil {
-			predecessors[predecessor] = struct{}{}
+			// A fast independent lane can commit while the reader is still
+			// discovering later source transactions. It is already a satisfied
+			// dependency and will not emit another completion event.
+			if !predecessor.committed {
+				predecessors[predecessor] = struct{}{}
+			}
 		}
 		tails[relation] = job
 	}
@@ -148,15 +146,9 @@ func linkReplayJob(job *replayJob, tails map[uint32]*replayJob) {
 	}
 }
 
-const (
-	workerPrepared = iota + 1
-	workerCommitted
-)
-
 type applyWorkerEvent struct {
-	job   *replayJob
-	phase int
-	err   error
+	job *replayJob
+	err error
 }
 
 type applyWorkerPool struct {
@@ -165,6 +157,7 @@ type applyWorkerPool struct {
 	applier  *Applier
 	jobs     chan *replayJob
 	results  chan applyWorkerEvent
+	progress *pgx.Conn
 	extra    []*pgx.Conn
 	wg       sync.WaitGroup
 	stopOnce sync.Once
@@ -175,17 +168,16 @@ func newApplyWorkerPool(
 	applier *Applier,
 	first *pgx.Conn,
 ) (*applyWorkerPool, error) {
-	connections := make([]*pgx.Conn, 1, applier.config.Workers)
-	connections[0] = first
-	for worker := 1; worker < applier.config.Workers; worker++ {
+	connections := make([]*pgx.Conn, 0, applier.config.Workers)
+	for worker := 0; worker < applier.config.Workers; worker++ {
 		conn, err := postgres.Connect(ctx, applier.config.ConnString)
 		if err != nil {
-			closeApplyConnections(connections[1:])
+			closeApplyConnections(connections)
 			return nil, fmt.Errorf("cdc: connect applier worker %d: %w", worker+1, err)
 		}
 		if err := configureApplySession(ctx, conn); err != nil {
 			conn.Close(context.Background())
-			closeApplyConnections(connections[1:])
+			closeApplyConnections(connections)
 			return nil, fmt.Errorf("cdc: configure applier worker %d: %w", worker+1, err)
 		}
 		connections = append(connections, conn)
@@ -193,12 +185,13 @@ func newApplyWorkerPool(
 
 	poolCtx, cancel := context.WithCancel(ctx)
 	pool := &applyWorkerPool{
-		ctx:     poolCtx,
-		cancel:  cancel,
-		applier: applier,
-		jobs:    make(chan *replayJob, applier.config.Workers),
-		results: make(chan applyWorkerEvent, applier.config.Workers*2),
-		extra:   connections[1:],
+		ctx:      poolCtx,
+		cancel:   cancel,
+		applier:  applier,
+		jobs:     make(chan *replayJob, applier.config.Workers),
+		results:  make(chan applyWorkerEvent, applier.config.Workers),
+		progress: first,
+		extra:    connections,
 	}
 	for _, conn := range connections {
 		pool.wg.Add(1)
@@ -225,21 +218,11 @@ func (p *applyWorkerPool) runWorker(conn *pgx.Conn) {
 			prepared, err := p.applier.prepareTransactions(
 				p.ctx, conn, relations, statements, job.transactions,
 			)
-			if !p.send(applyWorkerEvent{job: job, phase: workerPrepared, err: err}) {
+			if err == nil {
+				err = p.applier.commitPreparedReplay(prepared, job.transactions)
+			}
+			if !p.send(applyWorkerEvent{job: job, err: err}) {
 				_ = prepared.abort()
-				return
-			}
-			if err != nil {
-				continue
-			}
-			select {
-			case <-p.ctx.Done():
-				_ = prepared.abort()
-				return
-			case <-job.commit:
-			}
-			err = p.applier.commitPreparedTransaction(prepared, job.endLSN())
-			if !p.send(applyWorkerEvent{job: job, phase: workerCommitted, err: err}) {
 				return
 			}
 		}
@@ -272,10 +255,51 @@ func (p *applyWorkerPool) stop() {
 	})
 }
 
-// applyConcurrentAvailable reads ahead by a bounded amount, runs transactions
-// as soon as all preceding transactions for their tables have committed, and
-// grants commit permission strictly in source order. Progress is updated in the
-// same target transaction as its data, preserving crash-safe exactly-once replay.
+type replayReadEvent struct {
+	transaction Transaction
+	err         error
+}
+
+// startReplayReadPump keeps a large on-disk transaction from starving target
+// completion events. Its single-item channel bounds read-ahead to one decoded
+// transaction beyond the scheduler window.
+func startReplayReadPump(
+	ctx context.Context,
+	reader *Reader,
+) (<-chan replayReadEvent, context.CancelFunc, *sync.WaitGroup) {
+	readCtx, cancel := context.WithCancel(ctx)
+	events := make(chan replayReadEvent, 1)
+	wg := new(sync.WaitGroup)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		defer close(events)
+		for {
+			select {
+			case <-readCtx.Done():
+				return
+			default:
+			}
+			transaction, err := reader.Next()
+			select {
+			case events <- replayReadEvent{transaction: transaction, err: err}:
+			case <-readCtx.Done():
+				_ = transaction.CleanupSpill()
+				return
+			}
+			if err != nil {
+				return
+			}
+		}
+	}()
+	return events, cancel, wg
+}
+
+// applyConcurrentAvailable reads ahead by a bounded amount and commits a job
+// as soon as every preceding transaction for its tables is durable. Each worker
+// atomically records replay receipts with its DML. The coordinator checkpoints
+// only the contiguous receipt prefix, so independent commits can finish out of
+// source order without weakening crash recovery.
 func (a *Applier) applyConcurrentAvailable(
 	ctx context.Context,
 	pool *applyWorkerPool,
@@ -284,6 +308,8 @@ func (a *Applier) applyConcurrentAvailable(
 ) (bool, LSN, error) {
 	maxPending := a.config.Window
 	compactAt := max(a.config.Workers*4, a.config.Workers)
+	checkpointEvery := max(a.config.Workers*4, a.config.BatchSize)
+	checkpointEvery = min(checkpointEvery, maxPending)
 	jobs := make([]*replayJob, 0, min(maxPending, compactAt))
 	front := 0
 	active := 0
@@ -291,31 +317,157 @@ func (a *Applier) applyConcurrentAvailable(
 	exhausted := false
 	applied := false
 	next := progress
+	durableNext := progress
 	tails := make(map[uint32]*replayJob)
 	runnable := make([]*replayJob, 0, a.config.Workers)
+	checkpointLSNs := make([]LSN, 0, checkpointEvery)
+	receipts, err := loadStreamReplayReceipts(
+		ctx, pool.progress, a.config.StreamID, a.config.StreamGeneration, progress,
+	)
+	if err != nil {
+		return false, progress, fmt.Errorf("cdc: load durable replay receipts: %w", err)
+	}
+	receiptIndex := 0
+	readEvents, cancelRead, readWG := startReplayReadPump(ctx, reader)
+
+	stopReader := func() error {
+		cancelRead()
+		readWG.Wait()
+		var result error
+		for event := range readEvents {
+			result = errors.Join(result, event.transaction.CleanupSpill())
+		}
+		return result
+	}
 
 	fail := func(err error) (bool, LSN, error) {
 		pool.stop()
+		err = errors.Join(err, stopReader())
 		for i := front; i < len(jobs); i++ {
 			err = errors.Join(err, jobs[i].cleanupSpills())
 		}
 		return applied, next, err
 	}
+	succeed := func() (bool, LSN, error) {
+		return applied, next, stopReader()
+	}
+
+	sealLast := func() {
+		if len(jobs) > front {
+			jobs[len(jobs)-1].sealed = true
+		}
+	}
+
+	checkpoint := func() error {
+		if len(checkpointLSNs) == 0 {
+			return nil
+		}
+		if err := checkpointStreamProgress(
+			ctx, pool.progress, a.config.StreamID, a.config.StreamGeneration, durableNext,
+		); err != nil {
+			return fmt.Errorf("cdc: checkpoint replay progress: %w", err)
+		}
+		next = durableNext
+		applied = true
+		if a.config.AfterProgress != nil {
+			for _, checkpointLSN := range checkpointLSNs {
+				if err := a.config.AfterProgress(ctx, checkpointLSN); err != nil {
+					return err
+				}
+			}
+		}
+		checkpointLSNs = checkpointLSNs[:0]
+		return nil
+	}
+
+	advanceCommittedPrefix := func() error {
+		for front < len(jobs) && jobs[front].committed {
+			job := jobs[front]
+			if err := job.cleanupSpills(); err != nil {
+				return fmt.Errorf("cdc: cleanup applied reader spill: %w", err)
+			}
+			for i := range job.transactions {
+				checkpointLSNs = append(checkpointLSNs, job.transactions[i].EndLSN)
+			}
+			durableNext = job.endLSN()
+			pending -= len(job.transactions)
+			for _, relation := range job.relations {
+				if tails[relation] == job {
+					delete(tails, relation)
+				}
+			}
+			front++
+			if front >= compactAt {
+				remaining := copy(jobs, jobs[front:])
+				clear(jobs[remaining:])
+				jobs = jobs[:remaining]
+				front = 0
+			}
+		}
+		return nil
+	}
 
 	for {
-		// Start target work as soon as every idle worker has a runnable job.
-		// Keep scanning to maxPending only when table dependencies hide parallel
-		// work behind transactions that cannot run yet.
-		for !exhausted && pending < maxPending &&
-			active+len(runnable) < a.config.Workers && !fullRunnable(runnable) {
-			transaction, err := reader.Next()
-			if errors.Is(err, io.EOF) {
-				exhausted = true
+		if exhausted || pending >= maxPending {
+			sealLast()
+		}
+		for active < a.config.Workers {
+			selected := -1
+			for i, job := range runnable {
+				if job.sealed {
+					selected = i
+					break
+				}
+			}
+			if selected < 0 {
 				break
 			}
-			if err != nil {
+			job := runnable[selected]
+			copy(runnable[selected:], runnable[selected+1:])
+			runnable[len(runnable)-1] = nil
+			runnable = runnable[:len(runnable)-1]
+			if err := pool.submit(job); err != nil {
 				return fail(err)
 			}
+			job.submitted = true
+			active++
+		}
+
+		if err := advanceCommittedPrefix(); err != nil {
+			return fail(err)
+		}
+		if len(checkpointLSNs) >= checkpointEvery || exhausted && front == len(jobs) {
+			if err := checkpoint(); err != nil {
+				return fail(err)
+			}
+		}
+		if exhausted && front == len(jobs) && active == 0 {
+			return succeed()
+		}
+		if active == 0 && exhausted && len(runnable) == 0 {
+			return fail(errors.New("cdc: concurrent replay scheduler has pending work but no runnable transaction"))
+		}
+
+		var availableReads <-chan replayReadEvent
+		if !exhausted && pending < maxPending {
+			availableReads = readEvents
+		}
+		select {
+		case <-ctx.Done():
+			return fail(ctx.Err())
+		case event, ok := <-availableReads:
+			if !ok {
+				exhausted = true
+				continue
+			}
+			if errors.Is(event.err, io.EOF) {
+				exhausted = true
+				continue
+			}
+			if event.err != nil {
+				return fail(event.err)
+			}
+			transaction := event.transaction
 			if transaction.EndLSN <= progress {
 				if err := transaction.CleanupSpill(); err != nil {
 					return fail(fmt.Errorf("cdc: cleanup already-applied reader spill: %w", err))
@@ -332,12 +484,36 @@ func (a *Applier) applyConcurrentAvailable(
 						return fail(fmt.Errorf("cdc: cleanup post-boundary reader spill: %w", err))
 					}
 					exhausted = true
-					break
+					continue
 				}
+			}
+
+			for receiptIndex < len(receipts) && transaction.EndLSN > receipts[receiptIndex].last {
+				receiptIndex++
+			}
+			recovered := receiptIndex < len(receipts) &&
+				transaction.EndLSN >= receipts[receiptIndex].first
+			if recovered {
+				sealLast()
+				for _, relation := range transaction.Relations {
+					if tails[relation.OID] != nil {
+						return fail(fmt.Errorf(
+							"cdc: durable receipt %x precedes an unapplied transaction for table %d",
+							transaction.EndLSN, relation.OID,
+						))
+					}
+				}
+				job := newReplayJob(transaction, 0, 1)
+				job.committed = true
+				job.submitted = true
+				jobs = append(jobs, job)
+				pending++
+				continue
 			}
 
 			payloadBytes := uint64(0)
 			if a.config.BatchSize > 1 {
+				var err error
 				payloadBytes, err = transactionPayloadSize(&transaction)
 				if err != nil {
 					return fail(errors.Join(err, transaction.CleanupSpill()))
@@ -357,101 +533,18 @@ func (a *Applier) applyConcurrentAvailable(
 			if job.waiting == 0 {
 				runnable = append(runnable, job)
 			}
-		}
-
-		for active < a.config.Workers && len(runnable) != 0 {
-			job := runnable[0]
-			runnable[0] = nil
-			runnable = runnable[1:]
-			if len(runnable) == 0 {
-				runnable = nil
-			}
-			if err := pool.submit(job); err != nil {
-				return fail(err)
-			}
-			job.submitted = true
-			active++
-		}
-
-		if front < len(jobs) && jobs[front].prepared && !jobs[front].committing {
-			jobs[front].committing = true
-			close(jobs[front].commit)
-		}
-		if exhausted && front == len(jobs) {
-			return applied, next, nil
-		}
-		if active == 0 {
-			return fail(errors.New("cdc: concurrent replay scheduler has pending work but no runnable transaction"))
-		}
-
-		select {
-		case <-ctx.Done():
-			return fail(ctx.Err())
 		case event := <-pool.results:
-			switch event.phase {
-			case workerPrepared:
-				if event.err != nil {
-					return fail(event.err)
+			if event.err != nil {
+				return fail(event.err)
+			}
+			active--
+			event.job.committed = true
+			for _, dependent := range event.job.dependents {
+				dependent.waiting--
+				if dependent.waiting == 0 {
+					runnable = append(runnable, dependent)
 				}
-				event.job.prepared = true
-
-			case workerCommitted:
-				if event.job != jobs[front] {
-					return fail(fmt.Errorf(
-						"cdc: transaction %x committed ahead of %x",
-						event.job.endLSN(), jobs[front].endLSN(),
-					))
-				}
-				if event.err != nil {
-					return fail(event.err)
-				}
-				active--
-				job := jobs[front]
-				if err := job.cleanupSpills(); err != nil {
-					return fail(fmt.Errorf("cdc: cleanup applied reader spill: %w", err))
-				}
-				next = job.endLSN()
-				pending -= len(job.transactions)
-				applied = true
-				if a.config.AfterProgress != nil {
-					if err := a.config.AfterProgress(ctx, next); err != nil {
-						return fail(err)
-					}
-				}
-				for _, relation := range job.relations {
-					if tails[relation] == job {
-						delete(tails, relation)
-					}
-				}
-				for _, dependent := range job.dependents {
-					dependent.waiting--
-					if dependent.waiting == 0 {
-						runnable = append(runnable, dependent)
-					}
-				}
-				front++
-				// A durable backlog can contain millions of transactions. Keep the
-				// scheduler window bounded instead of retaining every committed job
-				// in the slice backing array until the reader reaches EOF.
-				if front >= compactAt {
-					remaining := copy(jobs, jobs[front:])
-					clear(jobs[remaining:])
-					jobs = jobs[:remaining]
-					front = 0
-				}
-
-			default:
-				return fail(fmt.Errorf("cdc: unknown apply worker event %d", event.phase))
 			}
 		}
 	}
-}
-
-func fullRunnable(runnable []*replayJob) bool {
-	for _, job := range runnable {
-		if job.full {
-			return true
-		}
-	}
-	return false
 }

@@ -33,8 +33,9 @@ type ApplierConfig struct {
 	Directory            string
 	ReaderSpillDirectory string
 	// Workers is the number of target sessions used for replay. Transactions
-	// that touch independent relations execute concurrently, while commits and
-	// progress remain in source order. Values below one preserve serial replay.
+	// that touch independent relations commit concurrently; per-relation order
+	// and the authoritative progress prefix remain in source order. Values below
+	// one preserve serial replay.
 	Workers int
 	// BatchSize bounds contiguous dependent source transactions combined into
 	// one target transaction. Window bounds source transactions held by the
@@ -203,7 +204,13 @@ func (a *Applier) runConnection(ctx context.Context) error {
 		return err
 	}
 	defer reader.Close()
-	if a.config.Workers > 1 {
+	receipts, err := loadStreamReplayReceipts(
+		ctx, conn, a.config.StreamID, a.config.StreamGeneration, LSN(progress),
+	)
+	if err != nil {
+		return fmt.Errorf("cdc: inspect pending replay receipts: %w", err)
+	}
+	if a.config.Workers > 1 || len(receipts) != 0 {
 		pool, err := newApplyWorkerPool(ctx, a, conn)
 		if err != nil {
 			return err
@@ -257,6 +264,12 @@ func configureApplySession(ctx context.Context, conn *pgx.Conn) error {
 	// actions without paying an extra target round trip per transaction.
 	if _, err := conn.Exec(ctx, "SET session_replication_role = replica"); err != nil {
 		return classifyApplyError(nil, 0, fmt.Errorf("cdc: disable target replication triggers: %w", err))
+	}
+	// No normal replay path waits while a target transaction is idle. This fuse
+	// turns a future scheduler stall into a rollback and crash-safe reconnect
+	// instead of leaving every worker pinned indefinitely.
+	if _, err := conn.Exec(ctx, "SET idle_in_transaction_session_timeout = '2min'"); err != nil {
+		return classifyApplyError(nil, 0, fmt.Errorf("cdc: set idle target transaction timeout: %w", err))
 	}
 	return nil
 }
@@ -566,6 +579,20 @@ func (a *Applier) queueTransaction(
 
 func (a *Applier) commitPreparedTransaction(prepared *preparedTransaction, endLSN LSN) error {
 	prepared.replay.queueProgress(a.config.StreamID, a.config.StreamGeneration, endLSN)
+	return commitPrepared(prepared)
+}
+
+func (a *Applier) commitPreparedReplay(
+	prepared *preparedTransaction,
+	transactions []Transaction,
+) error {
+	prepared.replay.queueReplayReceipts(
+		a.config.StreamID, a.config.StreamGeneration, transactions,
+	)
+	return commitPrepared(prepared)
+}
+
+func commitPrepared(prepared *preparedTransaction) error {
 	prepared.replay.commit()
 	replayErr := prepared.replay.sync()
 	if replayErr == nil && prepared.replay.conn.TxStatus() != 'I' {
@@ -826,6 +853,21 @@ func (p *applyPipeline) queueProgress(streamID, generation string, remoteLSN LSN
 		streamProgressParams(streamID, generation, remoteLSN),
 		applyExpectation{
 			description: "update transactional apply progress", expectedRows: 1,
+			progressGuard: true,
+		},
+	)
+}
+
+func (p *applyPipeline) queueReplayReceipts(
+	streamID string,
+	generation string,
+	transactions []Transaction,
+) {
+	p.queueUnprepared(
+		streamReplayReceiptSQL,
+		streamReplayReceiptParams(streamID, generation, transactions),
+		applyExpectation{
+			description: "record durable replay receipts", expectedRows: 1,
 			progressGuard: true,
 		},
 	)

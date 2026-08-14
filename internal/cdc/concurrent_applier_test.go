@@ -71,6 +71,20 @@ func TestReplayJobDeduplicatesRelationsAndPredecessors(t *testing.T) {
 	}
 }
 
+func TestReplayJobDoesNotWaitForAnAlreadyCommittedTableTail(t *testing.T) {
+	t.Parallel()
+	tails := make(map[uint32]*replayJob)
+	previous := newReplayJob(Transaction{Relations: []Relation{{OID: 1}}}, 0, 1)
+	linkReplayJob(previous, tails)
+	previous.committed = true
+
+	next := newReplayJob(Transaction{Relations: []Relation{{OID: 1}}}, 0, 1)
+	linkReplayJob(next, tails)
+	if next.waiting != 0 {
+		t.Fatalf("job waits for %d already committed predecessors, want 0", next.waiting)
+	}
+}
+
 func TestReplayBatchOnlyCombinesCoveredTableSets(t *testing.T) {
 	t.Parallel()
 	job := newReplayJob(Transaction{
