@@ -410,16 +410,17 @@ func (a *Applier) applyTransaction(
 	}
 
 	collector := newSampleCollector(a.config.Sampler, transaction)
+	replay := newApplyPipeline(ctx, tx.Conn().PgConn())
+	var replayErr error
 	if transaction.Spill != nil {
-		if err := a.applySpilledChanges(ctx, tx, relations, transaction.Spill, collector); err != nil {
-			return err
-		}
+		replayErr = a.applySpilledChanges(replay, relations, transaction.Spill, collector)
 	} else {
 		for i := 0; i < len(transaction.Changes); {
 			change := &transaction.Changes[i]
 			relation := relations[change.RelationOID]
 			if relation == nil {
-				return divergenceFor(nil, change.Kind, "required relation metadata is missing")
+				replayErr = divergenceFor(nil, change.Kind, "required relation metadata is missing")
+				break
 			}
 			switch change.Kind {
 			case ChangeInsert:
@@ -429,20 +430,23 @@ func (a *Applier) applyTransaction(
 					transaction.Changes[end].RelationOID == change.RelationOID {
 					end++
 				}
-				if err := applyInserts(ctx, tx, relation, transaction.Changes[i:end]); err != nil {
-					return err
+				if err := applyInserts(replay, relation, transaction.Changes[i:end]); err != nil {
+					replayErr = err
+					break
 				}
 				collector.addAll(transaction.Changes[i:end])
 				i = end
 			case ChangeUpdate:
-				if err := applyUpdate(ctx, tx, relation, change); err != nil {
-					return err
+				if err := applyUpdate(replay, relation, change); err != nil {
+					replayErr = err
+					break
 				}
 				collector.add(change)
 				i++
 			case ChangeDelete:
-				if err := applyDelete(ctx, tx, relation, change); err != nil {
-					return err
+				if err := applyDelete(replay, relation, change); err != nil {
+					replayErr = err
+					break
 				}
 				collector.add(change)
 				i++
@@ -453,14 +457,21 @@ func (a *Applier) applyTransaction(
 					sameTruncateOptions(transaction.Changes[end], *change) {
 					end++
 				}
-				if err := applyTruncates(ctx, tx, relations, transaction.Changes[i:end]); err != nil {
-					return err
+				if err := applyTruncates(replay, relations, transaction.Changes[i:end]); err != nil {
+					replayErr = err
+					break
 				}
 				i = end
 			default:
-				return divergenceFor(relation, change.Kind, "unknown change kind")
+				replayErr = divergenceFor(relation, change.Kind, "unknown change kind")
+			}
+			if replayErr != nil {
+				break
 			}
 		}
+	}
+	if finishErr := replay.close(); replayErr != nil || finishErr != nil {
+		return errors.Join(replayErr, finishErr)
 	}
 	if err := updateStreamProgress(
 		ctx, tx, a.config.StreamID, a.config.StreamGeneration, transaction.EndLSN,
@@ -555,8 +566,7 @@ func loadTargetRelation(ctx context.Context, tx pgx.Tx, source *Relation) (*targ
 }
 
 func (a *Applier) applySpilledChanges(
-	ctx context.Context,
-	tx pgx.Tx,
+	replay *applyPipeline,
 	relations map[uint32]*targetRelation,
 	spill *TransactionSpill,
 	collector *sampleCollector,
@@ -570,12 +580,12 @@ func (a *Applier) applySpilledChanges(
 		var err error
 		switch pending[0].Kind {
 		case ChangeInsert:
-			err = applyInserts(ctx, tx, relation, pending)
+			err = applyInserts(replay, relation, pending)
 			if err == nil {
 				collector.addAll(pending)
 			}
 		case ChangeTruncate:
-			err = applyTruncates(ctx, tx, relations, pending)
+			err = applyTruncates(replay, relations, pending)
 		}
 		pending = pending[:0]
 		return err
@@ -611,7 +621,7 @@ func (a *Applier) applySpilledChanges(
 			if err := flush(); err != nil {
 				return err
 			}
-			if err := applyUpdate(ctx, tx, relation, &change); err != nil {
+			if err := applyUpdate(replay, relation, &change); err != nil {
 				return err
 			}
 			collector.add(&change)
@@ -620,7 +630,7 @@ func (a *Applier) applySpilledChanges(
 			if err := flush(); err != nil {
 				return err
 			}
-			if err := applyDelete(ctx, tx, relation, &change); err != nil {
+			if err := applyDelete(replay, relation, &change); err != nil {
 				return err
 			}
 			collector.add(&change)
@@ -647,18 +657,154 @@ type rawParam struct {
 	isNull bool
 }
 
+const applyPipelineWindow = 256
+
+type applyExpectation struct {
+	relation     *targetRelation
+	kind         ChangeKind
+	description  string
+	expectedRows int64
+}
+
+type applyPipeline struct {
+	pipeline     *pgconn.Pipeline
+	expectations []applyExpectation
+	closed       bool
+}
+
+func newApplyPipeline(ctx context.Context, conn *pgconn.PgConn) *applyPipeline {
+	return &applyPipeline{pipeline: conn.StartPipeline(ctx)}
+}
+
+func (p *applyPipeline) queue(
+	sql string,
+	params []rawParam,
+	expectation applyExpectation,
+) error {
+	values := paramValues(params)
+	oids := make([]uint32, len(params))
+	formats := make([]int16, len(params))
+	for i := range params {
+		oids[i] = params[i].oid
+		formats[i] = params[i].format
+	}
+	p.pipeline.SendQueryParams(sql, values, oids, formats, nil)
+	p.expectations = append(p.expectations, expectation)
+	if len(p.expectations) >= applyPipelineWindow {
+		return p.sync()
+	}
+	return nil
+}
+
+func (p *applyPipeline) sync() error {
+	if len(p.expectations) == 0 {
+		return nil
+	}
+	expectations := p.expectations
+	p.expectations = nil
+	if err := p.pipeline.Sync(); err != nil {
+		return classifyApplyError(nil, 0, fmt.Errorf("cdc: synchronize replay pipeline: %w", err))
+	}
+
+	resultIndex := 0
+	var firstErr error
+	for {
+		result, err := p.pipeline.GetResults()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = pipelineResultError(expectations, resultIndex, err)
+			}
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) {
+				return firstErr
+			}
+			continue
+		}
+		switch result := result.(type) {
+		case *pgconn.ResultReader:
+			if resultIndex >= len(expectations) {
+				_, closeErr := result.Close()
+				if firstErr == nil {
+					firstErr = errors.Join(
+						errors.New("cdc: replay pipeline returned an unexpected command result"),
+						closeErr,
+					)
+				}
+				continue
+			}
+			expectation := expectations[resultIndex]
+			resultIndex++
+			tag, closeErr := result.Close()
+			if closeErr != nil {
+				if firstErr == nil {
+					firstErr = expectation.classify(closeErr)
+				}
+				continue
+			}
+			if expectation.expectedRows >= 0 && tag.RowsAffected() != expectation.expectedRows && firstErr == nil {
+				firstErr = divergenceFor(expectation.relation, expectation.kind, fmt.Sprintf(
+					"affected %d rows, expected %d", tag.RowsAffected(), expectation.expectedRows,
+				))
+			}
+		case *pgconn.PipelineSync:
+			if resultIndex != len(expectations) && firstErr == nil {
+				firstErr = fmt.Errorf(
+					"cdc: replay pipeline returned %d command results, expected %d",
+					resultIndex, len(expectations),
+				)
+			}
+			return firstErr
+		case nil:
+			if firstErr == nil {
+				firstErr = fmt.Errorf("cdc: replay pipeline ended before synchronization")
+			}
+			return firstErr
+		default:
+			if firstErr == nil {
+				firstErr = fmt.Errorf("cdc: replay pipeline returned unexpected result type %T", result)
+			}
+		}
+	}
+}
+
+func pipelineResultError(expectations []applyExpectation, index int, err error) error {
+	if index < len(expectations) {
+		return expectations[index].classify(err)
+	}
+	return classifyApplyError(nil, 0, fmt.Errorf("cdc: read replay pipeline result: %w", err))
+}
+
+func (expectation applyExpectation) classify(err error) error {
+	return classifyApplyError(expectation.relation, expectation.kind, fmt.Errorf(
+		"%s: %w", expectation.description, err,
+	))
+}
+
+func (p *applyPipeline) close() error {
+	if p.closed {
+		return nil
+	}
+	p.closed = true
+	syncErr := p.sync()
+	closeErr := p.pipeline.Close()
+	if closeErr != nil {
+		closeErr = classifyApplyError(nil, 0, fmt.Errorf("cdc: close replay pipeline: %w", closeErr))
+	}
+	return errors.Join(syncErr, closeErr)
+}
+
 // emptyParamValue is a non-nil zero-length parameter value, which the extended
 // query protocol reads as a zero-length value rather than as NULL.
 var emptyParamValue = []byte{}
 
-func applyInserts(ctx context.Context, tx pgx.Tx, relation *targetRelation, changes []Change) error {
+func applyInserts(replay *applyPipeline, relation *targetRelation, changes []Change) error {
 	chunkRows := insertChunkRows(len(relation.columns))
 	for start := 0; start < len(changes); start += chunkRows {
 		end := start + chunkRows
 		if end > len(changes) {
 			end = len(changes)
 		}
-		if err := applyInsertChunk(ctx, tx, relation, changes[start:end]); err != nil {
+		if err := applyInsertChunk(replay, relation, changes[start:end]); err != nil {
 			return err
 		}
 	}
@@ -683,21 +829,18 @@ func insertChunkRows(columnCount int) int {
 	return rows
 }
 
-func applyInsertChunk(ctx context.Context, tx pgx.Tx, relation *targetRelation, changes []Change) error {
+func applyInsertChunk(replay *applyPipeline, relation *targetRelation, changes []Change) error {
 	if len(relation.columns) == 0 {
 		sql := "INSERT INTO " + relation.quoted + " DEFAULT VALUES"
 		for i := range changes {
 			if err := validateTuple(relation, changes[i].New, ChangeInsert); err != nil {
 				return err
 			}
-			tag, err := tx.Exec(ctx, sql)
-			if err != nil {
-				return classifyApplyError(relation, ChangeInsert, fmt.Errorf("insert default row into %s: %w", relation.quoted, err))
-			}
-			if tag.RowsAffected() != 1 {
-				return divergenceFor(relation, ChangeInsert, fmt.Sprintf(
-					"default insert affected %d rows, expected exactly one", tag.RowsAffected(),
-				))
+			if err := replay.queue(sql, nil, applyExpectation{
+				relation: relation, kind: ChangeInsert,
+				description: "insert default row into " + relation.quoted, expectedRows: 1,
+			}); err != nil {
+				return err
 			}
 		}
 		return nil
@@ -740,19 +883,13 @@ func applyInsertChunk(ctx context.Context, tx pgx.Tx, relation *targetRelation, 
 		}
 		sql.WriteByte(')')
 	}
-	tag, err := execRaw(ctx, tx, sql.String(), params)
-	if err != nil {
-		return classifyApplyError(relation, ChangeInsert, fmt.Errorf("insert into %s: %w", relation.quoted, err))
-	}
-	if tag.RowsAffected() != int64(len(changes)) {
-		return divergenceFor(relation, ChangeInsert, fmt.Sprintf(
-			"insert affected %d rows, expected %d", tag.RowsAffected(), len(changes),
-		))
-	}
-	return nil
+	return replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeInsert,
+		description: "insert into " + relation.quoted, expectedRows: int64(len(changes)),
+	})
 }
 
-func applyUpdate(ctx context.Context, tx pgx.Tx, relation *targetRelation, change *Change) error {
+func applyUpdate(replay *applyPipeline, relation *targetRelation, change *Change) error {
 	if err := validateTuple(relation, change.New, ChangeUpdate); err != nil {
 		return err
 	}
@@ -764,7 +901,7 @@ func applyUpdate(ctx context.Context, tx pgx.Tx, relation *targetRelation, chang
 		return err
 	}
 	if len(relation.columns) == 0 {
-		return applyGeneratedOnlyUpdate(ctx, tx, relation, *predicate)
+		return applyGeneratedOnlyUpdate(replay, relation, *predicate)
 	}
 
 	var sql strings.Builder
@@ -799,16 +936,14 @@ func applyUpdate(ctx context.Context, tx pgx.Tx, relation *targetRelation, chang
 	if err := appendPredicate(&sql, &params, relation, *predicate, ChangeUpdate); err != nil {
 		return err
 	}
-	tag, err := execRaw(ctx, tx, sql.String(), params)
-	if err != nil {
-		return classifyApplyError(relation, ChangeUpdate, fmt.Errorf("update %s: %w", relation.quoted, err))
-	}
-	return requireOne(relation, ChangeUpdate, tag)
+	return replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description: "update " + relation.quoted, expectedRows: 1,
+	})
 }
 
 func applyGeneratedOnlyUpdate(
-	ctx context.Context,
-	tx pgx.Tx,
+	replay *applyPipeline,
 	relation *targetRelation,
 	predicate Tuple,
 ) error {
@@ -831,11 +966,10 @@ func applyGeneratedOnlyUpdate(
 	if err := appendPredicate(&sql, &params, relation, predicate, ChangeUpdate); err != nil {
 		return err
 	}
-	tag, err := execRaw(ctx, tx, sql.String(), params)
-	if err != nil {
-		return classifyApplyError(relation, ChangeUpdate, fmt.Errorf("generated-only update %s: %w", relation.quoted, err))
-	}
-	return requireOne(relation, ChangeUpdate, tag)
+	return replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description: "generated-only update " + relation.quoted, expectedRows: 1,
+	})
 }
 
 func hasReplicaIdentityColumns(relation *targetRelation) bool {
@@ -850,7 +984,7 @@ func hasReplicaIdentityColumns(relation *targetRelation) bool {
 	return false
 }
 
-func applyDelete(ctx context.Context, tx pgx.Tx, relation *targetRelation, change *Change) error {
+func applyDelete(replay *applyPipeline, relation *targetRelation, change *Change) error {
 	if err := validateTuple(relation, change.Old, ChangeDelete); err != nil {
 		return err
 	}
@@ -862,16 +996,14 @@ func applyDelete(ctx context.Context, tx pgx.Tx, relation *targetRelation, chang
 	if err := appendPredicate(&sql, &params, relation, *change.Old, ChangeDelete); err != nil {
 		return err
 	}
-	tag, err := execRaw(ctx, tx, sql.String(), params)
-	if err != nil {
-		return classifyApplyError(relation, ChangeDelete, fmt.Errorf("delete from %s: %w", relation.quoted, err))
-	}
-	return requireOne(relation, ChangeDelete, tag)
+	return replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeDelete,
+		description: "delete from " + relation.quoted, expectedRows: 1,
+	})
 }
 
 func applyTruncates(
-	ctx context.Context,
-	tx pgx.Tx,
+	replay *applyPipeline,
 	relations map[uint32]*targetRelation,
 	changes []Change,
 ) error {
@@ -888,10 +1020,10 @@ func applyTruncates(
 		sql.WriteString(relation.quoted)
 	}
 	appendTruncateOptions(&sql, changes[0])
-	if _, err := tx.Exec(ctx, sql.String()); err != nil {
-		return classifyApplyError(relations[changes[0].RelationOID], ChangeTruncate, fmt.Errorf("truncate target relations: %w", err))
-	}
-	return nil
+	return replay.queue(sql.String(), nil, applyExpectation{
+		relation: relations[changes[0].RelationOID], kind: ChangeTruncate,
+		description: "truncate target relations", expectedRows: -1,
+	})
 }
 
 func sameTruncateOptions(left, right Change) bool {
@@ -996,18 +1128,6 @@ func datumParamForColumn(
 	}
 }
 
-func execRaw(ctx context.Context, tx pgx.Tx, sql string, params []rawParam) (pgconn.CommandTag, error) {
-	values := paramValues(params)
-	oids := make([]uint32, len(params))
-	formats := make([]int16, len(params))
-	for i := range params {
-		oids[i] = params[i].oid
-		formats[i] = params[i].format
-	}
-	result := tx.Conn().PgConn().ExecParams(ctx, sql, values, oids, formats, nil)
-	return result.Close()
-}
-
 // paramValues renders bind parameters for the extended query protocol, where a
 // nil value means SQL NULL and a non-nil zero-length one means a zero-length
 // value. Only an explicitly null parameter may be nil.
@@ -1033,15 +1153,6 @@ func validateTuple(relation *targetRelation, tuple *Tuple, kind ChangeKind) erro
 	if len(*tuple) != len(relation.source.Columns) {
 		return divergenceFor(relation, kind, fmt.Sprintf(
 			"tuple has %d columns, pgoutput relation has %d", len(*tuple), len(relation.source.Columns),
-		))
-	}
-	return nil
-}
-
-func requireOne(relation *targetRelation, kind ChangeKind, tag pgconn.CommandTag) error {
-	if tag.RowsAffected() != 1 {
-		return divergenceFor(relation, kind, fmt.Sprintf(
-			"affected %d rows, expected exactly one", tag.RowsAffected(),
 		))
 	}
 	return nil
