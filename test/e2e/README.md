@@ -53,6 +53,9 @@ source and target tables.
 Set `PGMIGRATE_BIN` to use another binary. `MIGRATION_TIMEOUT` controls the wait for
 follow mode. `MIGRATION_DIR` uses a caller-owned state directory; otherwise temporary
 state is deleted. Set `KEEP_MIGRATION_DIR=1` to retain temporary state and logs.
+`REPLAY_WORKERS`, `REPLAY_BATCH_SIZE`, and `REPLAY_WINDOW` select the concurrent
+target sessions, dependent transactions per target commit, and scheduler window
+(defaults `4`, `64`, and `128`).
 The harness acknowledges expected preflight warnings for this controlled fixture.
 
 `assert-data.sh` is intentionally independent of pgmigrate's verifier. It compares the

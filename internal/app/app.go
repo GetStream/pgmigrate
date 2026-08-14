@@ -1361,6 +1361,7 @@ func runApplierToFollow(
 	}
 	applier, err := cdc.NewApplier(cdc.ApplierConfig{
 		ConnString: cfg.Target, Directory: filepath.Join(cfg.Dir, "cdc"),
+		Workers: cfg.ReplayWorkers, BatchSize: cfg.ReplayBatchSize, Window: cfg.ReplayWindow,
 		StreamID: snapshot.Slot, StreamGeneration: streamGeneration(
 			migration.SourceFingerprint, migration.FilterFingerprint,
 		), TargetHasCopiedData: true, Durable: durable, EndPosition: endPosition(store),

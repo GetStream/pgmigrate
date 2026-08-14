@@ -1210,6 +1210,172 @@ func TestPG17ApplierStartsBeforeReadingUnappliedSuffix(t *testing.T) {
 	}
 }
 
+func TestPG17ConcurrentReplayRunsIndependentTablesTogetherAndOrdersEachTable(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	conn := target.Connect(t)
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.replay_events (
+			table_name text NOT NULL,
+			value integer NOT NULL,
+			started_at timestamptz NOT NULL
+		);
+		CREATE FUNCTION public.replay_probe(table_name text, value integer)
+		RETURNS boolean LANGUAGE plpgsql AS $$
+		BEGIN
+			INSERT INTO public.replay_events VALUES (table_name, value, clock_timestamp());
+			PERFORM pg_sleep(0.3);
+			RETURN true;
+		END
+		$$;
+		CREATE TABLE public.replay_a (
+			id integer PRIMARY KEY,
+			value integer NOT NULL CHECK (public.replay_probe('a', value))
+		);
+		CREATE TABLE public.replay_b (
+			id integer PRIMARY KEY,
+			value integer NOT NULL CHECK (public.replay_probe('b', value))
+		);
+		CREATE TABLE public.replay_c (
+			id integer PRIMARY KEY,
+			value integer NOT NULL CHECK (public.replay_probe('c', value))
+		);
+		CREATE TABLE public.replay_d (
+			id integer PRIMARY KEY,
+			value integer NOT NULL CHECK (public.replay_probe('d', value))
+		);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	tuple := func(id, value string) *Tuple {
+		result := Tuple{
+			{Kind: DatumText, Data: []byte(id)},
+			{Kind: DatumText, Data: []byte(value)},
+		}
+		return &result
+	}
+	relation := func(oid uint32, name string) Relation {
+		return Relation{
+			OID: oid, Namespace: "public", Name: name, ReplicaIdentity: 'd',
+			Columns: []Column{
+				{Name: "id", Type: 23, Flags: 1},
+				{Name: "value", Type: 23},
+			},
+		}
+	}
+	relationA := relation(2001, "replay_a")
+	relationB := relation(2002, "replay_b")
+	relationC := relation(2003, "replay_c")
+	relationD := relation(2004, "replay_d")
+	transactions := []Transaction{
+		{CommitLSN: 10, EndLSN: 11, Relations: []Relation{relationA}, Changes: []Change{{
+			RelationOID: relationA.OID, Kind: ChangeInsert, New: tuple("1", "1"),
+		}}},
+		{CommitLSN: 20, EndLSN: 21, Relations: []Relation{relationA}, Changes: []Change{{
+			RelationOID: relationA.OID, Kind: ChangeUpdate,
+			Old: tuple("1", "1"), New: tuple("1", "2"),
+		}}},
+		{CommitLSN: 30, EndLSN: 31, Relations: []Relation{relationB}, Changes: []Change{{
+			RelationOID: relationB.OID, Kind: ChangeInsert, New: tuple("1", "1"),
+		}}},
+		{CommitLSN: 40, EndLSN: 41, Relations: []Relation{relationC}, Changes: []Change{{
+			RelationOID: relationC.OID, Kind: ChangeInsert, New: tuple("1", "1"),
+		}}},
+		{CommitLSN: 50, EndLSN: 51, Relations: []Relation{relationD}, Changes: []Change{{
+			RelationOID: relationD.OID, Kind: ChangeInsert, New: tuple("1", "1"),
+		}}},
+	}
+
+	directory := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: directory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	for i := range transactions {
+		if _, err := writer.AppendFrame(&transactions[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	durableLSN, err := writer.Sync()
+	if err != nil {
+		t.Fatal(err)
+	}
+	durable := new(DurableWatermark)
+	durable.Publish(durableLSN)
+
+	var progressCallbacks []LSN
+	applier, err := NewApplier(ApplierConfig{
+		ConnString: target.URI, Directory: directory,
+		Workers: 4, StreamID: "concurrent-replay", StreamGeneration: "generation-1",
+		Durable: durable, PollInterval: time.Millisecond,
+		EndPosition: func(context.Context) (LSN, bool, error) {
+			return durableLSN, true, nil
+		},
+		AfterProgress: func(_ context.Context, progress LSN) error {
+			progressCallbacks = append(progressCallbacks, progress)
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	startedAt := time.Now()
+	if err := applier.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(startedAt)
+	// Five 300 ms checks take at least 1.5 s through the serial applier. A and
+	// its update form a 600 ms critical path; B/C/D overlap that path.
+	if elapsed >= 1100*time.Millisecond {
+		t.Fatalf("concurrent replay took %s, want well below the 1.5s serial floor", elapsed)
+	}
+	t.Logf("five 300ms target transactions replayed in %s (serial floor 1.5s)", elapsed)
+
+	if got, want := progressCallbacks, []LSN{11, 21, 31, 41, 51}; !slices.Equal(got, want) {
+		t.Fatalf("progress callbacks = %v, want source order %v", got, want)
+	}
+	var value int
+	if err := conn.QueryRow(ctx, "SELECT value FROM public.replay_a WHERE id = 1").Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != 2 {
+		t.Fatalf("ordered replay_a value = %d, want 2", value)
+	}
+
+	started := make(map[string]time.Time)
+	rows, err := conn.Query(ctx, `
+		SELECT table_name || value::text, started_at
+		FROM public.replay_events
+	`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key string
+		var at time.Time
+		if err := rows.Scan(&key, &at); err != nil {
+			t.Fatal(err)
+		}
+		started[key] = at
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	first := started["a1"]
+	for _, key := range []string{"b1", "c1", "d1"} {
+		delta := started[key].Sub(first).Abs()
+		if delta >= 200*time.Millisecond {
+			t.Errorf("independent %s started %s from a1; replay was not concurrent", key, delta)
+		}
+	}
+	if delta := started["a2"].Sub(first); delta < 250*time.Millisecond {
+		t.Fatalf("second replay_a change started after %s, before its predecessor committed", delta)
+	}
+}
+
 func waitFor(t testing.TB, timeout time.Duration, condition func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)

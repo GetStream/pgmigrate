@@ -25,3 +25,19 @@ func TestSequencesIsItsOwnCommand(t *testing.T) {
 		t.Errorf("sequence-offset defaults to %s, want 1000000", offset.DefValue)
 	}
 }
+
+func TestReplayWorkersFlagHasConcurrentDefault(t *testing.T) {
+	flags := NewRootCommand().PersistentFlags()
+	flag := flags.Lookup("replay-workers")
+	if flag == nil {
+		t.Fatal("replay-workers flag is missing")
+	}
+	if flag.DefValue == "0" || flag.DefValue == "1" {
+		t.Fatalf("replay-workers default = %s, want concurrent replay", flag.DefValue)
+	}
+	for _, name := range []string{"replay-batch-size", "replay-window"} {
+		if value := flags.Lookup(name); value == nil || value.DefValue == "0" || value.DefValue == "1" {
+			t.Fatalf("%s default is not throughput-oriented: %#v", name, value)
+		}
+	}
+}

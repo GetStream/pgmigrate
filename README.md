@@ -48,8 +48,10 @@ Change data capture uses `pgoutput`, the logical decoding plugin built into
 PostgreSQL, so there is no extension to install on the source. Decoded
 transactions are written to append-only checksummed segment files under the
 migration directory and fsynced at each transaction boundary; a transaction over
-256 MiB spills to temporary files beneath `cdc/spill`. Apply is serial, and
-target DML commits in the same transaction as
+256 MiB spills to temporary files beneath `cdc/spill`. Transactions that touch
+different tables replay concurrently while each table retains source order.
+Contiguous transactions already serialized by the same tables share a bounded
+target commit. Target DML commits in the same transaction as
 `pgmigrate_internal.replication_progress` on the target, which is the
 authoritative apply position. Finalized segments that have been applied are
 pruned every `--segment-prune-interval`, retaining one safety segment.
@@ -88,7 +90,8 @@ There are six commands:
 
 Every command takes `--dir`. All but `status` also need source and target
 connection strings. `pgmigrate <command> --help` prints the defaults as resolved
-on the host, which for `--workers` and `--restore-jobs` depend on its CPU count.
+on the host, which for `--workers`, `--replay-workers`, `--replay-window`, and
+`--restore-jobs` depend on its CPU count.
 
 ## Example
 
@@ -111,7 +114,7 @@ With those understood, start the migration. It keeps running after the base copy
 finishes, following changes until you cut over:
 
 ```bash
-$ pgmigrate run --dir ./migration --ack-warnings --workers 8 --restore-jobs 4 --metrics :9187
+$ pgmigrate run --dir ./migration --ack-warnings --workers 8 --replay-workers 8 --restore-jobs 4 --metrics :9187
 ```
 
 `run` writes almost nothing to the terminal. Phase, progress, health, and error
@@ -278,6 +281,9 @@ directory's writer lock.
 | `--ack-warnings` | false | accept every current preflight warning, including consenting to `REPLICA IDENTITY FULL` where it is needed |
 | `--allow-collation-change` | false | proceed to a target that collates text differently from the source |
 | `--workers <n>` | host CPU count | parallel copy and index-build workers, and the cap on parts per table |
+| `--replay-workers <n>` | host CPU count clamped to 8–32 | target sessions that replay independent tables concurrently. Transactions touching the same table wait for their predecessor, and every target batch still commits in source order |
+| `--replay-batch-size <n>` | `64` | maximum contiguous dependent source transactions combined into one durable target transaction. Independent table lanes are never combined, and encoded batch data is capped at 16 MiB |
+| `--replay-window <n>` | 8 times `--replay-workers` | source transactions searched for independent table work; also bounds scheduler memory |
 | `--split-threshold <bytes>` | `1073741824` (1 GiB) | desired bytes per copy part. A table is split into at most `--workers` parts, so a table far larger than the threshold produces larger parts |
 | `--restore-jobs <n>` | half the host CPU count, at least 1 | parallel `pg_restore` jobs for the schema restore |
 | `--pg-dump <path>` | found on `PATH` | `pg_dump` executable |
@@ -783,7 +789,10 @@ schema.
   findings and need an operator plan.
 - The target is assumed not to receive independent application traffic before
   cutover. Replay divergence stops the run.
-- Apply is serial.
+- Replay parallelism comes from transactions that touch independent tables.
+  A workload whose every transaction touches the same table remains serial by
+  design so that updates and deletes observe source order, but bounded batches
+  amortize its target commit cost.
 - The delivered e2e bed is PostgreSQL 17 to 17. Cross-major compatibility has
   focused integration probes but no full cross-major Compose migration.
 - Verification samples, and reports 64-bit server-side hashes rather than a

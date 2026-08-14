@@ -64,6 +64,9 @@ trap cleanup EXIT INT TERM
 # The seed is far smaller than the default 1 GiB threshold, so without this every
 # table would copy as one unsplit part and the split path would never run here.
 split_threshold=${SPLIT_THRESHOLD:-65536}
+replay_workers=${REPLAY_WORKERS:-4}
+replay_batch_size=${REPLAY_BATCH_SIZE:-64}
+replay_window=${REPLAY_WINDOW:-128}
 
 echo "checking the collation gate"
 PGMIGRATE_BIN="$binary" PGMIGRATE_SOURCE="$source_url" \
@@ -89,6 +92,9 @@ echo "starting migration"
     --pg-restore "$pg_restore_path" \
     --wal-sample-duration 250ms \
     --split-threshold "$split_threshold" \
+    --replay-workers "$replay_workers" \
+    --replay-batch-size "$replay_batch_size" \
+    --replay-window "$replay_window" \
     --ack-warnings >"$migration_dir/run.log" 2>&1 &
 run_pid=$!
 

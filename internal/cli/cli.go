@@ -42,6 +42,9 @@ func NewRootCommand() *cobra.Command {
 	flags.BoolVar(&cfg.AllowCollationChange, "allow-collation-change", false,
 		"migrate to a target that collates text differently from the source")
 	flags.IntVar(&cfg.Workers, "workers", cfg.Workers, "parallel copy and index-build workers (verification has --verify-workers)")
+	flags.IntVar(&cfg.ReplayWorkers, "replay-workers", cfg.ReplayWorkers, "target connections applying independent tables concurrently")
+	flags.IntVar(&cfg.ReplayBatchSize, "replay-batch-size", cfg.ReplayBatchSize, "contiguous dependent source transactions per durable target commit")
+	flags.IntVar(&cfg.ReplayWindow, "replay-window", cfg.ReplayWindow, "source transactions searched for runnable table work")
 	flags.Int64Var(&cfg.SplitThreshold, "split-threshold", cfg.SplitThreshold, "table bytes per copy part")
 	flags.IntVar(&cfg.RestoreJobs, "restore-jobs", cfg.RestoreJobs, "parallel pg_restore jobs")
 	flags.StringVar(&cfg.PGDumpPath, "pg-dump", "", "pg_dump executable path")
@@ -100,9 +103,10 @@ func newDatabaseCommand(name, summary string, cfg *config.Config, run func(conte
 					return err
 				}
 			}
-			if cfg.Workers < 1 || cfg.RestoreJobs < 1 || cfg.SplitThreshold < 1 ||
+			if cfg.Workers < 1 || cfg.ReplayWorkers < 1 || cfg.ReplayBatchSize < 1 || cfg.ReplayWindow < 1 ||
+				cfg.RestoreJobs < 1 || cfg.SplitThreshold < 1 ||
 				cfg.WALSampleDuration <= 0 || cfg.SegmentPruneInterval <= 0 {
-				return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, and segment-prune-interval must be positive")
+				return errors.New("workers, replay-workers, replay-batch-size, replay-window, restore-jobs, split-threshold, wal-sample-duration, and segment-prune-interval must be positive")
 			}
 			if _, err := cfg.TuningOverrides(); err != nil {
 				return err
