@@ -2,9 +2,12 @@ package cdc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,6 +66,312 @@ func TestSegmentPrunerBoundsSustainedAppliedSegments(t *testing.T) {
 	}
 	if _, err := Recover(directory); err != nil {
 		t.Fatalf("recover retained safety segment: %v", err)
+	}
+}
+
+func TestCatalogPrunerDeletesInBatchesAndKeepsSafety(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: directory, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastEnd LSN
+	for i := 1; i <= 5; i++ {
+		transaction := testTransaction(LSN(i * 0x10))
+		lastEnd = transaction.EndLSN
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
+		Directory:         directory,
+		Interval:          time.Hour,
+		Catalog:           writer.SegmentCatalog(),
+		MaxRemoveSegments: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pruner.OnProgress(context.Background(), lastEnd+1); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(writer.SegmentCatalog().snapshot()); got != 3 {
+		t.Fatalf("catalog after first batch=%d, want 3", got)
+	}
+	if err := pruner.OnProgress(context.Background(), lastEnd+1); err != nil {
+		t.Fatal(err)
+	}
+	ranges := writer.SegmentCatalog().snapshot()
+	if len(ranges) != 1 || ranges[0].LastEnd != lastEnd {
+		t.Fatalf("catalog after second batch=%#v, want last safety segment", ranges)
+	}
+	segments, err := listSegments(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 || segments[0].start != 0x50 {
+		t.Fatalf("remaining segments=%#v, want safety segment 0x50", segments)
+	}
+	if _, err := Recover(directory); err != nil {
+		t.Fatalf("recover after catalog prune: %v", err)
+	}
+}
+
+func TestSegmentPrunerRunDrainsBatchesWithoutNewProgress(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: directory, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastEnd LSN
+	for i := 1; i <= 7; i++ {
+		transaction := testTransaction(LSN(i * 0x10))
+		lastEnd = transaction.EndLSN
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
+		Directory:         directory,
+		Interval:          time.Hour,
+		Catalog:           writer.SegmentCatalog(),
+		MaxRemoveSegments: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pruner.OnProgress(context.Background(), lastEnd+1); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(writer.SegmentCatalog().snapshot()); got != 5 {
+		t.Fatalf("catalog after callback batch=%d, want 5", got)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- pruner.Run(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(writer.SegmentCatalog().snapshot()) != 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := len(writer.SegmentCatalog().snapshot()); got != 1 {
+		cancel()
+		t.Fatalf("catalog after background batches=%d, want 1", got)
+	}
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("pruner Run error=%v, want context cancellation", err)
+	}
+	segments, err := listSegments(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segments) != 1 || segments[0].start != 0x70 {
+		t.Fatalf("remaining segments=%#v, want final safety segment", segments)
+	}
+}
+
+func TestCatalogPrunerRejectsSegmentChangedAfterValidation(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: directory, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		transaction := testTransaction(LSN(i * 0x10))
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ranges := writer.SegmentCatalog().snapshot()
+	file, err := os.OpenFile(ranges[0].Path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte{0}); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
+		Directory: directory,
+		Interval:  time.Nanosecond,
+		Catalog:   writer.SegmentCatalog(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = pruner.OnProgress(context.Background(), 0x40)
+	if err == nil || !strings.Contains(err.Error(), "changed after validation") {
+		t.Fatalf("changed segment prune error=%v", err)
+	}
+	if got := len(writer.SegmentCatalog().snapshot()); got != 3 {
+		t.Fatalf("catalog after rejected prune=%d, want 3", got)
+	}
+}
+
+func TestCatalogPrunerRefusesAnUnexplainedMissingSegment(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: directory, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		transaction := testTransaction(LSN(i * 0x10))
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ranges := writer.SegmentCatalog().snapshot()
+	if err := os.Remove(ranges[0].Path); err != nil {
+		t.Fatal(err)
+	}
+	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
+		Directory: directory,
+		Interval:  time.Nanosecond,
+		Catalog:   writer.SegmentCatalog(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = pruner.OnProgress(context.Background(), 0x40)
+	if err == nil || !strings.Contains(err.Error(), "missing from disk") {
+		t.Fatalf("missing segment prune error=%v", err)
+	}
+	if got := len(writer.SegmentCatalog().snapshot()); got != 3 {
+		t.Fatalf("catalog after missing segment=%d, want 3", got)
+	}
+	if _, err := os.Stat(ranges[1].Path); err != nil {
+		t.Fatalf("pruner deleted another segment after missing file: %v", err)
+	}
+}
+
+func TestCatalogPrunerRevalidatesAChangedFinalizedSegment(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: directory, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 3; i++ {
+		transaction := testTransaction(LSN(i * 0x10))
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	first := writer.SegmentCatalog().snapshot()[0]
+	extra := testTransaction(0x15)
+	extra.EndLSN = 0x16
+	payload, err := MarshalTransaction(&extra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var header [frameHeaderSize]byte
+	binary.LittleEndian.PutUint32(header[:4], uint32(len(payload)))
+	binary.LittleEndian.PutUint32(header[4:], crc32.Checksum(payload, castagnoliTable))
+	file, err := os.OpenFile(first.Path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeFull(file, header[:]); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := writeFull(file, payload); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
+		Directory: directory,
+		Interval:  time.Hour,
+		Catalog:   writer.SegmentCatalog(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pruner.OnProgress(context.Background(), 0x40); err != nil {
+		t.Fatal(err)
+	}
+	ranges := writer.SegmentCatalog().snapshot()
+	if len(ranges) != 3 || ranges[0].LastCommit != 0x15 || ranges[0].LastEnd != 0x16 {
+		t.Fatalf("refreshed catalog=%#v", ranges)
+	}
+	if err := pruner.OnProgress(context.Background(), 0x40); err != nil {
+		t.Fatal(err)
+	}
+	ranges = writer.SegmentCatalog().snapshot()
+	if len(ranges) != 1 || ranges[0].StartCommit != 0x30 {
+		t.Fatalf("catalog after refreshed prune=%#v", ranges)
+	}
+	if _, err := Recover(directory); err != nil {
+		t.Fatalf("recover after refreshed prune: %v", err)
+	}
+}
+
+func TestCatalogPruneAllowsOpenReaderToReachSafetySegment(t *testing.T) {
+	t.Parallel()
+	directory := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: directory, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 4; i++ {
+		transaction := testTransaction(LSN(i * 0x10))
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := NewReader(directory, 0x10, writer.DurableEndLSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	transaction, err := reader.Next()
+	if err != nil || transaction.CommitLSN != 0x20 {
+		t.Fatalf("first reader transaction=%x err=%v, want 20", transaction.CommitLSN, err)
+	}
+	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
+		Directory: directory,
+		Interval:  time.Nanosecond,
+		Catalog:   writer.SegmentCatalog(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pruner.OnProgress(context.Background(), 0x40); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err = reader.Next()
+	if err != nil || transaction.CommitLSN != 0x30 {
+		t.Fatalf("reader after unlink=%x err=%v, want safety transaction 30", transaction.CommitLSN, err)
 	}
 }
 

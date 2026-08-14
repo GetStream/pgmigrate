@@ -605,7 +605,9 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		if err := pauseForCrashTest(groupCtx, state.PhaseCatchup); err != nil {
 			return err
 		}
-		return runApplierToFollow(groupCtx, cfg, store, holder.Snapshot, durable, state.PhaseCatchup)
+		return runApplierToFollow(
+			groupCtx, cfg, store, holder.Snapshot, durable, writer.SegmentCatalog(), state.PhaseCatchup,
+		)
 	})
 	if cfg.Metrics != "" {
 		group.Go(func() error { return serveMetrics(groupCtx, cfg.Metrics, store) })
@@ -708,7 +710,9 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 				return err
 			}
 		}
-		return runApplierToFollow(groupCtx, cfg, store, snapshot, durable, phase)
+		return runApplierToFollow(
+			groupCtx, cfg, store, snapshot, durable, writer.SegmentCatalog(), phase,
+		)
 	})
 	group.Go(func() error {
 		ticker := time.NewTicker(200 * time.Millisecond)
@@ -1329,6 +1333,7 @@ func runApplierToFollow(
 	store *state.Store,
 	snapshot setup.Snapshot,
 	durable *cdc.DurableWatermark,
+	segments *cdc.SegmentCatalog,
 	phase state.Phase,
 ) error {
 	migration, err := store.Migration(ctx)
@@ -1338,6 +1343,7 @@ func runApplierToFollow(
 	pruner, err := cdc.NewSegmentPruner(cdc.SegmentPrunerConfig{
 		Directory: filepath.Join(cfg.Dir, "cdc"),
 		Interval:  cfg.SegmentPruneInterval,
+		Catalog:   segments,
 	})
 	if err != nil {
 		return err
@@ -1365,13 +1371,13 @@ func runApplierToFollow(
 		return err
 	}
 	if phase == state.PhaseFollow || phase == state.PhaseDrained || phase == state.PhaseCutover {
-		return runApplierContinuous(ctx, applier, store)
+		return runApplierWithPruner(ctx, applier, pruner, store)
 	}
 	boundary := durable.Load()
 	applyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	result := make(chan error, 1)
-	go func() { result <- runApplierContinuous(applyCtx, applier, store) }()
+	go func() { result <- runApplierWithPruner(applyCtx, applier, pruner, store) }()
 	if err := awaitCatchup(ctx, boundary, applier.WaitUntil, result); err != nil {
 		return err
 	}
@@ -1388,6 +1394,18 @@ func runApplierToFollow(
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func runApplierWithPruner(
+	ctx context.Context,
+	applier *cdc.Applier,
+	pruner *cdc.SegmentPruner,
+	store *state.Store,
+) error {
+	group, groupCtx := errgroup.WithContext(ctx)
+	group.Go(func() error { return pruner.Run(groupCtx) })
+	group.Go(func() error { return runApplierContinuous(groupCtx, applier, store) })
+	return group.Wait()
 }
 
 // awaitCatchup waits for target apply progress to reach boundary while watching

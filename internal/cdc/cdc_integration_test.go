@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -224,6 +225,7 @@ func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {
 	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
 		Directory: directory,
 		Interval:  time.Nanosecond,
+		Catalog:   writer.SegmentCatalog(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -458,6 +460,176 @@ func (c *collectingSampler) all() []string {
 	}
 	slices.Sort(seen)
 	return slices.Compact(seen)
+}
+
+// TestPG17WaitUntilDoesNotScanStagedSegments is the catchup wait: the boundary
+// is already the durable EndLSN. Scanning the segment directory to "normalize"
+// it would decode the whole backlog after a long copy, which is how a shard
+// sat on the first file at the memory ceiling with apply idle.
+func TestPG17WaitUntilDoesNotScanStagedSegments(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	conn := target.Connect(t)
+	if err := postgres.EnsureProgressTable(ctx, conn); err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.UpdateProgress(ctx, conn, "catchup", 0x100); err != nil {
+		t.Fatal(err)
+	}
+	watermark := new(DurableWatermark)
+	watermark.Publish(0x100)
+	applier, err := NewApplier(ApplierConfig{
+		ConnString:   target.URI,
+		Directory:    filepath.Join(t.TempDir(), "empty-cdc"),
+		StreamID:     "catchup",
+		Durable:      watermark,
+		PollInterval: 5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := applier.WaitUntil(waitCtx, 0x100); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPG17ApplierStartsBeforeReadingUnappliedSuffix(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	targetSQL := target.Connect(t)
+	if _, err := targetSQL.Exec(ctx, `
+		CREATE TABLE public.catchup_probe (
+			id bigint PRIMARY KEY,
+			value text NOT NULL
+		)`); err != nil {
+		t.Fatal(err)
+	}
+
+	directory := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: directory, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lastEnd LSN
+	for i := 1; i <= 256; i++ {
+		value := fmt.Sprint(i)
+		row := Tuple{
+			{Kind: DatumText, Data: []byte(value)},
+			{Kind: DatumText, Data: []byte("value-" + value)},
+		}
+		transaction := Transaction{
+			CommitLSN:  LSN(i * 0x10),
+			EndLSN:     LSN(i*0x10 + 1),
+			CommitTime: time.Unix(int64(i), 0).UTC(),
+			Relations: []Relation{{
+				OID:             4242,
+				Namespace:       "public",
+				Name:            "catchup_probe",
+				ReplicaIdentity: 'd',
+				Columns: []Column{
+					{Name: "id", Type: 20, Flags: 1},
+					{Name: "value", Type: 25},
+				},
+			}},
+			Changes: []Change{{
+				RelationOID: 4242,
+				Kind:        ChangeInsert,
+				New:         &row,
+			}},
+		}
+		lastEnd = transaction.EndLSN
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ranges := writer.SegmentCatalog().snapshot()
+	last := ranges[len(ranges)-1]
+	file, err := os.OpenFile(last.Path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte{0xff}, frameHeaderSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	const streamID = "catchup-starts-before-suffix"
+	const generation = "generation-1"
+	if err := EnsureStreamProgressIdentity(ctx, targetSQL, StreamIdentityConfig{
+		StreamID: streamID, Generation: generation, FreshSetup: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := postgres.UpdateProgress(ctx, targetSQL, streamID, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := EnsureStreamProgressIdentity(ctx, targetSQL, StreamIdentityConfig{
+		StreamID: streamID, Generation: generation, FreshSetup: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	watermark := new(DurableWatermark)
+	watermark.Publish(lastEnd)
+	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
+		Directory: directory,
+		Interval:  time.Nanosecond,
+		Catalog:   writer.SegmentCatalog(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applier, err := NewApplier(ApplierConfig{
+		ConnString:           target.URI,
+		Directory:            directory,
+		StreamID:             streamID,
+		StreamGeneration:     generation,
+		TargetHasCopiedData:  true,
+		Durable:              watermark,
+		PollInterval:         time.Millisecond,
+		AfterProgress:        pruner.OnProgress,
+		ReaderSpillDirectory: filepath.Join(t.TempDir(), "reader-spill"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	applyCtx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- applier.Run(applyCtx) }()
+	deadline := time.Now().Add(30 * time.Second)
+	var progress pglogrepl.LSN
+	for time.Now().Before(deadline) {
+		progress, _, err = postgres.ReadProgress(ctx, targetSQL, streamID)
+		if err != nil {
+			stop()
+			t.Fatal(err)
+		}
+		if progress > 0 {
+			break
+		}
+		select {
+		case err := <-done:
+			stop()
+			t.Fatalf("applier reached corrupt suffix before first progress: %v", err)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if progress == 0 {
+		stop()
+		t.Fatal("target progress did not move before the unapplied suffix")
+	}
+	stop()
+	if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
 }
 
 func waitFor(t testing.TB, timeout time.Duration, condition func() bool) {

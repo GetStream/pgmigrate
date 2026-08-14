@@ -110,14 +110,16 @@ func (a *Applier) Run(ctx context.Context) error {
 // WaitUntil blocks until the authoritative target progress reaches boundary.
 // Only Applier.Run advances that progress, so the caller must supervise Run
 // concurrently and stop waiting if it exits; otherwise this polls forever.
+//
+// boundary must already be a transaction EndLSN. Catchup passes the durable
+// watermark, which the persister published from a commit. A manual cutover LSN
+// is normalized before it is stored. This wait must not scan the segment
+// directory: NormalizeEndPosition reads every staged transaction, and after a
+// long copy that is the whole backlog.
 func (a *Applier) WaitUntil(ctx context.Context, boundary LSN) error {
 	if boundary == 0 {
 		return nil
 	}
-	// Resolve the boundary at most once. It cannot move afterwards, and
-	// resolving it per poll re-decoded the whole staged stream each time.
-	effectiveBoundary := boundary
-	resolved := false
 	for {
 		conn, err := postgres.Connect(ctx, a.config.ConnString)
 		if err != nil {
@@ -128,17 +130,7 @@ func (a *Applier) WaitUntil(ctx context.Context, boundary LSN) error {
 		if readErr != nil {
 			return fmt.Errorf("cdc: read catch-up progress: %w", readErr)
 		}
-		if !resolved {
-			if durable := a.config.Durable.Load(); durable >= boundary {
-				resolution, err := NormalizeEndPosition(a.config.Directory, boundary, durable)
-				if err != nil {
-					return err
-				}
-				effectiveBoundary = resolution.Boundary
-				resolved = true
-			}
-		}
-		if LSN(progress) >= effectiveBoundary {
+		if LSN(progress) >= boundary {
 			return nil
 		}
 		timer := time.NewTimer(a.config.PollInterval)
