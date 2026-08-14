@@ -143,21 +143,36 @@ func updateStreamProgress(
 	generation string,
 	remoteLSN LSN,
 ) error {
-	if err := postgres.UpdateProgress(ctx, tx, streamID, pglogrepl.LSN(remoteLSN)); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE `+cdcProgressTable+`
-		SET stream_generation = $2
-		WHERE stream_id = $1
-	`, streamID, generation); err != nil {
-		return err
-	}
 	tag, err := tx.Exec(ctx, `
-		UPDATE `+streamIdentityTable+`
-		SET progress_started = true
-		WHERE stream_id = $1 AND stream_generation = $2
-	`, streamID, generation)
+		WITH valid_identity AS MATERIALIZED (
+			SELECT stream_id
+			FROM `+streamIdentityTable+`
+			WHERE stream_id = $1 AND stream_generation = $2
+			FOR UPDATE
+		),
+		mark_started AS (
+			UPDATE `+streamIdentityTable+` AS identity
+			SET progress_started = true
+			FROM valid_identity
+			WHERE identity.stream_id = valid_identity.stream_id
+			  AND NOT identity.progress_started
+			RETURNING identity.stream_id
+		),
+		progress_source AS (
+			SELECT valid_identity.stream_id
+			FROM valid_identity
+			LEFT JOIN mark_started USING (stream_id)
+		)
+		INSERT INTO `+cdcProgressTable+` (stream_id, remote_lsn, stream_generation)
+		SELECT stream_id, $3::pg_lsn, $2
+		FROM progress_source
+		ON CONFLICT (stream_id) DO UPDATE
+		SET remote_lsn = EXCLUDED.remote_lsn,
+		    stream_generation = EXCLUDED.stream_generation,
+		    updated_at = clock_timestamp()
+		WHERE `+cdcProgressTable+`.stream_generation IS NULL
+		   OR `+cdcProgressTable+`.stream_generation = EXCLUDED.stream_generation
+	`, streamID, generation, pglogrepl.LSN(remoteLSN).String())
 	if err != nil {
 		return err
 	}
