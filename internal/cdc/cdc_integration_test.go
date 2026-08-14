@@ -531,6 +531,48 @@ func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
 	}
 }
 
+func TestPG17TargetRelationCacheInvalidatesChangedDefinition(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	conn := target.Connect(t)
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.relation_cache_items (
+			id bigint PRIMARY KEY,
+			value text NOT NULL
+		)`); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	cache := newTargetRelationCache()
+	source := Relation{
+		OID: 991, Namespace: "public", Name: "relation_cache_items", ReplicaIdentity: 'd',
+		Columns: []Column{{Name: "id", Type: 20, Flags: 1}, {Name: "value", Type: 25}},
+	}
+	first, err := cache.resolve(ctx, tx, &source, loadTargetRelation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := cache.resolve(ctx, tx, &source, loadTargetRelation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != again {
+		t.Fatal("identical source relation missed the target metadata cache")
+	}
+	source.ReplicaIdentity = 'f'
+	changed, err := cache.resolve(ctx, tx, &source, loadTargetRelation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed == first || changed.source.ReplicaIdentity != 'f' {
+		t.Fatal("changed source relation definition reused stale target metadata")
+	}
+}
+
 func TestPG17ApplierStartsBeforeReadingUnappliedSuffix(t *testing.T) {
 	target := pgtest.Start(t, 17)
 	ctx := context.Background()
