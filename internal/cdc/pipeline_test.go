@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestPersisterSquashesBatchIntoOneDurableWatermark(t *testing.T) {
@@ -47,6 +49,43 @@ func TestDurableWatermarkIsMonotonic(t *testing.T) {
 	watermark.Publish(10)
 	if got := watermark.Load(); got != 20 {
 		t.Fatalf("watermark = %d, want 20", got)
+	}
+}
+
+func TestTargetRelationCacheReloadsOnlyForChangedSourceDefinition(t *testing.T) {
+	t.Parallel()
+	cache := newTargetRelationCache()
+	source := Relation{
+		OID: 7, Namespace: "public", Name: "items", ReplicaIdentity: 'd',
+		Columns: []Column{{Name: "id", Type: 20, Flags: 1}, {Name: "value", Type: 25}},
+	}
+	loads := 0
+	loader := func(_ context.Context, _ pgx.Tx, relation *Relation) (*targetRelation, error) {
+		loads++
+		return &targetRelation{source: *relation, quoted: relation.Name}, nil
+	}
+	first, err := cache.resolve(context.Background(), nil, &source, loader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := cache.resolve(context.Background(), nil, &source, loader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loads != 1 || again != first {
+		t.Fatalf("unchanged relation loads=%d same=%t, want one load and same result", loads, again == first)
+	}
+
+	source.Columns[1].Flags = 1
+	changed, err := cache.resolve(context.Background(), nil, &source, loader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loads != 2 || changed == first {
+		t.Fatalf("changed relation loads=%d reused=%t, want reload", loads, changed == first)
+	}
+	if first.source.Columns[1].Flags != 0 {
+		t.Fatal("cached source definition aliases the caller's mutable column slice")
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -182,6 +183,7 @@ func (a *Applier) runConnection(ctx context.Context) error {
 		return err
 	}
 	defer reader.Close()
+	relationCache := newTargetRelationCache()
 	for {
 		if err := reader.Refresh(a.config.Durable.Load()); err != nil {
 			return err
@@ -195,7 +197,7 @@ func (a *Applier) runConnection(ctx context.Context) error {
 				return nil
 			}
 		}
-		applied, next, err := a.applyFromReader(ctx, conn, reader, LSN(progress))
+		applied, next, err := a.applyFromReader(ctx, conn, reader, relationCache, LSN(progress))
 		if err != nil {
 			return err
 		}
@@ -238,13 +240,14 @@ func (a *Applier) applyAvailable(ctx context.Context, conn *pgx.Conn, progress L
 		return false, progress, err
 	}
 	defer reader.Close()
-	return a.applyFromReader(ctx, conn, reader, progress)
+	return a.applyFromReader(ctx, conn, reader, newTargetRelationCache(), progress)
 }
 
 func (a *Applier) applyFromReader(
 	ctx context.Context,
 	conn *pgx.Conn,
 	reader *Reader,
+	relationCache *targetRelationCache,
 	progress LSN,
 ) (bool, LSN, error) {
 	for {
@@ -275,7 +278,7 @@ func (a *Applier) applyFromReader(
 				return false, progress, nil
 			}
 		}
-		applyErr := a.applyTransaction(ctx, conn, &transaction)
+		applyErr := a.applyTransaction(ctx, conn, relationCache, &transaction)
 		cleanupErr := transaction.CleanupSpill()
 		if applyErr != nil {
 			return false, progress, errors.Join(applyErr, cleanupErr)
@@ -342,7 +345,55 @@ type targetColumn struct {
 	notNull     bool
 }
 
-func (a *Applier) applyTransaction(ctx context.Context, conn *pgx.Conn, transaction *Transaction) error {
+type targetRelationCache struct {
+	relations map[uint32]*targetRelation
+}
+
+type targetRelationLoader func(context.Context, pgx.Tx, *Relation) (*targetRelation, error)
+
+func newTargetRelationCache() *targetRelationCache {
+	return &targetRelationCache{relations: make(map[uint32]*targetRelation)}
+}
+
+func (c *targetRelationCache) resolve(
+	ctx context.Context,
+	tx pgx.Tx,
+	source *Relation,
+	loader targetRelationLoader,
+) (*targetRelation, error) {
+	if c == nil {
+		return loader(ctx, tx, source)
+	}
+	if cached := c.relations[source.OID]; cached != nil &&
+		sameRelationDefinition(&cached.source, source) {
+		return cached, nil
+	}
+	relation, err := loader(ctx, tx, source)
+	if err != nil {
+		return nil, err
+	}
+	relation.source = cloneRelation(*source)
+	c.relations[source.OID] = relation
+	return relation, nil
+}
+
+func sameRelationDefinition(left, right *Relation) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.OID == right.OID &&
+		left.Namespace == right.Namespace &&
+		left.Name == right.Name &&
+		left.ReplicaIdentity == right.ReplicaIdentity &&
+		slices.Equal(left.Columns, right.Columns)
+}
+
+func (a *Applier) applyTransaction(
+	ctx context.Context,
+	conn *pgx.Conn,
+	relationCache *targetRelationCache,
+	transaction *Transaction,
+) error {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("cdc: begin target transaction: %w", err)
@@ -351,7 +402,7 @@ func (a *Applier) applyTransaction(ctx context.Context, conn *pgx.Conn, transact
 
 	relations := make(map[uint32]*targetRelation, len(transaction.Relations))
 	for i := range transaction.Relations {
-		relation, err := loadTargetRelation(ctx, tx, &transaction.Relations[i])
+		relation, err := relationCache.resolve(ctx, tx, &transaction.Relations[i], loadTargetRelation)
 		if err != nil {
 			return err
 		}

@@ -253,7 +253,7 @@ func TestApplierSkipPathsRemoveReaderSpills(t *testing.T) {
 				Durable:     &DurableWatermark{},
 				EndPosition: testCase.endPosition,
 			}}
-			_, _, _ = applier.applyFromReader(ctx, nil, reader, testCase.progress)
+			_, _, _ = applier.applyFromReader(ctx, nil, reader, newTargetRelationCache(), testCase.progress)
 			if _, err := os.Stat(spillPath); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("reader spill remains after skip: %v", err)
 			}
