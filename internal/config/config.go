@@ -120,7 +120,7 @@ func FromEnvironment() Config {
 		Target:               os.Getenv(TargetEnv),
 		Workers:              max(1, runtime.NumCPU()),
 		ReplayWorkers:        replayWorkers,
-		ReplayBatchSize:      64,
+		ReplayBatchSize:      128,
 		ReplayWindow:         replayWorkers * 8,
 		SplitThreshold:       1 << 30,
 		RestoreJobs:          max(1, runtime.NumCPU()/2),

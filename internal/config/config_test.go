@@ -21,7 +21,7 @@ func TestFromEnvironment(t *testing.T) {
 	if got.ReplayWorkers < 8 || got.ReplayWorkers > 32 {
 		t.Fatalf("ReplayWorkers = %d, want default in [8,32]", got.ReplayWorkers)
 	}
-	if got.ReplayBatchSize != 64 || got.ReplayWindow != got.ReplayWorkers*8 {
+	if got.ReplayBatchSize != 128 || got.ReplayWindow != got.ReplayWorkers*8 {
 		t.Fatalf("replay batch/window = %d/%d for %d workers", got.ReplayBatchSize, got.ReplayWindow, got.ReplayWorkers)
 	}
 }

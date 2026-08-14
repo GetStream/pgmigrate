@@ -283,7 +283,7 @@ directory's writer lock.
 | `--allow-collation-change` | false | proceed to a target that collates text differently from the source |
 | `--workers <n>` | host CPU count | parallel copy and index-build workers, and the cap on parts per table |
 | `--replay-workers <n>` | host CPU count clamped to 8–32 | target sessions that replay independent tables concurrently. Transactions touching the same table wait for their predecessor; independent durable commits may finish out of order while authoritative progress advances only through their contiguous source-order prefix |
-| `--replay-batch-size <n>` | `64` | maximum contiguous dependent source transactions combined into one durable target transaction. Independent table lanes are never combined, and encoded batch data is capped at 16 MiB |
+| `--replay-batch-size <n>` | `128` | maximum contiguous dependent source transactions combined into one durable target transaction. Independent table lanes are never combined, and encoded batch data is capped at 16 MiB |
 | `--replay-window <n>` | 8 times `--replay-workers` | source transactions searched for independent table work; also bounds scheduler memory |
 | `--split-threshold <bytes>` | `1073741824` (1 GiB) | desired bytes per copy part. A table is split into at most `--workers` parts, so a table far larger than the threshold produces larger parts |
 | `--restore-jobs <n>` | half the host CPU count, at least 1 | parallel `pg_restore` jobs for the schema restore |

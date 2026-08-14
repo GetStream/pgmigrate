@@ -87,7 +87,7 @@ func TestPG17ReplayBatchCollapsesSerializedCommitLane(t *testing.T) {
 	}
 
 	unbatched := run("replay_unbatched", "replay-unbatched", 1)
-	batched := run("replay_batched", "replay-batched", 64)
+	batched := run("replay_batched", "replay-batched", 128)
 	t.Logf("%d same-table transactions: unbatched=%s batched=%s speedup=%.1fx rate=%.0f events/s",
 		transactionCount, unbatched, batched, float64(unbatched)/float64(batched),
 		float64(transactionCount)/batched.Seconds())
@@ -192,7 +192,7 @@ func TestPG17ReplayScalesAcrossIndependentCommitLanes(t *testing.T) {
 		durable.Publish(durableLSN)
 		applier, err := NewApplier(ApplierConfig{
 			ConnString: target.URI, Directory: directory,
-			Workers: workers, BatchSize: 64, Window: workers * 8,
+			Workers: workers, BatchSize: 128, Window: workers * 8,
 			StreamID: stream, StreamGeneration: stream + "-generation", Durable: durable,
 			EndPosition: func(context.Context) (LSN, bool, error) {
 				return durableLSN, true, nil

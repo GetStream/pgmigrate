@@ -65,7 +65,7 @@ trap cleanup EXIT INT TERM
 # table would copy as one unsplit part and the split path would never run here.
 split_threshold=${SPLIT_THRESHOLD:-65536}
 replay_workers=${REPLAY_WORKERS:-4}
-replay_batch_size=${REPLAY_BATCH_SIZE:-64}
+replay_batch_size=${REPLAY_BATCH_SIZE:-128}
 replay_window=${REPLAY_WINDOW:-128}
 
 echo "checking the collation gate"
