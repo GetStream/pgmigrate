@@ -466,6 +466,106 @@ func TestRotationAndReaderAfterLSN(t *testing.T) {
 	}
 }
 
+func TestSegmentCatalogTracksRotationAndRecovery(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: dir, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range []struct {
+		commit LSN
+		end    LSN
+	}{{0x10, 0x18}, {0x20, 0x2f}, {0x30, 0x45}} {
+		tx := testTransaction(pair.commit)
+		tx.EndLSN = pair.end
+		if err := writer.Append(&tx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ranges := writer.SegmentCatalog().snapshot()
+	if len(ranges) != 3 {
+		t.Fatalf("catalog ranges=%d, want 3", len(ranges))
+	}
+	for i, want := range []struct {
+		start LSN
+		end   LSN
+	}{{0x10, 0x18}, {0x20, 0x2f}, {0x30, 0x45}} {
+		if ranges[i].StartCommit != want.start || ranges[i].LastEnd != want.end {
+			t.Fatalf("catalog range %d=%x/%x, want %x/%x",
+				i, ranges[i].StartCommit, ranges[i].LastEnd, want.start, want.end)
+		}
+		info, err := os.Stat(ranges[i].Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Size() != ranges[i].ValidatedSize {
+			t.Fatalf("catalog size %d=%d, want %d", i, ranges[i].ValidatedSize, info.Size())
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, recovery, err := OpenWriter(WriterConfig{Directory: dir, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if recovery.LastCommitLSN != 0x30 || recovery.DurableLSN != 0x45 {
+		t.Fatalf("recovery LSNs=%x/%x, want 30/45", recovery.LastCommitLSN, recovery.DurableLSN)
+	}
+	recovered := reopened.SegmentCatalog().snapshot()
+	if !reflect.DeepEqual(recovered, ranges) {
+		t.Fatalf("recovered catalog=%#v, want %#v", recovered, ranges)
+	}
+}
+
+func TestSegmentCatalogFinalizesRecoveredPartialRange(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{
+		Directory: dir, RotationBytes: int64(^uint64(0) >> 1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := testTransaction(0x10)
+	first.EndLSN = 0x18
+	if err := writer.Append(&first); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, recovery, err := OpenWriter(WriterConfig{
+		Directory: dir, RotationBytes: int64(^uint64(0) >> 1),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.PartialPath == "" || len(reopened.SegmentCatalog().snapshot()) != 0 {
+		t.Fatalf("recovered partial=%q catalog=%#v", recovery.PartialPath, reopened.SegmentCatalog().snapshot())
+	}
+	second := testTransaction(0x20)
+	second.EndLSN = 0x2f
+	if err := reopened.Append(&second); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+	ranges := reopened.SegmentCatalog().snapshot()
+	if len(ranges) != 1 || ranges[0].StartCommit != 0x10 ||
+		ranges[0].LastCommit != 0x20 || ranges[0].LastEnd != 0x2f {
+		t.Fatalf("finalized recovered partial catalog=%#v", ranges)
+	}
+	if err := reopened.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestRecoveryTruncatesTornTailAndContinues(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -693,6 +793,47 @@ func TestPruneKeepsOneSafetySegment(t *testing.T) {
 	}
 	if len(segments) != 1 || segments[0].start != 0x30 {
 		t.Fatalf("remaining segments = %#v, want safety segment starting at 30", segments)
+	}
+}
+
+func TestPruneStopsBeforeUnappliedCorruptSuffix(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: dir, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lsn := range []LSN{0x10, 0x20, 0x30} {
+		tx := testTransaction(lsn)
+		if err := writer.Append(&tx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := listSegments(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(segments[1].path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte{0xff}, frameHeaderSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	removed, err := Prune(dir, 0x10)
+	if err != nil {
+		t.Fatalf("prune read unapplied corrupt suffix: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("pruned %d unapplied segments", len(removed))
 	}
 }
 

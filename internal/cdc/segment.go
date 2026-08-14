@@ -35,6 +35,7 @@ type Writer struct {
 
 	dir           string
 	rotationBytes int64
+	catalog       *SegmentCatalog
 	file          *os.File
 	partialPath   string
 	size          int64
@@ -57,6 +58,116 @@ type Recovery struct {
 	TruncatedBytes int64
 }
 
+// SegmentRange is the immutable LSN range of one finalized segment. It is
+// populated only after the segment has been validated by recovery or durably
+// finalized by Writer.
+type SegmentRange struct {
+	Path          string
+	StartCommit   LSN
+	LastCommit    LSN
+	LastEnd       LSN
+	ValidatedSize int64
+}
+
+// SegmentCatalog caches validated finalized-segment bounds for pruning. Disk is
+// authoritative: OpenWriter rebuilds the catalog through recovery after every
+// restart, and the mutable partial tail is never included.
+type SegmentCatalog struct {
+	mu        sync.RWMutex
+	directory string
+	finalized []SegmentRange
+}
+
+func newSegmentCatalog(directory string, finalized []SegmentRange) *SegmentCatalog {
+	return &SegmentCatalog{
+		directory: directory,
+		finalized: append([]SegmentRange(nil), finalized...),
+	}
+}
+
+func (c *SegmentCatalog) snapshot() []SegmentRange {
+	if c == nil {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return append([]SegmentRange(nil), c.finalized...)
+}
+
+func (c *SegmentCatalog) addFinalized(segment SegmentRange) error {
+	if c == nil {
+		return errors.New("cdc: finalized segment catalog is missing")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.finalized) != 0 {
+		previous := c.finalized[len(c.finalized)-1]
+		if segment.StartCommit <= previous.StartCommit ||
+			segment.LastCommit <= previous.LastCommit ||
+			segment.LastEnd <= previous.LastEnd {
+			return fmt.Errorf(
+				"cdc: finalized segment %s range %x/%x does not follow %s range %x/%x",
+				filepath.Base(segment.Path), segment.LastCommit, segment.LastEnd,
+				filepath.Base(previous.Path), previous.LastCommit, previous.LastEnd,
+			)
+		}
+	}
+	c.finalized = append(c.finalized, segment)
+	return nil
+}
+
+func (c *SegmentCatalog) removeFinalized(paths []string) {
+	if c == nil || len(paths) == 0 {
+		return
+	}
+	removed := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		removed[path] = struct{}{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	kept := c.finalized[:0]
+	for _, segment := range c.finalized {
+		if _, ok := removed[segment.Path]; !ok {
+			kept = append(kept, segment)
+		}
+	}
+	c.finalized = kept
+}
+
+func (c *SegmentCatalog) replaceFinalized(replacement SegmentRange) error {
+	if c == nil {
+		return errors.New("cdc: finalized segment catalog is missing")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := range c.finalized {
+		if c.finalized[i].Path != replacement.Path {
+			continue
+		}
+		if replacement.StartCommit != c.finalized[i].StartCommit {
+			return fmt.Errorf("cdc: cataloged segment %s changed start LSN", filepath.Base(replacement.Path))
+		}
+		if i > 0 {
+			previous := c.finalized[i-1]
+			if replacement.LastCommit <= previous.LastCommit || replacement.LastEnd <= previous.LastEnd {
+				return fmt.Errorf("cdc: refreshed segment %s no longer follows %s",
+					filepath.Base(replacement.Path), filepath.Base(previous.Path))
+			}
+		}
+		if i+1 < len(c.finalized) {
+			next := c.finalized[i+1]
+			if replacement.LastCommit >= next.LastCommit || replacement.LastEnd >= next.LastEnd {
+				return fmt.Errorf("cdc: refreshed segment %s no longer precedes %s",
+					filepath.Base(replacement.Path), filepath.Base(next.Path))
+			}
+		}
+		c.finalized[i] = replacement
+		return nil
+	}
+	return fmt.Errorf("cdc: refreshed segment %s is absent from catalog", filepath.Base(replacement.Path))
+}
+
 // OpenWriter recovers the segment directory and opens its partial tail.
 func OpenWriter(config WriterConfig) (*Writer, Recovery, error) {
 	if config.Directory == "" {
@@ -77,7 +188,7 @@ func OpenWriter(config WriterConfig) (*Writer, Recovery, error) {
 	if err := mkdirAllDurable(config.Directory, 0o750); err != nil {
 		return nil, Recovery{}, err
 	}
-	recovery, err := Recover(config.Directory)
+	recovery, finalized, err := recoverDirectory(config.Directory)
 	if err != nil {
 		return nil, Recovery{}, err
 	}
@@ -85,6 +196,7 @@ func OpenWriter(config WriterConfig) (*Writer, Recovery, error) {
 	w := &Writer{
 		dir:           config.Directory,
 		rotationBytes: config.RotationBytes,
+		catalog:       newSegmentCatalog(config.Directory, finalized),
 		lastCommitLSN: recovery.LastCommitLSN,
 		lastEndLSN:    recovery.DurableLSN,
 		pendingEndLSN: recovery.DurableLSN,
@@ -110,6 +222,15 @@ func OpenWriter(config WriterConfig) (*Writer, Recovery, error) {
 		}
 	}
 	return w, recovery, nil
+}
+
+// SegmentCatalog returns the writer's validated finalized-segment catalog.
+// The catalog remains current as this writer rotates new segments.
+func (w *Writer) SegmentCatalog() *SegmentCatalog {
+	if w == nil {
+		return nil
+	}
+	return w.catalog
 }
 
 // Append writes one complete transaction frame. It does not make the
@@ -313,6 +434,12 @@ func (w *Writer) rotateLocked() error {
 	if w.file == nil {
 		return nil
 	}
+	finalized := SegmentRange{
+		StartCommit:   segmentStart(w.partialPath),
+		LastCommit:    w.lastCommitLSN,
+		LastEnd:       w.lastEndLSN,
+		ValidatedSize: w.size,
+	}
 	if err := w.syncLocked(); err != nil {
 		return err
 	}
@@ -337,7 +464,19 @@ func (w *Writer) rotateLocked() error {
 	if err := w.directorySync(w.dir); err != nil {
 		return err
 	}
+	finalized.Path = finalPath
+	if err := w.catalog.addFinalized(finalized); err != nil {
+		return err
+	}
 	return nil
+}
+
+func segmentStart(path string) LSN {
+	start, _, ok := parseSegmentName(filepath.Base(path))
+	if !ok {
+		return 0
+	}
+	return start
 }
 
 // Finalize fsyncs and renames the current tail to .seg.
@@ -427,31 +566,46 @@ func mkdirAllDurable(directory string, mode os.FileMode) error {
 // Recover verifies finalized segments and truncates a torn or corrupt partial
 // tail at its first invalid frame.
 func Recover(directory string) (Recovery, error) {
+	recovery, _, err := recoverDirectory(directory)
+	return recovery, err
+}
+
+func recoverDirectory(directory string) (Recovery, []SegmentRange, error) {
 	segments, err := listSegments(directory)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return Recovery{}, nil
+			return Recovery{}, nil, nil
 		}
-		return Recovery{}, err
+		return Recovery{}, nil, err
 	}
 	var result Recovery
+	finalized := make([]SegmentRange, 0, len(segments))
 	var previousCommit LSN
 	var previousEnd LSN
 	partialSeen := false
 	for _, segment := range segments {
 		if segment.partial {
 			if partialSeen {
-				return Recovery{}, errors.New("cdc: multiple partial segments")
+				return Recovery{}, nil, errors.New("cdc: multiple partial segments")
 			}
 			partialSeen = true
 			result.PartialPath = segment.path
 		} else if partialSeen {
-			return Recovery{}, errors.New("cdc: finalized segment follows partial tail")
+			return Recovery{}, nil, errors.New("cdc: finalized segment follows partial tail")
 		}
 
 		scan, scanErr := scanSegment(segment.path, segment.partial, previousCommit, previousEnd, nil)
 		if scanErr != nil {
-			return Recovery{}, scanErr
+			return Recovery{}, nil, scanErr
+		}
+		if !segment.partial {
+			finalized = append(finalized, SegmentRange{
+				Path:          segment.path,
+				StartCommit:   segment.start,
+				LastCommit:    scan.lastCommitLSN,
+				LastEnd:       scan.lastEndLSN,
+				ValidatedSize: scan.size,
+			})
 		}
 		previousCommit = scan.lastCommitLSN
 		previousEnd = scan.lastEndLSN
@@ -459,7 +613,7 @@ func Recover(directory string) (Recovery, error) {
 	}
 	result.LastCommitLSN = previousCommit
 	result.DurableLSN = previousEnd
-	return result, nil
+	return result, finalized, nil
 }
 
 type segmentFile struct {

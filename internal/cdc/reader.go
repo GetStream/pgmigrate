@@ -397,7 +397,11 @@ func Prune(directory string, appliedLSN LSN) ([]string, error) {
 		previousEnd = scan.lastEndLSN
 		if scan.lastEndLSN < appliedLSN {
 			candidates = append(candidates, segment.path)
+			continue
 		}
+		// EndLSNs are globally monotonic, so every later segment is also
+		// ineligible. This cold-path fallback must not read an unapplied suffix.
+		break
 	}
 	if len(candidates) <= 1 {
 		return nil, nil
