@@ -7,8 +7,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 func TestPersisterSquashesBatchIntoOneDurableWatermark(t *testing.T) {
@@ -60,7 +58,7 @@ func TestTargetRelationCacheReloadsOnlyForChangedSourceDefinition(t *testing.T) 
 		Columns: []Column{{Name: "id", Type: 20, Flags: 1}, {Name: "value", Type: 25}},
 	}
 	loads := 0
-	loader := func(_ context.Context, _ pgx.Tx, relation *Relation) (*targetRelation, error) {
+	loader := func(_ context.Context, _ targetRelationQuerier, relation *Relation) (*targetRelation, error) {
 		loads++
 		return &targetRelation{source: *relation, quoted: relation.Name}, nil
 	}
