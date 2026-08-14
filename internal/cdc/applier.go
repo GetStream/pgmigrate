@@ -356,7 +356,11 @@ type targetRelationCache struct {
 	relations map[uint32]*targetRelation
 }
 
-type targetRelationLoader func(context.Context, pgx.Tx, *Relation) (*targetRelation, error)
+type targetRelationQuerier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}
+
+type targetRelationLoader func(context.Context, targetRelationQuerier, *Relation) (*targetRelation, error)
 
 func newTargetRelationCache() *targetRelationCache {
 	return &targetRelationCache{relations: make(map[uint32]*targetRelation)}
@@ -364,18 +368,18 @@ func newTargetRelationCache() *targetRelationCache {
 
 func (c *targetRelationCache) resolve(
 	ctx context.Context,
-	tx pgx.Tx,
+	db targetRelationQuerier,
 	source *Relation,
 	loader targetRelationLoader,
 ) (*targetRelation, error) {
 	if c == nil {
-		return loader(ctx, tx, source)
+		return loader(ctx, db, source)
 	}
 	if cached := c.relations[source.OID]; cached != nil &&
 		sameRelationDefinition(&cached.source, source) {
 		return cached, nil
 	}
-	relation, err := loader(ctx, tx, source)
+	relation, err := loader(ctx, db, source)
 	if err != nil {
 		return nil, err
 	}
@@ -402,15 +406,9 @@ func (a *Applier) applyTransaction(
 	statementCache *applyStatementCache,
 	transaction *Transaction,
 ) error {
-	tx, err := conn.Begin(ctx)
-	if err != nil {
-		return fmt.Errorf("cdc: begin target transaction: %w", err)
-	}
-	defer tx.Rollback(context.Background())
-
 	relations := make(map[uint32]*targetRelation, len(transaction.Relations))
 	for i := range transaction.Relations {
-		relation, err := relationCache.resolve(ctx, tx, &transaction.Relations[i], loadTargetRelation)
+		relation, err := relationCache.resolve(ctx, conn, &transaction.Relations[i], loadTargetRelation)
 		if err != nil {
 			return err
 		}
@@ -418,7 +416,8 @@ func (a *Applier) applyTransaction(
 	}
 
 	collector := newSampleCollector(a.config.Sampler, transaction)
-	replay := newApplyPipeline(ctx, tx.Conn().PgConn(), statementCache)
+	replay := newApplyPipeline(ctx, conn.PgConn(), statementCache)
+	replay.begin()
 	var replayErr error
 	if transaction.Spill != nil {
 		replayErr = a.applySpilledChanges(replay, relations, transaction.Spill, collector)
@@ -478,23 +477,38 @@ func (a *Applier) applyTransaction(
 			}
 		}
 	}
-	if finishErr := replay.close(); replayErr != nil || finishErr != nil {
-		return errors.Join(replayErr, finishErr)
+	if replayErr == nil {
+		replayErr = replay.sync()
 	}
-	if err := updateStreamProgress(
-		ctx, tx, a.config.StreamID, a.config.StreamGeneration, transaction.EndLSN,
-	); err != nil {
-		return classifyApplyError(nil, 0, fmt.Errorf("cdc: update transactional apply progress: %w", err))
+	if replayErr == nil && replay.conn.TxStatus() != 'T' {
+		replayErr = fmt.Errorf(
+			"cdc: target transaction status after replay is %q, want %q",
+			replay.conn.TxStatus(), 'T',
+		)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return classifyApplyError(nil, 0, fmt.Errorf("cdc: commit target transaction: %w", err))
+	if replayErr == nil {
+		replay.queueProgress(a.config.StreamID, a.config.StreamGeneration, transaction.EndLSN)
+		replay.commit()
+		replayErr = replay.sync()
+	}
+	if replayErr == nil && replay.conn.TxStatus() != 'I' {
+		replayErr = fmt.Errorf(
+			"cdc: target transaction status after commit is %q, want %q",
+			replay.conn.TxStatus(), 'I',
+		)
+	}
+	if replayErr != nil {
+		return errors.Join(replayErr, replay.abort())
+	}
+	if err := replay.close(); err != nil {
+		return err
 	}
 	collector.flush()
 	return nil
 }
 
-func loadTargetRelation(ctx context.Context, tx pgx.Tx, source *Relation) (*targetRelation, error) {
-	rows, err := tx.Query(ctx, `
+func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *Relation) (*targetRelation, error) {
+	rows, err := db.Query(ctx, `
 		SELECT a.attname, a.atttypid, a.attidentity::text, a.attgenerated <> '', a.attnotnull
 		FROM pg_catalog.pg_attribute a
 		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
@@ -676,16 +690,19 @@ const (
 )
 
 type applyExpectation struct {
-	resultKind   applyResultKind
-	relation     *targetRelation
-	kind         ChangeKind
-	description  string
-	expectedRows int64
-	statement    string
-	paramOIDs    []uint32
+	resultKind    applyResultKind
+	relation      *targetRelation
+	kind          ChangeKind
+	description   string
+	expectedRows  int64
+	expectedTag   string
+	progressGuard bool
+	statement     string
+	paramOIDs     []uint32
 }
 
 type applyPipeline struct {
+	conn         *pgconn.PgConn
 	pipeline     *pgconn.Pipeline
 	statements   *applyStatementCache
 	expectations []applyExpectation
@@ -699,9 +716,33 @@ func newApplyPipeline(
 	statements *applyStatementCache,
 ) *applyPipeline {
 	return &applyPipeline{
+		conn:       conn,
 		pipeline:   conn.StartPipeline(ctx),
 		statements: statements,
 	}
+}
+
+func (p *applyPipeline) begin() {
+	p.queueUnprepared("BEGIN", nil, applyExpectation{
+		description: "begin target transaction", expectedRows: -1, expectedTag: "BEGIN",
+	})
+}
+
+func (p *applyPipeline) commit() {
+	p.queueUnprepared("COMMIT", nil, applyExpectation{
+		description: "commit target transaction", expectedRows: -1, expectedTag: "COMMIT",
+	})
+}
+
+func (p *applyPipeline) queueProgress(streamID, generation string, remoteLSN LSN) {
+	p.queueUnprepared(
+		streamProgressSQL,
+		streamProgressParams(streamID, generation, remoteLSN),
+		applyExpectation{
+			description: "update transactional apply progress", expectedRows: 1,
+			progressGuard: true,
+		},
+	)
 }
 
 func (p *applyPipeline) queue(
@@ -709,13 +750,7 @@ func (p *applyPipeline) queue(
 	params []rawParam,
 	expectation applyExpectation,
 ) error {
-	values := paramValues(params)
-	oids := make([]uint32, len(params))
-	formats := make([]int16, len(params))
-	for i := range params {
-		oids[i] = params[i].oid
-		formats[i] = params[i].format
-	}
+	values, oids, formats := rawParamArrays(params)
 	statement, added, evicted := p.statements.acquire(sql, oids)
 	if evicted != nil {
 		p.pipeline.SendDeallocate(evicted.name)
@@ -747,6 +782,28 @@ func (p *applyPipeline) queue(
 		return p.sync()
 	}
 	return nil
+}
+
+func (p *applyPipeline) queueUnprepared(
+	sql string,
+	params []rawParam,
+	expectation applyExpectation,
+) {
+	values, oids, formats := rawParamArrays(params)
+	p.pipeline.SendQueryParams(sql, values, oids, formats, nil)
+	p.expectations = append(p.expectations, expectation)
+	p.commands++
+}
+
+func rawParamArrays(params []rawParam) ([][]byte, []uint32, []int16) {
+	values := paramValues(params)
+	oids := make([]uint32, len(params))
+	formats := make([]int16, len(params))
+	for i := range params {
+		oids[i] = params[i].oid
+		formats[i] = params[i].format
+	}
+	return values, oids, formats
 }
 
 func (p *applyPipeline) sync() error {
@@ -825,6 +882,12 @@ func (p *applyPipeline) sync() error {
 					"affected %d rows, expected %d", tag.RowsAffected(), expectation.expectedRows,
 				))
 			}
+			if expectation.expectedTag != "" && tag.String() != expectation.expectedTag && firstErr == nil {
+				firstErr = fmt.Errorf(
+					"cdc: %s returned command tag %q, expected %q",
+					expectation.description, tag.String(), expectation.expectedTag,
+				)
+			}
 		case applyPrepareResult:
 			description, ok := result.(*pgconn.StatementDescription)
 			if !ok {
@@ -875,6 +938,9 @@ func pipelineResultError(expectations []applyExpectation, index int, err error) 
 }
 
 func (expectation applyExpectation) classify(err error) error {
+	if expectation.progressGuard && isProgressGuardError(err) {
+		return fmt.Errorf("%w: %v", ErrStreamGenerationMismatch, err)
+	}
 	return classifyApplyError(expectation.relation, expectation.kind, fmt.Errorf(
 		"%s: %w", expectation.description, err,
 	))
@@ -885,12 +951,33 @@ func (p *applyPipeline) close() error {
 		return nil
 	}
 	p.closed = true
-	syncErr := p.sync()
 	closeErr := p.pipeline.Close()
 	if closeErr != nil {
 		closeErr = classifyApplyError(nil, 0, fmt.Errorf("cdc: close replay pipeline: %w", closeErr))
 	}
-	return errors.Join(syncErr, closeErr)
+	return closeErr
+}
+
+func (p *applyPipeline) abort() error {
+	if p.closed {
+		return nil
+	}
+	var result error
+	if len(p.expectations) != 0 {
+		result = errors.Join(result, p.sync())
+	}
+	if status := p.conn.TxStatus(); status == 'T' || status == 'E' {
+		p.queueUnprepared("ROLLBACK", nil, applyExpectation{
+			description: "roll back target transaction", expectedRows: -1, expectedTag: "ROLLBACK",
+		})
+		result = errors.Join(result, p.sync())
+	}
+	if status := p.conn.TxStatus(); status != 'I' && !p.conn.IsClosed() {
+		result = errors.Join(result, fmt.Errorf(
+			"cdc: target transaction status after rollback is %q, want %q", status, 'I',
+		))
+	}
+	return errors.Join(result, p.close())
 }
 
 // emptyParamValue is a non-nil zero-length parameter value, which the extended

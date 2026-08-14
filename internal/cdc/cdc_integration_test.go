@@ -717,6 +717,12 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		CREATE TABLE public.pipeline_missing (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_binary (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_prepared (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_progress_guard (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_deferred_commit (
+			id integer PRIMARY KEY,
+			value text,
+			UNIQUE (value) DEFERRABLE INITIALLY DEFERRED
+		);
 		CREATE TABLE public.pipeline_spill (id integer PRIMARY KEY, value integer NOT NULL);
 		INSERT INTO public.pipeline_spill
 		SELECT id, 0 FROM generate_series(1, 257) AS id;
@@ -902,6 +908,81 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatalf("failed pipeline committed %d rows", count)
 		}
 		assertProgress(t, "pipeline-sql-failure", 0)
+	})
+
+	t.Run("progress mismatch aborts before queued commit", func(t *testing.T) {
+		const stream = "pipeline-progress-guard"
+		const generation = stream + "-generation"
+		if err := EnsureStreamProgressIdentity(ctx, conn, StreamIdentityConfig{
+			StreamID: stream, Generation: generation, FreshSetup: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		source := relation(1110, "pipeline_progress_guard", 25)
+		applier := &Applier{config: ApplierConfig{
+			StreamID: stream, StreamGeneration: "wrong-generation",
+		}}
+		err := applier.applyTransaction(
+			ctx, conn, relationCache, statementCache,
+			&Transaction{
+				CommitLSN: 79, EndLSN: 80, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("1"), text("must roll back")),
+				}},
+			},
+		)
+		if !errors.Is(err, ErrStreamGenerationMismatch) {
+			t.Fatalf("progress mismatch error=%v", err)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM public.pipeline_progress_guard").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("progress mismatch committed %d rows", count)
+		}
+		assertProgress(t, stream, 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after progress mismatch=%q, want idle", status)
+		}
+	})
+
+	t.Run("deferred commit failure rolls back data and progress", func(t *testing.T) {
+		source := relation(1111, "pipeline_deferred_commit", 25)
+		transaction := &Transaction{
+			CommitLSN: 89, EndLSN: 90, Relations: []Relation{source},
+			Changes: []Change{
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("1"), text("duplicate"))},
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("2"), text("duplicate"))},
+			},
+		}
+		var divergence *DivergenceError
+		if err := apply("pipeline-deferred-commit", transaction); !errors.As(err, &divergence) {
+			t.Fatalf("deferred commit error=%v, want divergence", err)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM public.pipeline_deferred_commit").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("failed commit retained %d rows", count)
+		}
+		assertProgress(t, "pipeline-deferred-commit", 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after failed commit=%q, want idle", status)
+		}
+	})
+
+	t.Run("empty source transaction advances progress", func(t *testing.T) {
+		transaction := &Transaction{CommitLSN: 99, EndLSN: 100}
+		if err := apply("pipeline-empty", transaction); err != nil {
+			t.Fatal(err)
+		}
+		assertProgress(t, "pipeline-empty", transaction.EndLSN)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after empty transaction=%q, want idle", status)
+		}
 	})
 
 	for _, kind := range []ChangeKind{ChangeUpdate, ChangeDelete} {
