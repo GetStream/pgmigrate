@@ -184,6 +184,7 @@ func (a *Applier) runConnection(ctx context.Context) error {
 	}
 	defer reader.Close()
 	relationCache := newTargetRelationCache()
+	statementCache := newApplyStatementCache(applyStatementCacheCapacity)
 	for {
 		if err := reader.Refresh(a.config.Durable.Load()); err != nil {
 			return err
@@ -197,7 +198,9 @@ func (a *Applier) runConnection(ctx context.Context) error {
 				return nil
 			}
 		}
-		applied, next, err := a.applyFromReader(ctx, conn, reader, relationCache, LSN(progress))
+		applied, next, err := a.applyFromReader(
+			ctx, conn, reader, relationCache, statementCache, LSN(progress),
+		)
 		if err != nil {
 			return err
 		}
@@ -240,7 +243,10 @@ func (a *Applier) applyAvailable(ctx context.Context, conn *pgx.Conn, progress L
 		return false, progress, err
 	}
 	defer reader.Close()
-	return a.applyFromReader(ctx, conn, reader, newTargetRelationCache(), progress)
+	return a.applyFromReader(
+		ctx, conn, reader, newTargetRelationCache(),
+		newApplyStatementCache(applyStatementCacheCapacity), progress,
+	)
 }
 
 func (a *Applier) applyFromReader(
@@ -248,6 +254,7 @@ func (a *Applier) applyFromReader(
 	conn *pgx.Conn,
 	reader *Reader,
 	relationCache *targetRelationCache,
+	statementCache *applyStatementCache,
 	progress LSN,
 ) (bool, LSN, error) {
 	for {
@@ -278,7 +285,7 @@ func (a *Applier) applyFromReader(
 				return false, progress, nil
 			}
 		}
-		applyErr := a.applyTransaction(ctx, conn, relationCache, &transaction)
+		applyErr := a.applyTransaction(ctx, conn, relationCache, statementCache, &transaction)
 		cleanupErr := transaction.CleanupSpill()
 		if applyErr != nil {
 			return false, progress, errors.Join(applyErr, cleanupErr)
@@ -392,6 +399,7 @@ func (a *Applier) applyTransaction(
 	ctx context.Context,
 	conn *pgx.Conn,
 	relationCache *targetRelationCache,
+	statementCache *applyStatementCache,
 	transaction *Transaction,
 ) error {
 	tx, err := conn.Begin(ctx)
@@ -410,7 +418,7 @@ func (a *Applier) applyTransaction(
 	}
 
 	collector := newSampleCollector(a.config.Sampler, transaction)
-	replay := newApplyPipeline(ctx, tx.Conn().PgConn())
+	replay := newApplyPipeline(ctx, tx.Conn().PgConn(), statementCache)
 	var replayErr error
 	if transaction.Spill != nil {
 		replayErr = a.applySpilledChanges(replay, relations, transaction.Spill, collector)
@@ -659,21 +667,41 @@ type rawParam struct {
 
 const applyPipelineWindow = 256
 
+type applyResultKind byte
+
+const (
+	applyCommandResult applyResultKind = iota
+	applyPrepareResult
+	applyDeallocateResult
+)
+
 type applyExpectation struct {
+	resultKind   applyResultKind
 	relation     *targetRelation
 	kind         ChangeKind
 	description  string
 	expectedRows int64
+	statement    string
+	paramOIDs    []uint32
 }
 
 type applyPipeline struct {
 	pipeline     *pgconn.Pipeline
+	statements   *applyStatementCache
 	expectations []applyExpectation
+	commands     int
 	closed       bool
 }
 
-func newApplyPipeline(ctx context.Context, conn *pgconn.PgConn) *applyPipeline {
-	return &applyPipeline{pipeline: conn.StartPipeline(ctx)}
+func newApplyPipeline(
+	ctx context.Context,
+	conn *pgconn.PgConn,
+	statements *applyStatementCache,
+) *applyPipeline {
+	return &applyPipeline{
+		pipeline:   conn.StartPipeline(ctx),
+		statements: statements,
+	}
 }
 
 func (p *applyPipeline) queue(
@@ -688,9 +716,34 @@ func (p *applyPipeline) queue(
 		oids[i] = params[i].oid
 		formats[i] = params[i].format
 	}
-	p.pipeline.SendQueryParams(sql, values, oids, formats, nil)
+	statement, added, evicted := p.statements.acquire(sql, oids)
+	if evicted != nil {
+		p.pipeline.SendDeallocate(evicted.name)
+		p.expectations = append(p.expectations, applyExpectation{
+			resultKind:  applyDeallocateResult,
+			description: "deallocate replay statement " + evicted.name,
+			statement:   evicted.name,
+		})
+	}
+	if statement == nil {
+		p.pipeline.SendQueryParams(sql, values, oids, formats, nil)
+	} else {
+		if added {
+			p.pipeline.SendPrepare(statement.name, sql, oids)
+			p.expectations = append(p.expectations, applyExpectation{
+				resultKind:  applyPrepareResult,
+				relation:    expectation.relation,
+				kind:        expectation.kind,
+				description: "prepare " + expectation.description,
+				statement:   statement.name,
+				paramOIDs:   append([]uint32(nil), oids...),
+			})
+		}
+		p.pipeline.SendQueryPrepared(statement.name, values, formats, nil)
+	}
 	p.expectations = append(p.expectations, expectation)
-	if len(p.expectations) >= applyPipelineWindow {
+	p.commands++
+	if p.commands >= applyPipelineWindow {
 		return p.sync()
 	}
 	return nil
@@ -702,6 +755,7 @@ func (p *applyPipeline) sync() error {
 	}
 	expectations := p.expectations
 	p.expectations = nil
+	p.commands = 0
 	if err := p.pipeline.Sync(); err != nil {
 		return classifyApplyError(nil, 0, fmt.Errorf("cdc: synchronize replay pipeline: %w", err))
 	}
@@ -714,27 +768,52 @@ func (p *applyPipeline) sync() error {
 			if firstErr == nil {
 				firstErr = pipelineResultError(expectations, resultIndex, err)
 			}
+			if resultIndex < len(expectations) {
+				resultIndex++
+			}
 			var pgErr *pgconn.PgError
 			if !errors.As(err, &pgErr) {
 				return firstErr
 			}
 			continue
 		}
-		switch result := result.(type) {
-		case *pgconn.ResultReader:
-			if resultIndex >= len(expectations) {
-				_, closeErr := result.Close()
+		if _, ok := result.(*pgconn.PipelineSync); ok {
+			if resultIndex != len(expectations) && firstErr == nil {
+				firstErr = fmt.Errorf(
+					"cdc: replay pipeline returned %d results, expected %d",
+					resultIndex, len(expectations),
+				)
+			}
+			return firstErr
+		}
+		if resultIndex >= len(expectations) {
+			closeErr := closeUnexpectedPipelineResult(result)
+			if firstErr == nil {
+				firstErr = errors.Join(
+					fmt.Errorf("cdc: replay pipeline returned unexpected result type %T", result),
+					closeErr,
+				)
+			}
+			continue
+		}
+		expectation := expectations[resultIndex]
+		resultIndex++
+		switch expectation.resultKind {
+		case applyCommandResult:
+			reader, ok := result.(*pgconn.ResultReader)
+			if !ok {
 				if firstErr == nil {
 					firstErr = errors.Join(
-						errors.New("cdc: replay pipeline returned an unexpected command result"),
-						closeErr,
+						fmt.Errorf(
+							"cdc: %s returned result type %T, expected command result",
+							expectation.description, result,
+						),
+						closeUnexpectedPipelineResult(result),
 					)
 				}
 				continue
 			}
-			expectation := expectations[resultIndex]
-			resultIndex++
-			tag, closeErr := result.Close()
+			tag, closeErr := reader.Close()
 			if closeErr != nil {
 				if firstErr == nil {
 					firstErr = expectation.classify(closeErr)
@@ -746,25 +825,46 @@ func (p *applyPipeline) sync() error {
 					"affected %d rows, expected %d", tag.RowsAffected(), expectation.expectedRows,
 				))
 			}
-		case *pgconn.PipelineSync:
-			if resultIndex != len(expectations) && firstErr == nil {
+		case applyPrepareResult:
+			description, ok := result.(*pgconn.StatementDescription)
+			if !ok {
+				if firstErr == nil {
+					firstErr = errors.Join(
+						fmt.Errorf(
+							"cdc: %s returned result type %T, expected statement description",
+							expectation.description, result,
+						),
+						closeUnexpectedPipelineResult(result),
+					)
+				}
+				continue
+			}
+			if !slices.Equal(description.ParamOIDs, expectation.paramOIDs) && firstErr == nil {
 				firstErr = fmt.Errorf(
-					"cdc: replay pipeline returned %d command results, expected %d",
-					resultIndex, len(expectations),
+					"cdc: prepared replay statement %s parameter OIDs %v, expected %v",
+					expectation.statement, description.ParamOIDs, expectation.paramOIDs,
 				)
 			}
-			return firstErr
-		case nil:
-			if firstErr == nil {
-				firstErr = fmt.Errorf("cdc: replay pipeline ended before synchronization")
-			}
-			return firstErr
-		default:
-			if firstErr == nil {
-				firstErr = fmt.Errorf("cdc: replay pipeline returned unexpected result type %T", result)
+		case applyDeallocateResult:
+			if _, ok := result.(*pgconn.CloseComplete); !ok && firstErr == nil {
+				firstErr = errors.Join(
+					fmt.Errorf(
+						"cdc: %s returned result type %T, expected close completion",
+						expectation.description, result,
+					),
+					closeUnexpectedPipelineResult(result),
+				)
 			}
 		}
 	}
+}
+
+func closeUnexpectedPipelineResult(result any) error {
+	if reader, ok := result.(*pgconn.ResultReader); ok {
+		_, err := reader.Close()
+		return err
+	}
+	return nil
 }
 
 func pipelineResultError(expectations []applyExpectation, index int, err error) error {

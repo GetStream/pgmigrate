@@ -716,6 +716,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		);
 		CREATE TABLE public.pipeline_missing (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_binary (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_prepared (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_spill (id integer PRIMARY KEY, value integer NOT NULL);
 		INSERT INTO public.pipeline_spill
 		SELECT id, 0 FROM generate_series(1, 257) AS id;
@@ -739,6 +740,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			},
 		}
 	}
+	relationCache := newTargetRelationCache()
+	statementCache := newApplyStatementCache(applyStatementCacheCapacity)
 	apply := func(stream string, transaction *Transaction) error {
 		generation := stream + "-generation"
 		if err := EnsureStreamProgressIdentity(ctx, conn, StreamIdentityConfig{
@@ -749,7 +752,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		applier := &Applier{config: ApplierConfig{
 			StreamID: stream, StreamGeneration: generation,
 		}}
-		return applier.applyTransaction(ctx, conn, newTargetRelationCache(), transaction)
+		return applier.applyTransaction(ctx, conn, relationCache, statementCache, transaction)
 	}
 	assertProgress := func(t *testing.T, stream string, want LSN) {
 		t.Helper()
@@ -785,6 +788,96 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatalf("mixed replay row=%d/%q, want 2/second", id, value)
 		}
 		assertProgress(t, "pipeline-mixed", transaction.EndLSN)
+	})
+
+	t.Run("prepared DML is reused across source transactions", func(t *testing.T) {
+		source := relation(1108, "pipeline_prepared", 25)
+		for id, endLSN := range []LSN{61, 62} {
+			transaction := &Transaction{
+				CommitLSN: endLSN - 1, EndLSN: endLSN, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text(fmt.Sprint(id+1)), text("prepared")),
+				}},
+			}
+			if err := apply("pipeline-prepared", transaction); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var prepared int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*)
+			FROM pg_catalog.pg_prepared_statements
+			WHERE statement LIKE 'INSERT INTO "public"."pipeline_prepared"%'
+		`).Scan(&prepared); err != nil {
+			t.Fatal(err)
+		}
+		if prepared != 1 {
+			t.Fatalf("prepared INSERT statements=%d, want one reused statement", prepared)
+		}
+		assertProgress(t, "pipeline-prepared", 62)
+	})
+
+	t.Run("prepared DML eviction deallocates the server statement", func(t *testing.T) {
+		evictionConn := target.Connect(t)
+		source := relation(1109, "pipeline_prepared", 25)
+		const stream = "pipeline-prepared-eviction"
+		const generation = stream + "-generation"
+		if err := EnsureStreamProgressIdentity(ctx, evictionConn, StreamIdentityConfig{
+			StreamID: stream, Generation: generation, FreshSetup: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		applier := &Applier{config: ApplierConfig{
+			StreamID: stream, StreamGeneration: generation,
+		}}
+		evictionRelations := newTargetRelationCache()
+		evictionStatements := newApplyStatementCache(1)
+		if err := applier.applyTransaction(
+			ctx, evictionConn, evictionRelations, evictionStatements,
+			&Transaction{
+				CommitLSN: 69, EndLSN: 70, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("100"), text("before")),
+				}},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		var evictedName string
+		if err := evictionConn.QueryRow(
+			ctx, `
+				SELECT name FROM pg_catalog.pg_prepared_statements
+				WHERE name LIKE 'pgmigrate_cdc_%'
+			`,
+		).Scan(&evictedName); err != nil {
+			t.Fatal(err)
+		}
+		if err := applier.applyTransaction(
+			ctx, evictionConn, evictionRelations, evictionStatements,
+			&Transaction{
+				CommitLSN: 70, EndLSN: 71, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("100"), TupleDatum{Kind: DatumNull}),
+					New: tuple(text("100"), text("after")),
+				}},
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		var oldCount, preparedCount int
+		if err := evictionConn.QueryRow(ctx, `
+			SELECT count(*) FILTER (WHERE name = $1), count(*)
+			FROM pg_catalog.pg_prepared_statements
+			WHERE name LIKE 'pgmigrate_cdc_%'
+		`, evictedName).Scan(&oldCount, &preparedCount); err != nil {
+			t.Fatal(err)
+		}
+		if oldCount != 0 || preparedCount != 1 {
+			t.Fatalf("after eviction old/current prepared statements=%d/%d, want 0/1", oldCount, preparedCount)
+		}
 	})
 
 	t.Run("SQL failure rolls back data and progress", func(t *testing.T) {
