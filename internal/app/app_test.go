@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GetStream/pgmigrate/internal/cdc"
 	"github.com/GetStream/pgmigrate/internal/config"
@@ -20,6 +22,75 @@ import (
 	"github.com/GetStream/pgmigrate/internal/state"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+func TestApplyMonitorRatesUseCommittedCounterDeltas(t *testing.T) {
+	previous := newApplyMonitorSample(
+		time.Unix(100, 0),
+		cdc.ApplyProgressStats{Rows: 100},
+		[]cdc.ApplyTableStats{{
+			Schema: "public", Table: "messages", Rows: 40,
+		}},
+	)
+	now := time.Unix(104, 0)
+	if got := counterRate(140, previousApplyRows(previous), now, previous); got != 10 {
+		t.Fatalf("global rows/s = %v, want 10", got)
+	}
+	table := cdc.ApplyTableStats{Schema: "public", Table: "messages", Rows: 60}
+	if got := tableCounterRate(table, now, previous); got != 5 {
+		t.Fatalf("table rows/s = %v, want 5", got)
+	}
+	if got := tableCounterRate(
+		cdc.ApplyTableStats{Schema: "public", Table: "new", Rows: 12},
+		now,
+		previous,
+	); got != 3 {
+		t.Fatalf("new-table rows/s = %v, want 3", got)
+	}
+	if got := counterRate(10, 100, now, previous); got != 0 {
+		t.Fatalf("reset counter rows/s = %v, want 0", got)
+	}
+}
+
+func TestCompressionRatio(t *testing.T) {
+	if got := compressionRatio(600, 200); got != 3 {
+		t.Fatalf("compression ratio = %v, want 3", got)
+	}
+	if got := compressionRatio(10, 0); got != 0 {
+		t.Fatalf("zero-denominator compression ratio = %v, want 0", got)
+	}
+}
+
+func TestRecoveryScanRate(t *testing.T) {
+	t.Parallel()
+	recovery := cdc.Recovery{
+		ScannedBytes: 8 << 20,
+		Elapsed:      2 * time.Second,
+	}
+	if got := recoveryScanRate(recovery); got != 4<<20 {
+		t.Fatalf("recovery scan rate = %f, want %d", got, 4<<20)
+	}
+	if got := recoveryScanRate(cdc.Recovery{ScannedBytes: 1}); got != 0 {
+		t.Fatalf("zero-duration recovery scan rate = %f, want 0", got)
+	}
+}
+
+func TestMetricsListenerBindFailsBeforeRecovery(t *testing.T) {
+	t.Parallel()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	running, err := startMetricsServer(
+		context.Background(), listener.Addr().String(), nil,
+	)
+	if err == nil {
+		if running != nil {
+			running.Close()
+		}
+		t.Fatal("expected occupied metrics address to fail synchronously")
+	}
+}
 
 func TestWALHeadroomAlarm(t *testing.T) {
 	const maxWALSize = 1 << 20
@@ -121,7 +192,9 @@ func TestPrintFindingsKeepsAParagraphedMessageReadable(t *testing.T) {
 }
 
 func TestManualEndPositionRejectsInvalidLSNBeforeStateAccess(t *testing.T) {
-	if err := setManualEndPosition(context.Background(), "invalid", t.TempDir(), 0, nil); err == nil || !strings.Contains(err.Error(), "parse manual end position") {
+	if err := setManualEndPosition(
+		context.Background(), "invalid", t.TempDir(), 0, nil, nil,
+	); err == nil || !strings.Contains(err.Error(), "parse manual end position") {
 		t.Fatalf("error = %v", err)
 	}
 }

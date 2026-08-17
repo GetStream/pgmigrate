@@ -73,7 +73,10 @@ make e2e
 The harness builds/runs preflight, waits for `follow`, confirms traffic, freezes
 writes, verifies, cuts over, checks cleanup, and independently compares table
 inventory, exact row counts, and order-independent canonical row digests. It
-does not use pgmigrate's verifier for the final data assertion.
+does not use pgmigrate's verifier for the final data assertion. The default run
+uses four replay workers and 64-transaction replay batches. CI precedes it with
+focused real-PostgreSQL concurrency and batching throughput tests under the race
+detector.
 
 The seed also carries objects whose `pg_dump` archive descriptions are multi-word
 or word-prefixed by a shorter description: a text-search configuration reached by
@@ -132,6 +135,9 @@ Useful controls:
 - `PGMIGRATE_BIN`: test a different binary;
 - `MIGRATION_TIMEOUT`: seconds to wait for follow (default 300);
 - `SPLIT_THRESHOLD`: bytes per copy part (default 65536);
+- `REPLAY_WORKERS`: concurrent target replay sessions (default 4);
+- `REPLAY_BATCH_SIZE`: dependent transactions per target commit (default 64);
+- `REPLAY_WINDOW`: source transactions searched for parallel work (default 128);
 - `MIGRATION_DIR`: caller-owned state directory;
 - `KEEP_MIGRATION_DIR=1`: retain temporary state and logs;
 - `SOURCE_PORT` / `TARGET_PORT`: override host ports.

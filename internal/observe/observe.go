@@ -29,13 +29,42 @@ type ObjectCounts struct {
 
 // Apply is the rendered replication apply state.
 type Apply struct {
-	StagedLSN  string        `json:"staged_lsn"`
-	AppliedLSN string        `json:"applied_lsn"`
-	Txns       int64         `json:"transactions"`
-	Rows       int64         `json:"rows"`
-	UpdatedAt  time.Time     `json:"updated_at"`
-	LagBytes   uint64        `json:"lag_bytes"`
-	StaleFor   time.Duration `json:"stale_for"`
+	StagedLSN                   string        `json:"staged_lsn"`
+	AppliedLSN                  string        `json:"applied_lsn"`
+	Txns                        int64         `json:"transactions"`
+	Rows                        int64         `json:"rows"`
+	DMLStatements               int64         `json:"dml_statements"`
+	TargetCommits               int64         `json:"target_commits"`
+	RowsPerSecond               float64       `json:"rows_per_second"`
+	RowsPerDMLStatement         float64       `json:"rows_per_dml_statement"`
+	TransactionsPerTargetCommit float64       `json:"source_transactions_per_target_commit"`
+	Tables                      []ApplyTable  `json:"tables,omitempty"`
+	UpdatedAt                   time.Time     `json:"updated_at"`
+	LagBytes                    uint64        `json:"lag_bytes"`
+	StaleFor                    time.Duration `json:"stale_for"`
+}
+
+// ApplyTable is one relation's replay throughput and row-statement compression.
+type ApplyTable struct {
+	Table               string  `json:"table"`
+	Rows                int64   `json:"rows"`
+	DMLStatements       int64   `json:"dml_statements"`
+	RowsPerSecond       float64 `json:"rows_per_second"`
+	RowsPerDMLStatement float64 `json:"rows_per_dml_statement"`
+}
+
+// Recovery is the rendered startup validation of local CDC segments.
+type Recovery struct {
+	TotalBytes         int64         `json:"total_bytes"`
+	TrustedBytes       int64         `json:"trusted_bytes"`
+	ScannedBytes       int64         `json:"scanned_bytes"`
+	TotalSegments      int64         `json:"total_segments"`
+	TrustedSegments    int64         `json:"trusted_segments"`
+	ScannedSegments    int64         `json:"scanned_segments"`
+	Elapsed            time.Duration `json:"elapsed"`
+	ScanBytesPerSecond float64       `json:"scan_bytes_per_second"`
+	FallbackReason     string        `json:"fallback_reason,omitempty"`
+	ManifestRebuilt    bool          `json:"manifest_rebuilt"`
 }
 
 // Verification is one table's check progress and outcome.
@@ -80,6 +109,7 @@ type Snapshot struct {
 	OpenFindings   int64                   `json:"open_findings"`
 	CompletedSteps int64                   `json:"completed_steps"`
 	Apply          Apply                   `json:"apply"`
+	Recovery       Recovery                `json:"recovery"`
 }
 
 // Capture obtains one transactionally consistent state snapshot.
@@ -119,9 +149,50 @@ func Capture(ctx context.Context, provider Provider, now time.Time) (Snapshot, e
 		Apply: Apply{
 			StagedLSN: status.Apply.StagedLSN, AppliedLSN: status.Apply.AppliedLSN,
 			Txns: status.Apply.Txns, Rows: status.Apply.Rows,
-			UpdatedAt: status.Apply.UpdatedAt, LagBytes: lag, StaleFor: stale,
+			DMLStatements: status.Apply.DMLStatements, TargetCommits: status.Apply.TargetCommits,
+			RowsPerSecond:               status.Apply.RowsPerSecond,
+			RowsPerDMLStatement:         ratio(status.Apply.Rows, status.Apply.DMLStatements),
+			TransactionsPerTargetCommit: ratio(status.Apply.Txns, status.Apply.TargetCommits),
+			Tables:                      applyTables(status.ApplyTables),
+			UpdatedAt:                   status.Apply.UpdatedAt, LagBytes: lag, StaleFor: stale,
+		},
+		Recovery: Recovery{
+			TotalBytes:         status.Recovery.TotalBytes,
+			TrustedBytes:       status.Recovery.TrustedBytes,
+			ScannedBytes:       status.Recovery.ScannedBytes,
+			TotalSegments:      status.Recovery.TotalSegments,
+			TrustedSegments:    status.Recovery.TrustedSegments,
+			ScannedSegments:    status.Recovery.ScannedSegments,
+			Elapsed:            status.Recovery.Elapsed,
+			ScanBytesPerSecond: status.Recovery.ScanBytesPerSecond,
+			FallbackReason:     status.Recovery.FallbackReason,
+			ManifestRebuilt:    status.Recovery.ManifestRebuilt,
 		},
 	}, nil
+}
+
+func applyTables(tables []state.ApplyTableProgress) []ApplyTable {
+	if len(tables) == 0 {
+		return nil
+	}
+	out := make([]ApplyTable, 0, len(tables))
+	for _, table := range tables {
+		out = append(out, ApplyTable{
+			Table:               table.Schema + "." + table.Table,
+			Rows:                table.Rows,
+			DMLStatements:       table.DMLStatements,
+			RowsPerSecond:       table.RowsPerSecond,
+			RowsPerDMLStatement: ratio(table.Rows, table.DMLStatements),
+		})
+	}
+	return out
+}
+
+func ratio(numerator, denominator int64) float64 {
+	if denominator <= 0 {
+		return 0
+	}
+	return float64(numerator) / float64(denominator)
 }
 
 func counts(value state.Counts) ObjectCounts {
@@ -197,11 +268,37 @@ func RenderText(w io.Writer, snapshot Snapshot) error {
 			table.SourcePages, table.SourcePagesTotal,
 			table.TargetRows, cdcSuffix(table), divergenceSuffix(table), etaSuffix(table))
 	}
+	fmt.Fprintf(
+		&out,
+		"recovery: %d/%d bytes trusted, %d scanned; %d/%d segments trusted, %d scanned; %s elapsed, %.0f scan bytes/s; manifest rebuilt: %t\n",
+		snapshot.Recovery.TrustedBytes,
+		snapshot.Recovery.TotalBytes,
+		snapshot.Recovery.ScannedBytes,
+		snapshot.Recovery.TrustedSegments,
+		snapshot.Recovery.TotalSegments,
+		snapshot.Recovery.ScannedSegments,
+		snapshot.Recovery.Elapsed.Round(time.Millisecond),
+		snapshot.Recovery.ScanBytesPerSecond,
+		snapshot.Recovery.ManifestRebuilt,
+	)
+	if snapshot.Recovery.FallbackReason != "" {
+		fmt.Fprintf(&out, "recovery fallback: %s\n", snapshot.Recovery.FallbackReason)
+	}
 	fmt.Fprintf(&out, "findings: %d open\n", snapshot.OpenFindings)
 	fmt.Fprintf(&out, "steps: %d complete\n", snapshot.CompletedSteps)
-	fmt.Fprintf(&out, "apply: %s staged, %s applied, %d txns, %d rows\n",
+	fmt.Fprintf(&out, "apply: %s staged, %s applied, %d source txns, %d rows, %d DML statements, %d target commits, %.0f rows/s, %.2f rows/statement, %.2f txns/commit\n",
 		emptyDash(snapshot.Apply.StagedLSN), emptyDash(snapshot.Apply.AppliedLSN),
-		snapshot.Apply.Txns, snapshot.Apply.Rows)
+		snapshot.Apply.Txns, snapshot.Apply.Rows, snapshot.Apply.DMLStatements,
+		snapshot.Apply.TargetCommits, snapshot.Apply.RowsPerSecond,
+		snapshot.Apply.RowsPerDMLStatement, snapshot.Apply.TransactionsPerTargetCommit)
+	for _, table := range snapshot.Apply.Tables {
+		fmt.Fprintf(
+			&out,
+			"apply %s: %d rows, %d DML statements, %.0f rows/s, %.2f rows/statement\n",
+			table.Table, table.Rows, table.DMLStatements,
+			table.RowsPerSecond, table.RowsPerDMLStatement,
+		)
+	}
 	fmt.Fprintf(&out, "lag: %d bytes, %s stale\n", snapshot.Apply.LagBytes, snapshot.Apply.StaleFor.Round(time.Millisecond))
 	if _, err := io.WriteString(w, out.String()); err != nil {
 		return fmt.Errorf("render text status: %w", err)
@@ -255,9 +352,12 @@ type Collector struct {
 	Timeout  time.Duration
 	Now      func() time.Time
 
-	phase, objects, apply, lag, findings, steps *prometheus.Desc
-	verifyPages, verifyRows, verifyCoverage     *prometheus.Desc
-	verifyDivergent, verifyRate, verifyETA      *prometheus.Desc
+	phase, objects, apply, applyRate, applyCompression, applyTable, applyTableRate,
+	applyTableCompression, lag, findings, steps *prometheus.Desc
+	verifyPages, verifyRows, verifyCoverage *prometheus.Desc
+	verifyDivergent, verifyRate, verifyETA  *prometheus.Desc
+	recoveryBytes, recoverySegments         *prometheus.Desc
+	recoveryElapsed, recoveryScanRate       *prometheus.Desc
 }
 
 // verifyLabels are the labels every verification metric carries.
@@ -272,7 +372,22 @@ func NewCollector(provider Provider) *Collector {
 		Now:      func() time.Time { return time.Now().UTC() },
 		phase:    prometheus.NewDesc(namespace+"_phase", "Current migration phase (one labeled value is 1).", []string{"phase"}, nil),
 		objects:  prometheus.NewDesc(namespace+"_objects", "Migration object completion counts.", []string{"object", "state"}, nil),
-		apply:    prometheus.NewDesc(namespace+"_apply_total", "Applied transaction and row counters.", []string{"unit"}, nil),
+		apply: prometheus.NewDesc(namespace+"_apply_total",
+			"Committed source transactions and rows, target INSERT/UPDATE/DELETE statements, and target commits.",
+			[]string{"unit"}, nil),
+		applyRate: prometheus.NewDesc(namespace+"_apply_rows_per_second",
+			"Committed source row changes applied per second over the latest reporting interval.", nil, nil),
+		applyCompression: prometheus.NewDesc(namespace+"_apply_compression_ratio",
+			"Cumulative source work represented by one target operation.", []string{"kind"}, nil),
+		applyTable: prometheus.NewDesc(namespace+"_apply_table_total",
+			"Cumulative committed row and INSERT/UPDATE/DELETE statement counters for one table.",
+			[]string{"table", "unit"}, nil),
+		applyTableRate: prometheus.NewDesc(namespace+"_apply_table_rows_per_second",
+			"Committed source row changes applied per second for one table over the latest reporting interval.",
+			[]string{"table"}, nil),
+		applyTableCompression: prometheus.NewDesc(namespace+"_apply_table_compression_ratio",
+			"Cumulative source row changes represented by one target DML statement for one table.",
+			[]string{"table"}, nil),
 		lag:      prometheus.NewDesc(namespace+"_apply_lag", "Replication apply lag.", []string{"unit"}, nil),
 		findings: prometheus.NewDesc(namespace+"_open_findings", "Current unresolved findings.", nil, nil),
 		steps:    prometheus.NewDesc(namespace+"_completed_steps", "Current completed cutover/orchestration steps.", nil, nil),
@@ -291,14 +406,27 @@ func NewCollector(provider Provider) *Collector {
 			"Measured sampling rate for one table.", verifyLabels, nil),
 		verifyETA: prometheus.NewDesc(namespace+"_verify_eta_seconds",
 			"Estimated seconds remaining for one table, zero when unmeasured or done.", verifyLabels, nil),
+		recoveryBytes: prometheus.NewDesc(namespace+"_recovery_bytes",
+			"CDC segment bytes encountered, trusted from durable metadata, or scanned and checksummed.",
+			[]string{"kind"}, nil),
+		recoverySegments: prometheus.NewDesc(namespace+"_recovery_segments",
+			"CDC segments encountered, trusted from durable metadata, or scanned and checksummed.",
+			[]string{"kind"}, nil),
+		recoveryElapsed: prometheus.NewDesc(namespace+"_recovery_elapsed_seconds",
+			"Elapsed CDC startup recovery time in seconds.", nil, nil),
+		recoveryScanRate: prometheus.NewDesc(namespace+"_recovery_scan_bytes_per_second",
+			"CDC bytes scanned and checksummed per second during startup recovery.", nil, nil),
 	}
 }
 
 func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	for _, desc := range []*prometheus.Desc{
-		c.phase, c.objects, c.apply, c.lag, c.findings, c.steps,
+		c.phase, c.objects, c.apply, c.applyRate, c.applyCompression,
+		c.applyTable, c.applyTableRate, c.applyTableCompression,
+		c.lag, c.findings, c.steps,
 		c.verifyPages, c.verifyRows, c.verifyCoverage, c.verifyDivergent,
 		c.verifyRate, c.verifyETA,
+		c.recoveryBytes, c.recoverySegments, c.recoveryElapsed, c.recoveryScanRate,
 	} {
 		ch <- desc
 	}
@@ -332,10 +460,51 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	}
 	ch <- prometheus.MustNewConstMetric(c.apply, prometheus.CounterValue, float64(snapshot.Apply.Txns), "transactions")
 	ch <- prometheus.MustNewConstMetric(c.apply, prometheus.CounterValue, float64(snapshot.Apply.Rows), "rows")
+	ch <- prometheus.MustNewConstMetric(c.apply, prometheus.CounterValue,
+		float64(snapshot.Apply.DMLStatements), "dml_statements")
+	ch <- prometheus.MustNewConstMetric(c.apply, prometheus.CounterValue,
+		float64(snapshot.Apply.TargetCommits), "target_commits")
+	ch <- prometheus.MustNewConstMetric(c.applyRate, prometheus.GaugeValue, snapshot.Apply.RowsPerSecond)
+	ch <- prometheus.MustNewConstMetric(c.applyCompression, prometheus.GaugeValue,
+		snapshot.Apply.RowsPerDMLStatement, "rows_per_dml_statement")
+	ch <- prometheus.MustNewConstMetric(c.applyCompression, prometheus.GaugeValue,
+		snapshot.Apply.TransactionsPerTargetCommit, "source_transactions_per_target_commit")
+	for _, table := range snapshot.Apply.Tables {
+		ch <- prometheus.MustNewConstMetric(c.applyTable, prometheus.CounterValue,
+			float64(table.Rows), table.Table, "rows")
+		ch <- prometheus.MustNewConstMetric(c.applyTable, prometheus.CounterValue,
+			float64(table.DMLStatements), table.Table, "dml_statements")
+		ch <- prometheus.MustNewConstMetric(c.applyTableRate, prometheus.GaugeValue,
+			table.RowsPerSecond, table.Table)
+		ch <- prometheus.MustNewConstMetric(c.applyTableCompression, prometheus.GaugeValue,
+			table.RowsPerDMLStatement, table.Table)
+	}
 	ch <- prometheus.MustNewConstMetric(c.lag, prometheus.GaugeValue, float64(snapshot.Apply.LagBytes), "bytes")
 	ch <- prometheus.MustNewConstMetric(c.lag, prometheus.GaugeValue, snapshot.Apply.StaleFor.Seconds(), "seconds")
 	ch <- prometheus.MustNewConstMetric(c.findings, prometheus.GaugeValue, float64(snapshot.OpenFindings))
 	ch <- prometheus.MustNewConstMetric(c.steps, prometheus.GaugeValue, float64(snapshot.CompletedSteps))
+	for _, value := range []struct {
+		kind     string
+		bytes    int64
+		segments int64
+	}{
+		{"total", snapshot.Recovery.TotalBytes, snapshot.Recovery.TotalSegments},
+		{"trusted", snapshot.Recovery.TrustedBytes, snapshot.Recovery.TrustedSegments},
+		{"scanned", snapshot.Recovery.ScannedBytes, snapshot.Recovery.ScannedSegments},
+	} {
+		ch <- prometheus.MustNewConstMetric(
+			c.recoveryBytes, prometheus.GaugeValue, float64(value.bytes), value.kind,
+		)
+		ch <- prometheus.MustNewConstMetric(
+			c.recoverySegments, prometheus.GaugeValue, float64(value.segments), value.kind,
+		)
+	}
+	ch <- prometheus.MustNewConstMetric(
+		c.recoveryElapsed, prometheus.GaugeValue, snapshot.Recovery.Elapsed.Seconds(),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.recoveryScanRate, prometheus.GaugeValue, snapshot.Recovery.ScanBytesPerSecond,
+	)
 	for _, table := range snapshot.Verification {
 		labels := []string{table.Table}
 		for _, page := range []struct {

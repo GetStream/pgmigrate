@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 // Snapshot returns a transactionally consistent view of migration progress.
@@ -82,18 +83,75 @@ func (s *Store) Snapshot(ctx context.Context) (Status, error) {
 	var applyUpdated int64
 	if err := tx.QueryRowContext(
 		ctx, `
-		SELECT staged_lsn, applied_lsn, txns, rows_applied, updated_at
+		SELECT staged_lsn, applied_lsn, txns, rows_applied,
+		       dml_statements, target_commits, rows_per_second, updated_at
 		FROM apply_progress WHERE id=1`,
 	).Scan(
 		&status.Apply.StagedLSN,
 		&status.Apply.AppliedLSN,
 		&status.Apply.Txns,
 		&status.Apply.Rows,
+		&status.Apply.DMLStatements,
+		&status.Apply.TargetCommits,
+		&status.Apply.RowsPerSecond,
 		&applyUpdated,
 	); err != nil {
 		return Status{}, fmt.Errorf("read apply progress: %w", err)
 	}
 	status.Apply.UpdatedAt = fromUnixNano(applyUpdated)
+	applyTableRows, err := tx.QueryContext(ctx, `
+		SELECT schema_name, table_name, rows_applied, dml_statements,
+		       rows_per_second, updated_at
+		FROM apply_table_progress
+		ORDER BY schema_name, table_name
+	`)
+	if err != nil {
+		return Status{}, fmt.Errorf("read apply table progress: %w", err)
+	}
+	for applyTableRows.Next() {
+		var table ApplyTableProgress
+		var updated int64
+		if err := applyTableRows.Scan(
+			&table.Schema,
+			&table.Table,
+			&table.Rows,
+			&table.DMLStatements,
+			&table.RowsPerSecond,
+			&updated,
+		); err != nil {
+			applyTableRows.Close()
+			return Status{}, fmt.Errorf("scan apply table progress: %w", err)
+		}
+		table.UpdatedAt = fromUnixNano(updated)
+		status.ApplyTables = append(status.ApplyTables, table)
+	}
+	if err := applyTableRows.Err(); err != nil {
+		applyTableRows.Close()
+		return Status{}, fmt.Errorf("iterate apply table progress: %w", err)
+	}
+	applyTableRows.Close()
+	var recoveryElapsed int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT total_bytes, trusted_bytes, scanned_bytes,
+		       total_segments, trusted_segments, scanned_segments,
+		       elapsed_ns, scan_bytes_per_second, fallback_reason,
+		       manifest_rebuilt
+		FROM recovery_progress WHERE id=1
+	`).Scan(
+		&status.Recovery.TotalBytes,
+		&status.Recovery.TrustedBytes,
+		&status.Recovery.ScannedBytes,
+		&status.Recovery.TotalSegments,
+		&status.Recovery.TrustedSegments,
+		&status.Recovery.ScannedSegments,
+		&recoveryElapsed,
+		&status.Recovery.ScanBytesPerSecond,
+		&status.Recovery.FallbackReason,
+		&status.Recovery.ManifestRebuilt,
+	); err != nil {
+		return Status{}, fmt.Errorf("read recovery progress: %w", err)
+	}
+	status.Recovery.Elapsed = time.Duration(recoveryElapsed)
 
 	if err := tx.Commit(); err != nil {
 		return Status{}, fmt.Errorf("finish status snapshot: %w", err)

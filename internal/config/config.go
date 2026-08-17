@@ -26,6 +26,9 @@ type Config struct {
 	AckWarnings            bool
 	AllowCollationChange   bool
 	Workers                int
+	ReplayWorkers          int
+	ReplayBatchSize        int
+	ReplayWindow           int
 	SplitThreshold         int64
 	RestoreJobs            int
 	PGDumpPath             string
@@ -111,10 +114,14 @@ func (c Config) TuningOverrides() (tuning.Overrides, error) {
 // FromEnvironment returns configuration populated from supported environment
 // variables. Command-line flags may overwrite these values.
 func FromEnvironment() Config {
+	replayWorkers := min(32, max(8, runtime.NumCPU()))
 	return Config{
 		Source:               os.Getenv(SourceEnv),
 		Target:               os.Getenv(TargetEnv),
 		Workers:              max(1, runtime.NumCPU()),
+		ReplayWorkers:        replayWorkers,
+		ReplayBatchSize:      128,
+		ReplayWindow:         replayWorkers * 8,
 		SplitThreshold:       1 << 30,
 		RestoreJobs:          max(1, runtime.NumCPU()/2),
 		WALSampleDuration:    time.Minute,

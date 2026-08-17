@@ -48,11 +48,14 @@ Change data capture uses `pgoutput`, the logical decoding plugin built into
 PostgreSQL, so there is no extension to install on the source. Decoded
 transactions are written to append-only checksummed segment files under the
 migration directory and fsynced at each transaction boundary; a transaction over
-256 MiB spills to temporary files beneath `cdc/spill`. Apply is serial, and
-target DML commits in the same transaction as
-`pgmigrate_internal.replication_progress` on the target, which is the
-authoritative apply position. Finalized segments that have been applied are
-pruned every `--segment-prune-interval`, retaining one safety segment.
+256 MiB spills to temporary files beneath `cdc/spill`. Transactions that touch
+different tables replay concurrently while each table retains source order.
+Contiguous transactions already serialized by the same tables share a bounded
+target commit. Each parallel DML commit atomically records a durable target
+receipt; `pgmigrate_internal.replication_progress` advances only across the
+contiguous receipt prefix and remains the authoritative apply position.
+Finalized segments that have been checkpointed are pruned every
+`--segment-prune-interval`, retaining one safety segment.
 
 `pgmigrate cutover` then emits a logical boundary message, drains exactly through
 it, advances target sequences with headroom, reverts what the migration changed on
@@ -88,7 +91,8 @@ There are six commands:
 
 Every command takes `--dir`. All but `status` also need source and target
 connection strings. `pgmigrate <command> --help` prints the defaults as resolved
-on the host, which for `--workers` and `--restore-jobs` depend on its CPU count.
+on the host, which for `--workers`, `--replay-workers`, `--replay-window`, and
+`--restore-jobs` depend on its CPU count.
 
 ## Example
 
@@ -111,7 +115,7 @@ With those understood, start the migration. It keeps running after the base copy
 finishes, following changes until you cut over:
 
 ```bash
-$ pgmigrate run --dir ./migration --ack-warnings --workers 8 --restore-jobs 4 --metrics :9187
+$ pgmigrate run --dir ./migration --ack-warnings --workers 8 --replay-workers 8 --restore-jobs 4 --metrics :9187
 ```
 
 `run` writes almost nothing to the terminal. Phase, progress, health, and error
@@ -146,9 +150,22 @@ verify e2e.metrics: done 0/0 rows sampled (0.00%), 0/0 source pages, 0 target ro
 verify e2e.order_items: done 3059/3059 rows sampled (100.00%), 24/24 source pages, 3059 target rows, 123/123 applied rows checked
 findings: 4 open
 steps: 33 complete
-apply: 0/1BE9D08 staged, 0/1BE9D08 applied, 0 txns, 0 rows
+apply: 0/1BE9D08 staged, 0/1BE9D08 applied, 120 source txns, 600 rows, 200 DML statements, 30 target commits, 75 rows/s, 3.00 rows/statement, 4.00 txns/commit
+apply e2e.orders: 600 rows, 200 DML statements, 75 rows/s, 3.00 rows/statement
 lag: 0 bytes, 30.489s stale
 ```
+
+Apply counters advance only with the target's contiguous committed replay
+position, so failed or retried transactions are not counted twice. Per-table
+`rows/s` is the change in committed `INSERT`, `UPDATE`, and `DELETE` rows over
+the latest five-second reporting interval. `dml_statements` counts the target
+`INSERT`, `UPDATE`, and `DELETE` statements representing those rows.
+`TRUNCATE` is excluded from both because the logical stream does not report how
+many rows it removed. The two compression figures make batching explicit: rows
+per target row-DML statement measures row batching, while source transactions
+per target commit measures transaction batching. The same values are emitted in `progress` and
+`apply_table_progress` log events and under the `pgmigrate_apply_*`
+Prometheus metrics.
 
 `verify` can be run whenever you want an answer, including while the source is
 still taking writes. It prints a line per table as it works, and a summary that
@@ -278,6 +295,9 @@ directory's writer lock.
 | `--ack-warnings` | false | accept every current preflight warning, including consenting to `REPLICA IDENTITY FULL` where it is needed |
 | `--allow-collation-change` | false | proceed to a target that collates text differently from the source |
 | `--workers <n>` | host CPU count | parallel copy and index-build workers, and the cap on parts per table |
+| `--replay-workers <n>` | host CPU count clamped to 8–32 | target sessions that replay independent tables concurrently. Transactions touching the same table wait for their predecessor; independent durable commits may finish out of order while authoritative progress advances only through their contiguous source-order prefix |
+| `--replay-batch-size <n>` | `128` | maximum contiguous dependent source transactions combined into one durable target transaction. Independent table lanes are never combined, and encoded batch data is capped at 16 MiB |
+| `--replay-window <n>` | 8 times `--replay-workers` | source transactions searched for independent table work; also bounds scheduler memory |
 | `--split-threshold <bytes>` | `1073741824` (1 GiB) | desired bytes per copy part. A table is split into at most `--workers` parts, so a table far larger than the threshold produces larger parts |
 | `--restore-jobs <n>` | half the host CPU count, at least 1 | parallel `pg_restore` jobs for the schema restore |
 | `--pg-dump <path>` | found on `PATH` | `pg_dump` executable |
@@ -454,13 +474,13 @@ about what a partial part left behind.
 ### Apply progress lives on the target, not beside the tool
 
 `pgmigrate_internal.replication_progress` on the target is the authoritative
-apply position, and it commits in the same transaction as the DML it describes.
-The local SQLite database is a low-rate control plane whose apply LSN is
-display-only. A position recorded anywhere but next to the rows can disagree
-with them after a crash, and then replay either loses transactions or repeats
-them. A source-and-filter-derived stream generation binds copied data to that
-progress, and a resume refuses progress that is missing or belongs to another
-stream.
+apply position. Serial replay commits it with DML. Parallel replay commits a
+durable receipt with each independent DML transaction, then atomically advances
+progress and removes only the contiguous receipt prefix. A crash before that
+checkpoint leaves receipts that make already-committed DML unambiguous on
+resume. The local SQLite database is a low-rate control plane whose apply LSN is
+display-only. A source-and-filter-derived stream generation binds copied data,
+receipts, and progress; a resume refuses missing or mismatched durable identity.
 
 Every connection that reads or executes a catalog definition pins `search_path`
 to the empty path, so definitions are fully qualified and mean the same thing on
@@ -684,9 +704,17 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
 
 - A torn `.partial` CDC tail is scanned and truncated to the last valid frame.
   Receiving resumes from the latest fsynced transaction EndLSN.
-- Target DML and authoritative progress commit atomically, so a reconnect or
-  restart skips transactions already recorded on the target. Missing or
-  mismatched stream generation or progress is fatal once copied data exists.
+- Finalized segments are recorded in a checksummed `segments.catalog` beside
+  the CDC files. The first restart after upgrading scans retained segments once
+  to build it; normal restarts stat finalized files, scan only the mutable tail
+  or an unindexed suffix, and seek replay near target progress. Recovery work
+  is visible in status, `cdc_recovery_progress`/`cdc_recovery_complete` log
+  events, and the `pgmigrate_recovery_*` Prometheus metrics.
+- Serial target DML and progress commit atomically. Parallel DML commits with a
+  durable receipt, and checkpoint progress advances while deleting the
+  contiguous receipt prefix in one target transaction. A restart therefore
+  skips every committed transaction without guessing. Missing or mismatched
+  stream generation or progress is fatal once progress has started.
 - Restarts from `indexes`, `catchup`, or `follow` retain the completed base copy
   and recover staged CDC.
 - Restarts from `setup`, `schema`, or `copy` deliberately discard **all**
@@ -783,7 +811,10 @@ schema.
   findings and need an operator plan.
 - The target is assumed not to receive independent application traffic before
   cutover. Replay divergence stops the run.
-- Apply is serial.
+- Replay parallelism comes from transactions that touch independent tables.
+  A workload whose every transaction touches the same table remains serial by
+  design so that updates and deletes observe source order, but bounded batches
+  amortize its target commit cost.
 - The delivered e2e bed is PostgreSQL 17 to 17. Cross-major compatibility has
   focused integration probes but no full cross-major Compose migration.
 - Verification samples, and reports 64-bit server-side hashes rather than a

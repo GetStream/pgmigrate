@@ -20,12 +20,17 @@ type Reader struct {
 	index          int
 	file           *os.File
 	after          LSN
+	afterEnd       LSN
+	seekEnd        LSN
 	durableEndLSN  LSN
 	previousCommit LSN
 	previousEnd    LSN
+	initialOffset  int64
+	catalog        *SegmentCatalog
 	pending        *Transaction
 	payload        []byte
 	header         [frameHeaderSize]byte
+	bytesRead      int64
 	closed         bool
 }
 
@@ -43,7 +48,14 @@ type ReaderConfig struct {
 	Directory      string
 	SpillDirectory string
 	AfterCommitLSN LSN
-	DurableEndLSN  LSN
+	// AfterEndLSN is canonical target progress. When a catalog is provided,
+	// the reader seeks to a sparse frame boundary near this EndLSN.
+	AfterEndLSN LSN
+	// SeekEndLSN starts near, but does not skip, the boundary at or immediately
+	// before this EndLSN. It is used for end-position normalization.
+	SeekEndLSN    LSN
+	DurableEndLSN LSN
+	Catalog       *SegmentCatalog
 }
 
 func NewReaderWithConfig(config ReaderConfig) (*Reader, error) {
@@ -56,17 +68,111 @@ func NewReaderWithConfig(config ReaderConfig) (*Reader, error) {
 	if err := cleanupOrphanSpillsOnce(config.SpillDirectory); err != nil {
 		return nil, err
 	}
-	segments, err := listSegments(config.Directory)
+	var (
+		segments []segmentFile
+		ranges   []SegmentRange
+		err      error
+	)
+	if config.Catalog != nil {
+		var prunedThrough LSN
+		ranges, prunedThrough = config.Catalog.readerSnapshot()
+		if config.SeekEndLSN == 0 && config.AfterEndLSN < prunedThrough {
+			return nil, fmt.Errorf(
+				"cdc: applied EndLSN %x precedes pruned CDC prefix %x",
+				config.AfterEndLSN, prunedThrough,
+			)
+		}
+		segments, err = segmentFilesFromRanges(ranges)
+	} else {
+		segments, err = listSegments(config.Directory)
+	}
 	if err != nil {
 		return nil, err
 	}
-	return &Reader{
+	reader := &Reader{
 		directory:      config.Directory,
 		spillDirectory: config.SpillDirectory,
 		segments:       segments,
 		after:          config.AfterCommitLSN,
+		afterEnd:       config.AfterEndLSN,
+		seekEnd:        config.SeekEndLSN,
 		durableEndLSN:  config.DurableEndLSN,
-	}, nil
+		catalog:        config.Catalog,
+	}
+	reader.positionFromRanges(ranges)
+	return reader, nil
+}
+
+func readerSegmentFiles(
+	directory string,
+	catalog *SegmentCatalog,
+) ([]segmentFile, error) {
+	if catalog == nil {
+		return listSegments(directory)
+	}
+	ranges, _ := catalog.readerSnapshot()
+	return segmentFilesFromRanges(ranges)
+}
+
+func segmentFilesFromRanges(ranges []SegmentRange) ([]segmentFile, error) {
+	segments := make([]segmentFile, len(ranges))
+	for i, segment := range ranges {
+		start, partial, ok := parseSegmentName(filepath.Base(segment.Path))
+		if !ok {
+			return nil, fmt.Errorf(
+				"cdc: invalid segment catalog path %s", filepath.Base(segment.Path),
+			)
+		}
+		segments[i] = segmentFile{
+			path:    segment.Path,
+			start:   start,
+			partial: partial,
+		}
+	}
+	return segments, nil
+}
+
+func (r *Reader) positionFromRanges(ranges []SegmentRange) {
+	if r.catalog == nil || len(ranges) == 0 {
+		return
+	}
+	target := r.afterEnd
+	inclusive := false
+	if target == 0 {
+		target = r.seekEnd
+		inclusive = target != 0
+	}
+	if target == 0 {
+		return
+	}
+	r.index = len(ranges)
+	for i, segment := range ranges {
+		if segment.LastEnd > target || (inclusive && segment.LastEnd == target) {
+			r.index = i
+			break
+		}
+	}
+	if r.index == len(ranges) && inclusive && len(ranges) != 0 {
+		r.index = len(ranges) - 1
+	}
+	if r.index >= len(ranges) {
+		return
+	}
+	points := ranges[r.index].SeekPoints
+	if len(points) == 0 {
+		return
+	}
+	point := points[0]
+	for _, candidate := range points[1:] {
+		if candidate.PreviousEnd > target ||
+			(inclusive && candidate.PreviousEnd == target) {
+			break
+		}
+		point = candidate
+	}
+	r.initialOffset = point.Offset
+	r.previousCommit = point.PreviousCommit
+	r.previousEnd = point.PreviousEnd
 }
 
 // Next returns the next complete transaction whose CommitLSN is greater than
@@ -93,22 +199,39 @@ func (r *Reader) Next() (Transaction, error) {
 			r.file, err = os.Open(r.segments[r.index].path)
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) {
-					missingStart := r.segments[r.index].start
-					updated, refreshErr := listSegments(r.directory)
+					missing := r.segments[r.index]
+					updated, refreshErr := readerSegmentFiles(r.directory, r.catalog)
 					if refreshErr != nil {
 						return Transaction{}, refreshErr
 					}
-					r.segments = updated
-					r.index = len(updated)
+					remapped := false
 					for i := range updated {
-						if updated[i].start >= missingStart {
+						if updated[i].start == missing.start &&
+							updated[i].path != missing.path {
+							r.segments = updated
 							r.index = i
+							remapped = true
 							break
 						}
 					}
-					continue
+					if remapped {
+						continue
+					}
+					return Transaction{}, fmt.Errorf(
+						"cdc: cataloged segment %s is missing from disk",
+						filepath.Base(missing.path),
+					)
 				}
 				return Transaction{}, fmt.Errorf("cdc: open segment %s: %w", filepath.Base(r.segments[r.index].path), err)
+			}
+			if r.initialOffset != 0 {
+				if _, err := r.file.Seek(r.initialOffset, io.SeekStart); err != nil {
+					return Transaction{}, fmt.Errorf(
+						"cdc: seek segment %s: %w",
+						filepath.Base(r.segments[r.index].path), err,
+					)
+				}
+				r.initialOffset = 0
 			}
 		}
 		tx, err := r.readTransaction()
@@ -126,7 +249,7 @@ func (r *Reader) Next() (Transaction, error) {
 		if err != nil {
 			return Transaction{}, err
 		}
-		if tx.CommitLSN <= r.after {
+		if tx.CommitLSN <= r.after || tx.EndLSN <= r.afterEnd {
 			if err := tx.CleanupSpill(); err != nil {
 				return Transaction{}, fmt.Errorf("cdc: cleanup skipped reader spill: %w", err)
 			}
@@ -146,7 +269,8 @@ func (r *Reader) readTransaction() (Transaction, error) {
 	if err != nil {
 		return Transaction{}, fmt.Errorf("cdc: locate frame start in %s: %w", filepath.Base(segment.path), err)
 	}
-	_, err = io.ReadFull(r.file, r.header[:])
+	n, err := io.ReadFull(r.file, r.header[:])
+	r.bytesRead += int64(n)
 	if err == io.EOF {
 		return Transaction{}, r.rewindIncompleteFrame(frameStart, segment.path)
 	}
@@ -185,7 +309,9 @@ func (r *Reader) readTransaction() (Transaction, error) {
 	} else {
 		r.payload = r.payload[:int(length)]
 	}
-	if _, err := io.ReadFull(r.file, r.payload); err != nil {
+	n, err = io.ReadFull(r.file, r.payload)
+	r.bytesRead += int64(n)
+	if err != nil {
 		if segment.partial && (errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF)) {
 			return Transaction{}, r.rewindIncompleteFrame(frameStart, segment.path)
 		}
@@ -202,6 +328,12 @@ func (r *Reader) readTransaction() (Transaction, error) {
 		return Transaction{}, err
 	}
 	return tx, nil
+}
+
+// BytesRead returns segment payload and frame-header bytes consumed by this
+// reader. It is intended for recovery-work assertions and diagnostics.
+func (r *Reader) BytesRead() int64 {
+	return r.bytesRead
 }
 
 func (r *Reader) rewindIncompleteFrame(frameStart int64, path string) error {
@@ -259,6 +391,7 @@ func (r *Reader) readLargeTransaction(length, expected uint32) (transaction Tran
 	if checksum.Sum32() != expected {
 		return Transaction{}, fmt.Errorf("checksum mismatch: got %08x, want %08x", checksum.Sum32(), expected)
 	}
+	r.bytesRead += int64(length)
 	spill.changeCount = prefix.changes
 	spill.changeBytes = uint64(before)
 	spill.version = prefix.version
@@ -283,7 +416,7 @@ func (r *Reader) Refresh(durableEndLSN LSN) error {
 	if err := r.AdvanceDurableEndLSN(durableEndLSN); err != nil {
 		return err
 	}
-	updated, err := listSegments(r.directory)
+	updated, err := readerSegmentFiles(r.directory, r.catalog)
 	if err != nil {
 		return err
 	}
@@ -377,6 +510,25 @@ func ReadTransactionsAfter(directory string, afterCommitLSN, durableEndLSN LSN) 
 // Prune removes finalized segments whose end LSN is below appliedLSN while
 // retaining the newest eligible segment as a safety segment.
 func Prune(directory string, appliedLSN LSN) ([]string, error) {
+	diskCatalog, catalogExists, err := loadDiskSegmentCatalog(directory)
+	if err != nil {
+		return nil, fmt.Errorf("cdc: load segment catalog for pruning: %w", err)
+	}
+	if catalogExists {
+		ranges, err := diskCatalogRanges(directory, diskCatalog)
+		if err != nil {
+			return nil, err
+		}
+		catalog := newSegmentCatalogState(
+			directory,
+			ranges,
+			diskCatalog.Generation,
+			LSN(diskCatalog.PrunedThrough),
+			nil,
+		)
+		removed, _, err := catalog.prune(appliedLSN, max(1, len(ranges)))
+		return removed, err
+	}
 	segments, err := listSegments(directory)
 	if err != nil {
 		return nil, err

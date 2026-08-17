@@ -32,7 +32,10 @@ make_pg_tool() {
 set -e
 args=()
 for arg in "\$@"; do args+=("\${arg//localhost/host.docker.internal}"); done
-exec docker run --rm -v "$migration_dir:$migration_dir" postgres:17-bookworm "$tool" "\${args[@]}"
+exec docker run --rm \
+    --add-host host.docker.internal:host-gateway \
+    -v "$migration_dir:$migration_dir" \
+    postgres:17-bookworm "$tool" "\${args[@]}"
 EOF
     chmod 700 "$path"
 }
@@ -42,8 +45,11 @@ make_pg_tool pg_restore
 # The seed is far smaller than the default 1 GiB threshold, so without this every
 # table would copy as one unsplit part and the split path would never run here.
 split_threshold=${SPLIT_THRESHOLD:-65536}
+replay_workers=${REPLAY_WORKERS:-4}
+replay_batch_size=${REPLAY_BATCH_SIZE:-128}
+replay_window=${REPLAY_WINDOW:-128}
 
-common_args="--source $source_url --target $target_url --dir $migration_dir --pg-dump $tool_dir/pg_dump --pg-restore $tool_dir/pg_restore --wal-sample-duration 250ms --split-threshold $split_threshold --ack-warnings"
+common_args="--source $source_url --target $target_url --dir $migration_dir --pg-dump $tool_dir/pg_dump --pg-restore $tool_dir/pg_restore --wal-sample-duration 250ms --split-threshold $split_threshold --replay-workers $replay_workers --replay-batch-size $replay_batch_size --replay-window $replay_window --ack-warnings"
 
 "$E2E_DIR/scripts/start.sh"
 # shellcheck disable=SC2086

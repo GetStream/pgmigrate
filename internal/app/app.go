@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -300,6 +301,7 @@ func setManualEndPosition(
 	ctx context.Context,
 	value, directory string,
 	durable cdc.LSN,
+	catalog *cdc.SegmentCatalog,
 	store *state.Store,
 ) error {
 	if strings.TrimSpace(value) == "" {
@@ -309,7 +311,9 @@ func setManualEndPosition(
 	if err != nil {
 		return fmt.Errorf("parse manual end position: %w", err)
 	}
-	resolution, err := cdc.NormalizeEndPosition(directory, cdc.LSN(requested), durable)
+	resolution, err := cdc.NormalizeEndPositionWithCatalog(
+		directory, catalog, cdc.LSN(requested), durable,
+	)
 	if err != nil {
 		return err
 	}
@@ -373,6 +377,13 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		return err
 	}
 	defer store.Close()
+	metrics, err := startMetricsServer(ctx, cfg.Metrics, store)
+	if err != nil {
+		return err
+	}
+	if metrics != nil {
+		defer metrics.Close()
+	}
 	defer func() { recordFailedAttempt(ctx, a.output(), cfg.Dir, store, runErr) }()
 	migration, err := store.Migration(ctx)
 	if err != nil {
@@ -384,7 +395,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	if hadState && (migration.Phase == state.PhaseIndexes || migration.Phase == state.PhaseCatchup ||
 		migration.Phase == state.PhaseFollow || migration.Phase == state.PhaseDrained ||
 		migration.Phase == state.PhaseCutover) {
-		return a.resumePostCopy(ctx, cfg, store, migration)
+		return a.resumePostCopy(ctx, cfg, store, migration, metrics)
 	}
 	if migration.Phase == state.PhaseSetup || migration.Phase == state.PhaseSchema || migration.Phase == state.PhaseCopy {
 		if err := guardRepeatedBaseCopyFailure(ctx, cfg, store, migration); err != nil {
@@ -455,14 +466,30 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	}
 
 	cdcDir := filepath.Join(cfg.Dir, "cdc")
-	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{Directory: cdcDir})
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	group, groupCtx := errgroup.WithContext(runCtx)
+	if metrics != nil {
+		group.Go(func() error { return metrics.Supervise(groupCtx) })
+	}
+	recoveryObserver := newCDCRecoveryObserver(ctx, store, cfg.Dir)
+	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{
+		Directory:        cdcDir,
+		RecoveryProgress: recoveryObserver.Observe,
+	})
 	if err != nil {
 		return err
 	}
 	defer writer.Close()
+	if err := recoveryObserver.Err(); err != nil {
+		return err
+	}
+	logCDCRecoveryComplete(cfg.Dir, recovery)
 	durable := &cdc.DurableWatermark{}
 	durable.Publish(recovery.DurableLSN)
-	if err := setManualEndPosition(ctx, cfg.EndPosition, cdcDir, durable.Load(), store); err != nil {
+	if err := setManualEndPosition(
+		ctx, cfg.EndPosition, cdcDir, durable.Load(), writer.SegmentCatalog(), store,
+	); err != nil {
 		return err
 	}
 	transactions := make(chan cdc.Transaction, max(2, cfg.Workers*2))
@@ -483,11 +510,12 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		return err
 	}
 
-	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error { return runReceiverContinuous(groupCtx, receiver, store) })
 	group.Go(func() error { return persister.Run(groupCtx) })
 	group.Go(func() error {
-		return monitorProgress(groupCtx, store, cfg.Target, holder.Snapshot.Slot, durable, cfg.Dir)
+		return monitorProgress(
+			groupCtx, store, cfg.Target, holder.Snapshot.Slot, generation, durable, cfg.Dir,
+		)
 	})
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, holder.Snapshot.Slot) })
 	group.Go(func() error {
@@ -609,9 +637,6 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 			groupCtx, cfg, store, holder.Snapshot, durable, writer.SegmentCatalog(), state.PhaseCatchup,
 		)
 	})
-	if cfg.Metrics != "" {
-		group.Go(func() error { return serveMetrics(groupCtx, cfg.Metrics, store) })
-	}
 	group.Go(func() error {
 		ticker := time.NewTicker(200 * time.Millisecond)
 		defer ticker.Stop()
@@ -637,7 +662,13 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	return err
 }
 
-func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state.Store, migration state.Migration) error {
+func (a App) resumePostCopy(
+	ctx context.Context,
+	cfg config.Config,
+	store *state.Store,
+	migration state.Migration,
+	metrics *runningMetricsServer,
+) error {
 	if err := validateTargetIdentity(ctx, cfg, store); err != nil {
 		return err
 	}
@@ -657,14 +688,30 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 		return errors.New("snapshot metadata does not match durable migration state")
 	}
 	cdcDir := filepath.Join(cfg.Dir, "cdc")
-	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{Directory: cdcDir})
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	group, groupCtx := errgroup.WithContext(runCtx)
+	if metrics != nil {
+		group.Go(func() error { return metrics.Supervise(groupCtx) })
+	}
+	recoveryObserver := newCDCRecoveryObserver(ctx, store, cfg.Dir)
+	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{
+		Directory:        cdcDir,
+		RecoveryProgress: recoveryObserver.Observe,
+	})
 	if err != nil {
 		return err
 	}
 	defer writer.Close()
+	if err := recoveryObserver.Err(); err != nil {
+		return err
+	}
+	logCDCRecoveryComplete(cfg.Dir, recovery)
 	durable := &cdc.DurableWatermark{}
 	durable.Publish(recovery.DurableLSN)
-	if err := setManualEndPosition(ctx, cfg.EndPosition, cdcDir, durable.Load(), store); err != nil {
+	if err := setManualEndPosition(
+		ctx, cfg.EndPosition, cdcDir, durable.Load(), writer.SegmentCatalog(), store,
+	); err != nil {
 		return err
 	}
 	transactions := make(chan cdc.Transaction, max(2, cfg.Workers*2))
@@ -686,10 +733,13 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 	if err != nil {
 		return err
 	}
-	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error { return runReceiverContinuous(groupCtx, receiver, store) })
 	group.Go(func() error { return persister.Run(groupCtx) })
-	group.Go(func() error { return monitorProgress(groupCtx, store, cfg.Target, snapshot.Slot, durable, cfg.Dir) })
+	group.Go(func() error {
+		return monitorProgress(
+			groupCtx, store, cfg.Target, snapshot.Slot, generation, durable, cfg.Dir,
+		)
+	})
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, snapshot.Slot) })
 	group.Go(func() error {
 		phase := migration.Phase
@@ -732,9 +782,6 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 			}
 		}
 	})
-	if cfg.Metrics != "" {
-		group.Go(func() error { return serveMetrics(groupCtx, cfg.Metrics, store) })
-	}
 	logEvent(cfg.Dir, "resume", map[string]any{"phase": migration.Phase})
 	err = group.Wait()
 	if errors.Is(err, errComplete) {
@@ -1361,6 +1408,8 @@ func runApplierToFollow(
 	}
 	applier, err := cdc.NewApplier(cdc.ApplierConfig{
 		ConnString: cfg.Target, Directory: filepath.Join(cfg.Dir, "cdc"),
+		Workers: cfg.ReplayWorkers, BatchSize: cfg.ReplayBatchSize, Window: cfg.ReplayWindow,
+		Catalog:  segments,
 		StreamID: snapshot.Slot, StreamGeneration: streamGeneration(
 			migration.SourceFingerprint, migration.FilterFingerprint,
 		), TargetHasCopiedData: true, Durable: durable, EndPosition: endPosition(store),
@@ -1727,31 +1776,99 @@ func pauseForCrashTest(ctx context.Context, phase state.Phase) error {
 	}
 }
 
-func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamID string, durable *cdc.DurableWatermark, dir string) error {
+type applyMonitorSample struct {
+	at       time.Time
+	progress cdc.ApplyProgressStats
+	tables   map[string]cdc.ApplyTableStats
+}
+
+func monitorProgress(
+	ctx context.Context,
+	store *state.Store,
+	targetDSN string,
+	streamID string,
+	generation string,
+	durable *cdc.DurableWatermark,
+	dir string,
+) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	nextLog := time.Now()
+	var previous *applyMonitorSample
+	var progress cdc.ApplyProgressStats
+	var rowsPerSecond float64
 	for {
+		now := time.Now()
+		logDue := !now.Before(nextLog)
 		conn, err := postgres.Connect(ctx, targetDSN)
 		if err != nil {
 			return err
 		}
-		applied, _, readErr := postgres.ReadProgress(ctx, conn, streamID)
+		var tables []cdc.ApplyTableStats
+		var applied cdc.LSN
+		var readErr error
+		if logDue {
+			applied, _, progress, tables, readErr = cdc.ReadApplySnapshot(
+				ctx, conn, streamID, generation,
+			)
+		} else {
+			applied, _, progress, readErr = cdc.ReadApplyProgress(
+				ctx, conn, streamID, generation,
+			)
+		}
 		conn.Close(context.Background())
 		if readErr != nil {
 			return readErr
 		}
-		if err := store.UpdateApplyProgress(ctx, state.ApplyProgress{
-			StagedLSN: pglogrepl.LSN(durable.Load()).String(), AppliedLSN: applied.String(),
-		}); err != nil {
-			return err
-		}
-		if !time.Now().Before(nextLog) {
+		var tableProgress []state.ApplyTableProgress
+		if logDue {
+			current := newApplyMonitorSample(now, progress, tables)
+			rowsPerSecond = counterRate(progress.Rows, previousApplyRows(previous), now, previous)
+			tableProgress = make([]state.ApplyTableProgress, 0, len(tables))
+			for _, table := range tables {
+				rate := tableCounterRate(table, now, previous)
+				tableProgress = append(tableProgress, state.ApplyTableProgress{
+					Schema:        table.Schema,
+					Table:         table.Table,
+					Rows:          table.Rows,
+					DMLStatements: table.DMLStatements,
+					RowsPerSecond: rate,
+				})
+				if previous == nil || table.Rows > previousApplyTableRows(previous, table) {
+					logEvent(dir, "apply_table_progress", map[string]any{
+						"schema":                 table.Schema,
+						"table":                  table.Table,
+						"rows_applied":           table.Rows,
+						"dml_statements":         table.DMLStatements,
+						"rows_per_second":        rate,
+						"rows_per_dml_statement": compressionRatio(table.Rows, table.DMLStatements),
+					})
+				}
+			}
+			previous = current
+			nextLog = now.Add(5 * time.Second)
 			logEvent(dir, "progress", map[string]any{
-				"staged_lsn":  pglogrepl.LSN(durable.Load()).String(),
-				"applied_lsn": applied.String(),
+				"staged_lsn":                            pglogrepl.LSN(durable.Load()).String(),
+				"applied_lsn":                           pglogrepl.LSN(applied).String(),
+				"source_transactions":                   progress.Transactions,
+				"rows_applied":                          progress.Rows,
+				"dml_statements":                        progress.DMLStatements,
+				"target_commits":                        progress.TargetCommits,
+				"rows_per_second":                       rowsPerSecond,
+				"rows_per_dml_statement":                compressionRatio(progress.Rows, progress.DMLStatements),
+				"source_transactions_per_target_commit": compressionRatio(progress.Transactions, progress.TargetCommits),
 			})
-			nextLog = time.Now().Add(5 * time.Second)
+		}
+		if err := store.UpdateApplyProgressAndTables(ctx, state.ApplyProgress{
+			StagedLSN:     pglogrepl.LSN(durable.Load()).String(),
+			AppliedLSN:    pglogrepl.LSN(applied).String(),
+			Txns:          progress.Transactions,
+			Rows:          progress.Rows,
+			DMLStatements: progress.DMLStatements,
+			TargetCommits: progress.TargetCommits,
+			RowsPerSecond: rowsPerSecond,
+		}, tableProgress); err != nil {
+			return err
 		}
 		select {
 		case <-ctx.Done():
@@ -1761,15 +1878,205 @@ func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamI
 	}
 }
 
-func serveMetrics(ctx context.Context, address string, store *state.Store) error {
+func newApplyMonitorSample(
+	now time.Time,
+	progress cdc.ApplyProgressStats,
+	tables []cdc.ApplyTableStats,
+) *applyMonitorSample {
+	sample := &applyMonitorSample{
+		at:       now,
+		progress: progress,
+		tables:   make(map[string]cdc.ApplyTableStats, len(tables)),
+	}
+	for _, table := range tables {
+		sample.tables[applyTableKey(table.Schema, table.Table)] = table
+	}
+	return sample
+}
+
+func previousApplyRows(previous *applyMonitorSample) int64 {
+	if previous == nil {
+		return 0
+	}
+	return previous.progress.Rows
+}
+
+func previousApplyTableRows(previous *applyMonitorSample, table cdc.ApplyTableStats) int64 {
+	if previous == nil {
+		return 0
+	}
+	return previous.tables[applyTableKey(table.Schema, table.Table)].Rows
+}
+
+func tableCounterRate(
+	table cdc.ApplyTableStats,
+	now time.Time,
+	previous *applyMonitorSample,
+) float64 {
+	return counterRate(table.Rows, previousApplyTableRows(previous, table), now, previous)
+}
+
+func counterRate(
+	current int64,
+	previousValue int64,
+	now time.Time,
+	previous *applyMonitorSample,
+) float64 {
+	if previous == nil || current < previousValue {
+		return 0
+	}
+	elapsed := now.Sub(previous.at).Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(current-previousValue) / elapsed
+}
+
+func compressionRatio(numerator, denominator int64) float64 {
+	if denominator <= 0 {
+		return 0
+	}
+	return float64(numerator) / float64(denominator)
+}
+
+type cdcRecoveryObserver struct {
+	ctx   context.Context
+	store *state.Store
+	dir   string
+	err   error
+}
+
+func newCDCRecoveryObserver(
+	ctx context.Context,
+	store *state.Store,
+	dir string,
+) *cdcRecoveryObserver {
+	return &cdcRecoveryObserver{ctx: ctx, store: store, dir: dir}
+}
+
+func (o *cdcRecoveryObserver) Observe(recovery cdc.Recovery) {
+	if o.err != nil {
+		return
+	}
+	progress := state.RecoveryProgress{
+		TotalBytes:         recovery.TotalBytes,
+		TrustedBytes:       recovery.TrustedBytes,
+		ScannedBytes:       recovery.ScannedBytes,
+		TotalSegments:      recovery.TotalSegments,
+		TrustedSegments:    recovery.TrustedSegments,
+		ScannedSegments:    recovery.ScannedSegments,
+		Elapsed:            recovery.Elapsed,
+		ScanBytesPerSecond: recoveryScanRate(recovery),
+		FallbackReason:     recovery.FallbackReason,
+		ManifestRebuilt:    recovery.ManifestRebuilt,
+	}
+	if err := o.store.UpdateRecoveryProgress(o.ctx, progress); err != nil {
+		o.err = err
+		return
+	}
+	logEvent(o.dir, "cdc_recovery_progress", recoveryEventValues(recovery))
+}
+
+func (o *cdcRecoveryObserver) Err() error {
+	return o.err
+}
+
+func logCDCRecoveryComplete(directory string, recovery cdc.Recovery) {
+	logEvent(directory, "cdc_recovery_complete", recoveryEventValues(recovery))
+}
+
+func recoveryEventValues(recovery cdc.Recovery) map[string]any {
+	return map[string]any{
+		"total_bytes":           recovery.TotalBytes,
+		"trusted_bytes":         recovery.TrustedBytes,
+		"scanned_bytes":         recovery.ScannedBytes,
+		"total_segments":        recovery.TotalSegments,
+		"trusted_segments":      recovery.TrustedSegments,
+		"scanned_segments":      recovery.ScannedSegments,
+		"elapsed_seconds":       recovery.Elapsed.Seconds(),
+		"scan_bytes_per_second": recoveryScanRate(recovery),
+		"fallback_reason":       recovery.FallbackReason,
+		"manifest_rebuilt":      recovery.ManifestRebuilt,
+		"truncated_bytes":       recovery.TruncatedBytes,
+	}
+}
+
+func recoveryScanRate(recovery cdc.Recovery) float64 {
+	elapsed := recovery.Elapsed.Seconds()
+	if elapsed <= 0 {
+		return 0
+	}
+	return float64(recovery.ScannedBytes) / elapsed
+}
+
+func applyTableKey(schema, table string) string {
+	return schema + "\x00" + table
+}
+
+type runningMetricsServer struct {
+	cancel context.CancelFunc
+	result chan error
+}
+
+func startMetricsServer(
+	ctx context.Context,
+	address string,
+	store *state.Store,
+) (*runningMetricsServer, error) {
+	if address == "" {
+		return nil, nil
+	}
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		return nil, fmt.Errorf("listen for metrics on %s: %w", address, err)
+	}
+	serverCtx, cancel := context.WithCancel(ctx)
+	running := &runningMetricsServer{
+		cancel: cancel,
+		result: make(chan error, 1),
+	}
+	go func() {
+		running.result <- serveMetrics(serverCtx, listener, store)
+	}()
+	return running, nil
+}
+
+func (s *runningMetricsServer) Close() {
+	if s != nil {
+		s.cancel()
+	}
+}
+
+func (s *runningMetricsServer) Supervise(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	select {
+	case err := <-s.result:
+		return err
+	case <-ctx.Done():
+		s.cancel()
+		err := <-s.result
+		if errors.Is(err, context.Canceled) {
+			return ctx.Err()
+		}
+		return err
+	}
+}
+
+func serveMetrics(
+	ctx context.Context,
+	listener net.Listener,
+	store *state.Store,
+) error {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(observe.NewRegistry(store), promhttp.HandlerOpts{}))
-	server := &http.Server{Addr: address, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
 		_ = server.Shutdown(context.Background())
 	}()
-	err := server.ListenAndServe()
+	err := server.Serve(listener)
 	if errors.Is(err, http.ErrServerClosed) {
 		return ctx.Err()
 	}
@@ -2278,11 +2585,14 @@ func (a App) Cutover(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	recovery, err := cdc.Recover(filepath.Join(cfg.Dir, "cdc"))
+	recovery, catalog, err := cdc.RecoverWithCatalog(filepath.Join(cfg.Dir, "cdc"))
 	if err != nil {
 		return err
 	}
-	if err := setManualEndPosition(ctx, cfg.EndPosition, filepath.Join(cfg.Dir, "cdc"), recovery.DurableLSN, store); err != nil {
+	if err := setManualEndPosition(
+		ctx, cfg.EndPosition, filepath.Join(cfg.Dir, "cdc"),
+		recovery.DurableLSN, catalog, store,
+	); err != nil {
 		return err
 	}
 	if err := store.SetTargetCleanupRequested(ctx, !cfg.NoCleanup); err != nil {

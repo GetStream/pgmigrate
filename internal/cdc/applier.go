@@ -32,13 +32,24 @@ type ApplierConfig struct {
 	ConnString           string
 	Directory            string
 	ReaderSpillDirectory string
-	StreamID             string
-	StreamGeneration     string
-	FreshSetup           bool
-	TargetHasCopiedData  bool
-	Durable              *DurableWatermark
-	PollInterval         time.Duration
-	ReconnectDelay       time.Duration
+	Catalog              *SegmentCatalog
+	// Workers is the number of target sessions used for replay. Transactions
+	// that touch independent relations commit concurrently; per-relation order
+	// and the authoritative progress prefix remain in source order. Values below
+	// one preserve serial replay.
+	Workers int
+	// BatchSize bounds contiguous dependent source transactions combined into
+	// one target transaction. Window bounds source transactions held by the
+	// scheduler while it searches for independent table work.
+	BatchSize           int
+	Window              int
+	StreamID            string
+	StreamGeneration    string
+	FreshSetup          bool
+	TargetHasCopiedData bool
+	Durable             *DurableWatermark
+	PollInterval        time.Duration
+	ReconnectDelay      time.Duration
 	// EndPosition returns the optional inclusive cutover boundary. Transactions
 	// beyond it are never applied.
 	EndPosition func(context.Context) (LSN, bool, error)
@@ -79,6 +90,17 @@ func NewApplier(config ApplierConfig) (*Applier, error) {
 	}
 	if config.ReconnectDelay <= 0 {
 		config.ReconnectDelay = time.Second
+	}
+	if config.Workers < 1 {
+		config.Workers = 1
+	}
+	if config.BatchSize < 1 {
+		config.BatchSize = 1
+	}
+	if config.Window < 1 {
+		config.Window = config.Workers * 4
+	} else if config.Window < config.Workers {
+		config.Window = config.Workers
 	}
 	return &Applier{config: config}, nil
 }
@@ -177,12 +199,28 @@ func (a *Applier) runConnection(ctx context.Context) error {
 	reader, err := NewReaderWithConfig(ReaderConfig{
 		Directory:      a.config.Directory,
 		SpillDirectory: a.config.ReaderSpillDirectory,
+		AfterEndLSN:    LSN(progress),
 		DurableEndLSN:  a.config.Durable.Load(),
+		Catalog:        a.config.Catalog,
 	})
 	if err != nil {
 		return err
 	}
 	defer reader.Close()
+	receipts, err := loadStreamReplayReceipts(
+		ctx, conn, a.config.StreamID, a.config.StreamGeneration, LSN(progress),
+	)
+	if err != nil {
+		return fmt.Errorf("cdc: inspect pending replay receipts: %w", err)
+	}
+	if a.config.Workers > 1 || len(receipts) != 0 {
+		pool, err := newApplyWorkerPool(ctx, a, conn)
+		if err != nil {
+			return err
+		}
+		defer pool.stop()
+		return a.runConcurrentConnection(ctx, pool, reader, LSN(progress))
+	}
 	relationCache := newTargetRelationCache()
 	statementCache := newApplyStatementCache(applyStatementCacheCapacity)
 	for {
@@ -230,6 +268,12 @@ func configureApplySession(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, "SET session_replication_role = replica"); err != nil {
 		return classifyApplyError(nil, 0, fmt.Errorf("cdc: disable target replication triggers: %w", err))
 	}
+	// No normal replay path waits while a target transaction is idle. This fuse
+	// turns a future scheduler stall into a rollback and crash-safe reconnect
+	// instead of leaving every worker pinned indefinitely.
+	if _, err := conn.Exec(ctx, "SET idle_in_transaction_session_timeout = '2min'"); err != nil {
+		return classifyApplyError(nil, 0, fmt.Errorf("cdc: set idle target transaction timeout: %w", err))
+	}
 	return nil
 }
 
@@ -237,7 +281,9 @@ func (a *Applier) applyAvailable(ctx context.Context, conn *pgx.Conn, progress L
 	reader, err := NewReaderWithConfig(ReaderConfig{
 		Directory:      a.config.Directory,
 		SpillDirectory: a.config.ReaderSpillDirectory,
+		AfterEndLSN:    progress,
 		DurableEndLSN:  a.config.Durable.Load(),
+		Catalog:        a.config.Catalog,
 	})
 	if err != nil {
 		return false, progress, err
@@ -322,7 +368,9 @@ func (a *Applier) resolveEndPosition(requested, durable LSN) (LSN, error) {
 	if a.endPositionResolved && a.endPositionRequested == requested {
 		return a.endPositionBoundary, nil
 	}
-	resolution, err := NormalizeEndPosition(a.config.Directory, requested, durable)
+	resolution, err := NormalizeEndPositionWithCatalog(
+		a.config.Directory, a.config.Catalog, requested, durable,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -406,75 +454,62 @@ func (a *Applier) applyTransaction(
 	statementCache *applyStatementCache,
 	transaction *Transaction,
 ) error {
-	relations := make(map[uint32]*targetRelation, len(transaction.Relations))
-	for i := range transaction.Relations {
-		relation, err := relationCache.resolve(ctx, conn, &transaction.Relations[i], loadTargetRelation)
-		if err != nil {
-			return err
+	prepared, err := a.prepareTransaction(ctx, conn, relationCache, statementCache, transaction)
+	if err != nil {
+		return err
+	}
+	return a.commitPreparedTransaction(prepared, transaction.EndLSN)
+}
+
+type preparedTransaction struct {
+	replay     *applyPipeline
+	collectors []*sampleCollector
+}
+
+func (a *Applier) prepareTransaction(
+	ctx context.Context,
+	conn *pgx.Conn,
+	relationCache *targetRelationCache,
+	statementCache *applyStatementCache,
+	transaction *Transaction,
+) (*preparedTransaction, error) {
+	return a.prepareTransactions(
+		ctx, conn, relationCache, statementCache, []Transaction{*transaction},
+	)
+}
+
+func (a *Applier) prepareTransactions(
+	ctx context.Context,
+	conn *pgx.Conn,
+	relationCache *targetRelationCache,
+	statementCache *applyStatementCache,
+	transactions []Transaction,
+) (*preparedTransaction, error) {
+	relationSets := make([]map[uint32]*targetRelation, len(transactions))
+	for transactionIndex := range transactions {
+		transaction := &transactions[transactionIndex]
+		relations := make(map[uint32]*targetRelation, len(transaction.Relations))
+		for i := range transaction.Relations {
+			relation, err := relationCache.resolve(ctx, conn, &transaction.Relations[i], loadTargetRelation)
+			if err != nil {
+				return nil, err
+			}
+			relations[relation.source.OID] = relation
 		}
-		relations[relation.source.OID] = relation
+		relationSets[transactionIndex] = relations
 	}
 
-	collector := newSampleCollector(a.config.Sampler, transaction)
 	replay := newApplyPipeline(ctx, conn.PgConn(), statementCache)
+	replay.stats = newApplyStats(len(transactions))
 	replay.begin()
 	var replayErr error
-	if transaction.Spill != nil {
-		replayErr = a.applySpilledChanges(replay, relations, transaction.Spill, collector)
-	} else {
-		for i := 0; i < len(transaction.Changes); {
-			change := &transaction.Changes[i]
-			relation := relations[change.RelationOID]
-			if relation == nil {
-				replayErr = divergenceFor(nil, change.Kind, "required relation metadata is missing")
-				break
-			}
-			switch change.Kind {
-			case ChangeInsert:
-				end := i + 1
-				for end < len(transaction.Changes) &&
-					transaction.Changes[end].Kind == ChangeInsert &&
-					transaction.Changes[end].RelationOID == change.RelationOID {
-					end++
-				}
-				if err := applyInserts(replay, relation, transaction.Changes[i:end]); err != nil {
-					replayErr = err
-					break
-				}
-				collector.addAll(transaction.Changes[i:end])
-				i = end
-			case ChangeUpdate:
-				if err := applyUpdate(replay, relation, change); err != nil {
-					replayErr = err
-					break
-				}
-				collector.add(change)
-				i++
-			case ChangeDelete:
-				if err := applyDelete(replay, relation, change); err != nil {
-					replayErr = err
-					break
-				}
-				collector.add(change)
-				i++
-			case ChangeTruncate:
-				end := i + 1
-				for end < len(transaction.Changes) &&
-					transaction.Changes[end].Kind == ChangeTruncate &&
-					sameTruncateOptions(transaction.Changes[end], *change) {
-					end++
-				}
-				if err := applyTruncates(replay, relations, transaction.Changes[i:end]); err != nil {
-					replayErr = err
-					break
-				}
-				i = end
-			default:
-				replayErr = divergenceFor(relation, change.Kind, "unknown change kind")
-			}
-			if replayErr != nil {
-				break
-			}
+	collectors := make([]*sampleCollector, 0, len(transactions))
+	for i := range transactions {
+		transaction := &transactions[i]
+		collector := newSampleCollector(a.config.Sampler, transaction)
+		collectors = append(collectors, collector)
+		if replayErr = a.queueTransaction(replay, relationSets[i], transaction, collector); replayErr != nil {
+			break
 		}
 	}
 	if replayErr == nil {
@@ -486,25 +521,113 @@ func (a *Applier) applyTransaction(
 			replay.conn.TxStatus(), 'T',
 		)
 	}
-	if replayErr == nil {
-		replay.queueProgress(a.config.StreamID, a.config.StreamGeneration, transaction.EndLSN)
-		replay.commit()
-		replayErr = replay.sync()
+	if replayErr != nil {
+		return nil, errors.Join(replayErr, replay.abort())
 	}
-	if replayErr == nil && replay.conn.TxStatus() != 'I' {
+	return &preparedTransaction{replay: replay, collectors: collectors}, nil
+}
+
+func (a *Applier) queueTransaction(
+	replay *applyPipeline,
+	relations map[uint32]*targetRelation,
+	transaction *Transaction,
+	collector *sampleCollector,
+) error {
+	if transaction.Spill != nil {
+		return a.applySpilledChanges(replay, relations, transaction.Spill, collector)
+	}
+	for i := 0; i < len(transaction.Changes); {
+		change := &transaction.Changes[i]
+		relation := relations[change.RelationOID]
+		if relation == nil {
+			return divergenceFor(nil, change.Kind, "required relation metadata is missing")
+		}
+		switch change.Kind {
+		case ChangeInsert:
+			end := i + 1
+			for end < len(transaction.Changes) &&
+				transaction.Changes[end].Kind == ChangeInsert &&
+				transaction.Changes[end].RelationOID == change.RelationOID {
+				end++
+			}
+			if err := applyInserts(replay, relation, transaction.Changes[i:end]); err != nil {
+				return err
+			}
+			collector.addAll(transaction.Changes[i:end])
+			i = end
+		case ChangeUpdate:
+			if err := applyUpdate(replay, relation, change); err != nil {
+				return err
+			}
+			replay.stats.addRows(relation, 1)
+			collector.add(change)
+			i++
+		case ChangeDelete:
+			if err := applyDelete(replay, relation, change); err != nil {
+				return err
+			}
+			replay.stats.addRows(relation, 1)
+			collector.add(change)
+			i++
+		case ChangeTruncate:
+			end := i + 1
+			for end < len(transaction.Changes) &&
+				transaction.Changes[end].Kind == ChangeTruncate &&
+				sameTruncateOptions(transaction.Changes[end], *change) {
+				end++
+			}
+			if err := applyTruncates(replay, relations, transaction.Changes[i:end]); err != nil {
+				return err
+			}
+			i = end
+		default:
+			return divergenceFor(relation, change.Kind, "unknown change kind")
+		}
+	}
+	return nil
+}
+
+func (a *Applier) commitPreparedTransaction(prepared *preparedTransaction, endLSN LSN) error {
+	prepared.replay.queueProgress(a.config.StreamID, a.config.StreamGeneration, endLSN)
+	return commitPrepared(prepared)
+}
+
+func (a *Applier) commitPreparedReplay(
+	prepared *preparedTransaction,
+	transactions []Transaction,
+) error {
+	prepared.replay.queueReplayReceipts(
+		a.config.StreamID, a.config.StreamGeneration, transactions,
+	)
+	return commitPrepared(prepared)
+}
+
+func commitPrepared(prepared *preparedTransaction) error {
+	prepared.replay.commit()
+	replayErr := prepared.replay.sync()
+	if replayErr == nil && prepared.replay.conn.TxStatus() != 'I' {
 		replayErr = fmt.Errorf(
 			"cdc: target transaction status after commit is %q, want %q",
-			replay.conn.TxStatus(), 'I',
+			prepared.replay.conn.TxStatus(), 'I',
 		)
 	}
 	if replayErr != nil {
-		return errors.Join(replayErr, replay.abort())
+		return errors.Join(replayErr, prepared.abort())
 	}
-	if err := replay.close(); err != nil {
+	if err := prepared.replay.close(); err != nil {
 		return err
 	}
-	collector.flush()
+	for _, collector := range prepared.collectors {
+		collector.flush()
+	}
 	return nil
+}
+
+func (p *preparedTransaction) abort() error {
+	if p == nil || p.replay == nil {
+		return nil
+	}
+	return p.replay.abort()
 }
 
 func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *Relation) (*targetRelation, error) {
@@ -646,6 +769,7 @@ func (a *Applier) applySpilledChanges(
 			if err := applyUpdate(replay, relation, &change); err != nil {
 				return err
 			}
+			replay.stats.addRows(relation, 1)
 			collector.add(&change)
 			return nil
 		case ChangeDelete:
@@ -655,6 +779,7 @@ func (a *Applier) applySpilledChanges(
 			if err := applyDelete(replay, relation, &change); err != nil {
 				return err
 			}
+			replay.stats.addRows(relation, 1)
 			collector.add(&change)
 			return nil
 		default:
@@ -705,6 +830,7 @@ type applyPipeline struct {
 	conn         *pgconn.PgConn
 	pipeline     *pgconn.Pipeline
 	statements   *applyStatementCache
+	stats        *applyStats
 	expectations []applyExpectation
 	commands     int
 	closed       bool
@@ -737,9 +863,24 @@ func (p *applyPipeline) commit() {
 func (p *applyPipeline) queueProgress(streamID, generation string, remoteLSN LSN) {
 	p.queueUnprepared(
 		streamProgressSQL,
-		streamProgressParams(streamID, generation, remoteLSN),
+		streamProgressParams(streamID, generation, remoteLSN, p.stats),
 		applyExpectation{
 			description: "update transactional apply progress", expectedRows: 1,
+			progressGuard: true,
+		},
+	)
+}
+
+func (p *applyPipeline) queueReplayReceipts(
+	streamID string,
+	generation string,
+	transactions []Transaction,
+) {
+	p.queueUnprepared(
+		streamReplayReceiptSQL,
+		streamReplayReceiptParams(streamID, generation, transactions, p.stats),
+		applyExpectation{
+			description: "record durable replay receipts", expectedRows: 1,
 			progressGuard: true,
 		},
 	)
@@ -750,6 +891,13 @@ func (p *applyPipeline) queue(
 	params []rawParam,
 	expectation applyExpectation,
 ) error {
+	if expectation.resultKind == applyCommandResult &&
+		expectation.relation != nil &&
+		(expectation.kind == ChangeInsert ||
+			expectation.kind == ChangeUpdate ||
+			expectation.kind == ChangeDelete) {
+		p.stats.addDMLStatement(expectation.relation)
+	}
 	values, oids, formats := rawParamArrays(params)
 	statement, added, evicted := p.statements.acquire(sql, oids)
 	if evicted != nil {
@@ -995,6 +1143,7 @@ func applyInserts(replay *applyPipeline, relation *targetRelation, changes []Cha
 			return err
 		}
 	}
+	replay.stats.addRows(relation, int64(len(changes)))
 	return nil
 }
 

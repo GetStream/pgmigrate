@@ -33,6 +33,17 @@ func NormalizeEndPosition(
 	requested LSN,
 	durable LSN,
 ) (EndPositionResolution, error) {
+	return NormalizeEndPositionWithCatalog(
+		directory, nil, requested, durable,
+	)
+}
+
+func NormalizeEndPositionWithCatalog(
+	directory string,
+	catalog *SegmentCatalog,
+	requested LSN,
+	durable LSN,
+) (EndPositionResolution, error) {
 	resolution := EndPositionResolution{Requested: requested}
 	if requested == 0 {
 		return resolution, &EndPositionUnavailableError{
@@ -41,7 +52,12 @@ func NormalizeEndPosition(
 			Reason:    "zero is not a transaction boundary",
 		}
 	}
-	reader, err := NewReader(directory, 0, durable)
+	reader, err := NewReaderWithConfig(ReaderConfig{
+		Directory:     directory,
+		SeekEndLSN:    requested,
+		DurableEndLSN: durable,
+		Catalog:       catalog,
+	})
 	if err != nil {
 		return resolution, err
 	}

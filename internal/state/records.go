@@ -22,9 +22,13 @@ func (s *Store) ResetBaseCopy(ctx context.Context) error {
 		}
 		for _, statement := range []string{
 			"DELETE FROM verify_tables", "DELETE FROM constraints", "DELETE FROM indexes",
-			"DELETE FROM parts", "DELETE FROM tables",
+			"DELETE FROM parts", "DELETE FROM tables", "DELETE FROM apply_table_progress",
 			"DELETE FROM steps WHERE name NOT LIKE 'preflight.%'",
-			"UPDATE apply_progress SET staged_lsn='', applied_lsn='', txns=0, rows_applied=0, updated_at=0 WHERE id=1",
+			"UPDATE apply_progress SET staged_lsn='', applied_lsn='', txns=0, rows_applied=0, " +
+				"dml_statements=0, target_commits=0, rows_per_second=0, updated_at=0 WHERE id=1",
+			"UPDATE recovery_progress SET total_bytes=0, trusted_bytes=0, scanned_bytes=0, " +
+				"total_segments=0, trusted_segments=0, scanned_segments=0, elapsed_ns=0, " +
+				"scan_bytes_per_second=0, fallback_reason='', manifest_rebuilt=0 WHERE id=1",
 			"UPDATE migration SET slot_name='', snapshot_name='', consistent_point='', end_position='', phase='preflight', updated_at=0 WHERE id=1",
 		} {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
@@ -485,19 +489,57 @@ func (s *Store) completed(ctx context.Context, table, key string, value any) (bo
 
 // UpdateApplyProgress replaces the status copy of target-origin progress.
 func (s *Store) UpdateApplyProgress(ctx context.Context, progress ApplyProgress) error {
+	return s.UpdateApplyProgressAndTables(ctx, progress, nil)
+}
+
+// UpdateApplyProgressAndTables replaces the global status copy and upserts any
+// supplied per-table counters in the same local transaction.
+func (s *Store) UpdateApplyProgressAndTables(
+	ctx context.Context,
+	progress ApplyProgress,
+	tables []ApplyTableProgress,
+) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
+		now := time.Now().UTC().UnixNano()
 		_, err := tx.ExecContext(
 			ctx, `
-			INSERT INTO apply_progress (id, staged_lsn, applied_lsn, txns, rows_applied, updated_at)
-			VALUES (1, ?, ?, ?, ?, ?)
+			INSERT INTO apply_progress (
+				id, staged_lsn, applied_lsn, txns, rows_applied,
+				dml_statements, target_commits, rows_per_second, updated_at
+			)
+			VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(id) DO UPDATE SET staged_lsn=excluded.staged_lsn,
 				applied_lsn=excluded.applied_lsn, txns=excluded.txns,
-				rows_applied=excluded.rows_applied, updated_at=excluded.updated_at`,
+				rows_applied=excluded.rows_applied,
+				dml_statements=excluded.dml_statements,
+				target_commits=excluded.target_commits,
+				rows_per_second=excluded.rows_per_second,
+				updated_at=excluded.updated_at`,
 			progress.StagedLSN, progress.AppliedLSN, progress.Txns, progress.Rows,
-			time.Now().UTC().UnixNano(),
+			progress.DMLStatements, progress.TargetCommits, progress.RowsPerSecond, now,
 		)
 		if err != nil {
 			return fmt.Errorf("update apply progress: %w", err)
+		}
+		for _, table := range tables {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT INTO apply_table_progress (
+					schema_name, table_name, rows_applied, dml_statements,
+					rows_per_second, updated_at
+				)
+				VALUES (?, ?, ?, ?, ?, ?)
+				ON CONFLICT(schema_name, table_name) DO UPDATE SET
+					rows_applied=excluded.rows_applied,
+					dml_statements=excluded.dml_statements,
+					rows_per_second=excluded.rows_per_second,
+					updated_at=excluded.updated_at
+			`, table.Schema, table.Table, table.Rows, table.DMLStatements,
+				table.RowsPerSecond, now); err != nil {
+				return fmt.Errorf(
+					"update apply progress for %s.%s: %w",
+					table.Schema, table.Table, err,
+				)
+			}
 		}
 		return nil
 	})
