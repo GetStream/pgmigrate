@@ -33,10 +33,29 @@ func EnsureProgressTable(ctx context.Context, db ProgressExecer) error {
 		CREATE TABLE IF NOT EXISTS `+progressTable+` (
 			stream_id text PRIMARY KEY,
 			remote_lsn pg_lsn NOT NULL,
+			source_transactions bigint NOT NULL DEFAULT 0,
+			row_changes bigint NOT NULL DEFAULT 0,
+			dml_statements bigint NOT NULL DEFAULT 0,
+			target_commits bigint NOT NULL DEFAULT 0,
 			updated_at timestamptz NOT NULL DEFAULT clock_timestamp()
 		)
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	for _, column := range []string{
+		"source_transactions bigint NOT NULL DEFAULT 0",
+		"row_changes bigint NOT NULL DEFAULT 0",
+		"dml_statements bigint NOT NULL DEFAULT 0",
+		"target_commits bigint NOT NULL DEFAULT 0",
+	} {
+		if _, err := db.Exec(
+			ctx, "ALTER TABLE "+progressTable+" ADD COLUMN IF NOT EXISTS "+column,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReadProgress returns the authoritative target-local progress for streamID.

@@ -78,7 +78,32 @@ CREATE TABLE IF NOT EXISTS apply_progress (
 	applied_lsn TEXT NOT NULL DEFAULT '',
 	txns INTEGER NOT NULL DEFAULT 0,
 	rows_applied INTEGER NOT NULL DEFAULT 0,
+	dml_statements INTEGER NOT NULL DEFAULT 0,
+	target_commits INTEGER NOT NULL DEFAULT 0,
+	rows_per_second REAL NOT NULL DEFAULT 0,
 	updated_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS apply_table_progress (
+	schema_name TEXT NOT NULL,
+	table_name TEXT NOT NULL,
+	rows_applied INTEGER NOT NULL DEFAULT 0,
+	dml_statements INTEGER NOT NULL DEFAULT 0,
+	rows_per_second REAL NOT NULL DEFAULT 0,
+	updated_at INTEGER NOT NULL,
+	PRIMARY KEY (schema_name, table_name)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS recovery_progress (
+	id INTEGER PRIMARY KEY CHECK (id = 1),
+	total_bytes INTEGER NOT NULL DEFAULT 0,
+	trusted_bytes INTEGER NOT NULL DEFAULT 0,
+	scanned_bytes INTEGER NOT NULL DEFAULT 0,
+	total_segments INTEGER NOT NULL DEFAULT 0,
+	trusted_segments INTEGER NOT NULL DEFAULT 0,
+	scanned_segments INTEGER NOT NULL DEFAULT 0,
+	elapsed_ns INTEGER NOT NULL DEFAULT 0,
+	scan_bytes_per_second REAL NOT NULL DEFAULT 0,
+	fallback_reason TEXT NOT NULL DEFAULT '',
+	manifest_rebuilt INTEGER NOT NULL DEFAULT 0 CHECK (manifest_rebuilt IN (0, 1))
 );
 -- One row per table, so a separate pgmigrate status can report what verification
 -- is doing, how much of each table it looked at, and how the table came out.
@@ -175,7 +200,7 @@ CREATE TABLE IF NOT EXISTS failed_attempt (
 // forward. This matters more here than in most schemas: the whole value of the
 // state directory is resuming a copy that took hours, so a directory that
 // cannot be migrated means starting over.
-const schemaVersion = 6
+const schemaVersion = 8
 
 // migrations upgrade an existing state directory to schemaVersion. Index i moves
 // version i to version i+1. Each has to tolerate the change already being
@@ -249,6 +274,33 @@ var migrations = []func(context.Context, *sql.Tx) error{
 			if err := addColumn(ctx, tx, "verify_tables", column, "INTEGER NOT NULL DEFAULT 0"); err != nil {
 				return err
 			}
+		}
+		return nil
+	},
+	// 6 -> 7: committed replay accounting. Global source-transaction, row,
+	// statement, and target-commit counters make both batching ratios explicit;
+	// per-table rows and statements support table-labeled throughput.
+	6: func(ctx context.Context, tx *sql.Tx) error {
+		for column, definition := range map[string]string{
+			"dml_statements":  "INTEGER NOT NULL DEFAULT 0",
+			"target_commits":  "INTEGER NOT NULL DEFAULT 0",
+			"rows_per_second": "REAL NOT NULL DEFAULT 0",
+		} {
+			if err := addColumn(ctx, tx, "apply_progress", column, definition); err != nil {
+				return err
+			}
+		}
+		return nil
+	},
+	// 7 -> 8: startup recovery accounting. The table is created by the current
+	// schema above; the migration supplies its singleton zero row to an upgraded
+	// directory as well as to a newly initialized one.
+	7: func(ctx context.Context, tx *sql.Tx) error {
+		if _, err := tx.ExecContext(
+			ctx,
+			"INSERT OR IGNORE INTO recovery_progress (id) VALUES (1)",
+		); err != nil {
+			return fmt.Errorf("initialize recovery progress: %w", err)
 		}
 		return nil
 	},
@@ -510,6 +562,12 @@ func initialize(ctx context.Context, db *sql.DB, fingerprints Fingerprints) erro
 		time.Now().UTC().UnixNano(),
 	); err != nil {
 		return fmt.Errorf("ensure apply progress: %w", err)
+	}
+	if _, err := tx.ExecContext(
+		ctx,
+		"INSERT OR IGNORE INTO recovery_progress (id) VALUES (1)",
+	); err != nil {
+		return fmt.Errorf("ensure recovery progress: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit state initialization: %w", err)

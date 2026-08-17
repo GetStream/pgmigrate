@@ -22,6 +22,7 @@ func TestSegmentPrunerBoundsSustainedAppliedSegments(t *testing.T) {
 	pruner, err := NewSegmentPruner(SegmentPrunerConfig{
 		Directory: directory,
 		Interval:  time.Nanosecond,
+		Catalog:   writer.SegmentCatalog(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -216,7 +217,7 @@ func TestCatalogPrunerRejectsSegmentChangedAfterValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	err = pruner.OnProgress(context.Background(), 0x40)
-	if err == nil || !strings.Contains(err.Error(), "changed after validation") {
+	if err == nil || !strings.Contains(err.Error(), "changed size") {
 		t.Fatalf("changed segment prune error=%v", err)
 	}
 	if got := len(writer.SegmentCatalog().snapshot()); got != 3 {
@@ -264,7 +265,7 @@ func TestCatalogPrunerRefusesAnUnexplainedMissingSegment(t *testing.T) {
 	}
 }
 
-func TestCatalogPrunerRevalidatesAChangedFinalizedSegment(t *testing.T) {
+func TestCatalogPrunerRejectsAChangedFinalizedSegment(t *testing.T) {
 	t.Parallel()
 	directory := t.TempDir()
 	writer, _, err := OpenWriter(WriterConfig{Directory: directory, RotationBytes: 1})
@@ -314,22 +315,20 @@ func TestCatalogPrunerRevalidatesAChangedFinalizedSegment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := pruner.OnProgress(context.Background(), 0x40); err != nil {
-		t.Fatal(err)
+	err = pruner.OnProgress(context.Background(), 0x40)
+	if err == nil || !strings.Contains(err.Error(), "changed size") {
+		t.Fatalf("prune error = %v, want changed size", err)
 	}
 	ranges := writer.SegmentCatalog().snapshot()
-	if len(ranges) != 3 || ranges[0].LastCommit != 0x15 || ranges[0].LastEnd != 0x16 {
-		t.Fatalf("refreshed catalog=%#v", ranges)
+	if len(ranges) != 3 ||
+		ranges[0].Path != first.Path ||
+		ranges[0].ValidatedSize != first.ValidatedSize ||
+		ranges[0].LastEnd != first.LastEnd {
+		t.Fatalf("catalog changed after rejected prune=%#v", ranges)
 	}
-	if err := pruner.OnProgress(context.Background(), 0x40); err != nil {
-		t.Fatal(err)
-	}
-	ranges = writer.SegmentCatalog().snapshot()
-	if len(ranges) != 1 || ranges[0].StartCommit != 0x30 {
-		t.Fatalf("catalog after refreshed prune=%#v", ranges)
-	}
-	if _, err := Recover(directory); err != nil {
-		t.Fatalf("recover after refreshed prune: %v", err)
+	if _, err := Recover(directory); err == nil ||
+		!strings.Contains(err.Error(), "changed size") {
+		t.Fatalf("recovery error = %v, want changed size", err)
 	}
 }
 
@@ -349,7 +348,12 @@ func TestCatalogPruneAllowsOpenReaderToReachSafetySegment(t *testing.T) {
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reader, err := NewReader(directory, 0x10, writer.DurableEndLSN())
+	reader, err := NewReaderWithConfig(ReaderConfig{
+		Directory:     directory,
+		AfterEndLSN:   0x11,
+		DurableEndLSN: writer.DurableEndLSN(),
+		Catalog:       writer.SegmentCatalog(),
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

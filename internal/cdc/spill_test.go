@@ -320,7 +320,7 @@ func TestReaderUsesDedicatedSpillDirectoryAndCleansOrphans(t *testing.T) {
 	}
 }
 
-func TestReaderCleansLargeSpillWhenCommitAlreadyApplied(t *testing.T) {
+func TestIndexedReaderSkipsAppliedLargeTransactionWithoutSpilling(t *testing.T) {
 	t.Parallel()
 	segmentDirectory := t.TempDir()
 	spillDirectory := t.TempDir()
@@ -343,8 +343,9 @@ func TestReaderCleansLargeSpillWhenCommitAlreadyApplied(t *testing.T) {
 	reader, err := NewReaderWithConfig(ReaderConfig{
 		Directory:      segmentDirectory,
 		SpillDirectory: spillDirectory,
-		AfterCommitLSN: transaction.CommitLSN,
+		AfterEndLSN:    transaction.EndLSN,
 		DurableEndLSN:  transaction.EndLSN,
+		Catalog:        writer.SegmentCatalog(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -352,6 +353,9 @@ func TestReaderCleansLargeSpillWhenCommitAlreadyApplied(t *testing.T) {
 	defer reader.Close()
 	if _, err := reader.Next(); !errors.Is(err, io.EOF) {
 		t.Fatalf("already-applied large transaction = %v", err)
+	}
+	if reader.BytesRead() != 0 {
+		t.Fatalf("indexed reader consumed %d applied bytes", reader.BytesRead())
 	}
 	entries, err := os.ReadDir(spillDirectory)
 	if err != nil {

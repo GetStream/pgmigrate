@@ -53,6 +53,25 @@ func NewSegmentPruner(config SegmentPrunerConfig) (*SegmentPruner, error) {
 	if config.Catalog != nil && filepath.Clean(config.Catalog.directory) != filepath.Clean(config.Directory) {
 		return nil, errors.New("cdc: segment pruner catalog directory does not match")
 	}
+	if config.Catalog == nil {
+		diskCatalog, exists, err := loadDiskSegmentCatalog(config.Directory)
+		if err != nil {
+			return nil, fmt.Errorf("cdc: load segment catalog for pruning: %w", err)
+		}
+		if exists {
+			ranges, err := diskCatalogRanges(config.Directory, diskCatalog)
+			if err != nil {
+				return nil, err
+			}
+			config.Catalog = newSegmentCatalogState(
+				config.Directory,
+				ranges,
+				diskCatalog.Generation,
+				LSN(diskCatalog.PrunedThrough),
+				nil,
+			)
+		}
+	}
 	return &SegmentPruner{
 		directory: config.Directory,
 		interval:  config.Interval,
@@ -181,28 +200,53 @@ func (c *SegmentCatalog) prune(applied LSN, maxRemove int) ([]string, bool, erro
 		candidates = candidates[:maxRemove]
 	}
 
-	for i, segment := range candidates {
+	for _, segment := range candidates {
 		info, err := os.Stat(segment.Path)
 		if err != nil {
 			return nil, more, fmt.Errorf("stat cataloged segment %s: %w", filepath.Base(segment.Path), err)
 		}
 		if !info.Mode().IsRegular() || info.Size() != segment.ValidatedSize {
-			refreshed, err := revalidateCatalogedSegment(finalized, i)
-			if err != nil {
-				return nil, more, fmt.Errorf(
-					"cataloged segment %s changed after validation: %w",
-					filepath.Base(segment.Path), err,
-				)
-			}
-			if err := c.replaceFinalized(refreshed); err != nil {
-				return nil, more, err
-			}
-			// Recompute the eligible prefix from the refreshed catalog before
-			// deleting anything. This call remains conservative and bounded to
-			// one fallback segment scan.
-			return nil, true, nil
+			return nil, more, fmt.Errorf(
+				"cataloged segment %s changed size from %d to %d",
+				filepath.Base(segment.Path), segment.ValidatedSize, info.Size(),
+			)
 		}
 	}
+
+	c.mu.Lock()
+	if len(c.finalized) < len(candidates) {
+		c.mu.Unlock()
+		return nil, more, errors.New("cdc: finalized catalog changed during prune")
+	}
+	for i := range candidates {
+		if c.finalized[i].Path != candidates[i].Path {
+			c.mu.Unlock()
+			return nil, more, errors.New("cdc: finalized catalog changed during prune")
+		}
+	}
+	proposed := cloneSegmentRanges(c.finalized[len(candidates):])
+	prunedThrough := c.prunedThrough
+	for _, segment := range candidates {
+		if segment.LastEnd > prunedThrough {
+			prunedThrough = segment.LastEnd
+		}
+	}
+	if err := persistPruneWatermark(
+		c.directory, c.generation+1, prunedThrough,
+	); err != nil {
+		c.mu.Unlock()
+		return nil, more, err
+	}
+	if err := persistDiskSegmentCatalog(
+		c.directory, c.generation+1, prunedThrough, proposed,
+	); err != nil {
+		c.mu.Unlock()
+		return nil, more, err
+	}
+	c.generation++
+	c.prunedThrough = prunedThrough
+	c.finalized = proposed
+	c.mu.Unlock()
 
 	removed := make([]string, 0, len(candidates))
 	var removeErr error
@@ -217,34 +261,8 @@ func (c *SegmentCatalog) prune(applied LSN, maxRemove int) ([]string, bool, erro
 		return nil, more, removeErr
 	}
 	directoryErr := syncDirectory(c.directory)
-	if directoryErr == nil {
-		c.removeFinalized(removed)
-	}
 	if removeErr != nil || directoryErr != nil {
 		return removed, more, errors.Join(removeErr, directoryErr)
 	}
 	return removed, more, nil
-}
-
-func revalidateCatalogedSegment(finalized []SegmentRange, index int) (SegmentRange, error) {
-	if index < 0 || index >= len(finalized) {
-		return SegmentRange{}, errors.New("cdc: catalog segment index is out of range")
-	}
-	var previousCommit, previousEnd LSN
-	if index > 0 {
-		previousCommit = finalized[index-1].LastCommit
-		previousEnd = finalized[index-1].LastEnd
-	}
-	segment := finalized[index]
-	scan, err := scanSegment(segment.Path, false, previousCommit, previousEnd, nil)
-	if err != nil {
-		return SegmentRange{}, err
-	}
-	return SegmentRange{
-		Path:          segment.Path,
-		StartCommit:   segment.StartCommit,
-		LastCommit:    scan.lastCommitLSN,
-		LastEnd:       scan.lastEndLSN,
-		ValidatedSize: scan.size,
-	}, nil
 }

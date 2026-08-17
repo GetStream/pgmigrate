@@ -717,6 +717,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		CREATE TABLE public.pipeline_missing (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_binary (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_prepared (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_compressed (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_progress_guard (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_deferred_commit (
 			id integer PRIMARY KEY,
@@ -794,6 +795,49 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatalf("mixed replay row=%d/%q, want 2/second", id, value)
 		}
 		assertProgress(t, "pipeline-mixed", transaction.EndLSN)
+	})
+
+	t.Run("committed counters expose row statement compression", func(t *testing.T) {
+		const stream = "pipeline-compressed"
+		const generation = stream + "-generation"
+		source := relation(1112, "pipeline_compressed", 25)
+		first := &Transaction{
+			CommitLSN: 12, EndLSN: 13, Relations: []Relation{source},
+			Changes: []Change{
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("10"), text("first"))},
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("11"), text("second"))},
+				{RelationOID: source.OID, Kind: ChangeInsert, New: tuple(text("12"), text("third"))},
+			},
+		}
+		if err := apply(stream, first); err != nil {
+			t.Fatal(err)
+		}
+		second := &Transaction{
+			CommitLSN: 13, EndLSN: 14, Relations: []Relation{source},
+			Changes: []Change{
+				{RelationOID: source.OID, Kind: ChangeUpdate, Old: tuple(text("10"), TupleDatum{Kind: DatumNull}), New: tuple(text("10"), text("updated"))},
+				{RelationOID: source.OID, Kind: ChangeUpdate, Old: tuple(text("11"), TupleDatum{Kind: DatumNull}), New: tuple(text("11"), text("updated"))},
+			},
+		}
+		if err := apply(stream, second); err != nil {
+			t.Fatal(err)
+		}
+		stats, tables, err := ReadApplyStats(ctx, conn, stream, generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats != (ApplyProgressStats{
+			Transactions: 2, Rows: 5, DMLStatements: 3, TargetCommits: 2,
+		}) {
+			t.Fatalf("apply stats = %#v", stats)
+		}
+		if len(tables) != 1 ||
+			tables[0].Schema != "public" ||
+			tables[0].Table != "pipeline_compressed" ||
+			tables[0].Rows != 5 ||
+			tables[0].DMLStatements != 3 {
+			t.Fatalf("table apply stats = %#v", tables)
+		}
 	})
 
 	t.Run("prepared DML is reused across source transactions", func(t *testing.T) {
@@ -908,6 +952,15 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatalf("failed pipeline committed %d rows", count)
 		}
 		assertProgress(t, "pipeline-sql-failure", 0)
+		stats, tables, err := ReadApplyStats(
+			ctx, conn, "pipeline-sql-failure", "pipeline-sql-failure-generation",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats != (ApplyProgressStats{}) || len(tables) != 0 {
+			t.Fatalf("rolled-back apply stats = %#v, tables = %#v", stats, tables)
+		}
 	})
 
 	t.Run("progress mismatch aborts before queued commit", func(t *testing.T) {
@@ -1070,6 +1123,21 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatalf("updated spill rows=%d, want %d", count, applyPipelineWindow+1)
 		}
 		assertProgress(t, "pipeline-spill", transaction.EndLSN)
+		stats, tables, err := ReadApplyStats(
+			ctx, conn, "pipeline-spill", "pipeline-spill-generation",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stats.Transactions != 1 ||
+			stats.Rows != applyPipelineWindow+1 ||
+			stats.DMLStatements != applyPipelineWindow+1 ||
+			stats.TargetCommits != 1 ||
+			len(tables) != 1 ||
+			tables[0].Rows != applyPipelineWindow+1 ||
+			tables[0].DMLStatements != applyPipelineWindow+1 {
+			t.Fatalf("spilled apply stats = %#v, tables = %#v", stats, tables)
+		}
 	})
 }
 

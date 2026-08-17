@@ -83,6 +83,25 @@ func TestPG17ReplayBatchCollapsesSerializedCommitLane(t *testing.T) {
 		if err != nil || !exists || LSN(progress) != durableLSN {
 			t.Fatalf("%s progress = %x/%t (%v), want %x", stream, progress, exists, err, durableLSN)
 		}
+		stats, tables, err := ReadApplyStats(ctx, conn, stream, stream+"-generation")
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantCommits := int64((transactionCount + batchSize - 1) / batchSize)
+		if stats.Transactions != transactionCount ||
+			stats.Rows != transactionCount ||
+			stats.DMLStatements != transactionCount ||
+			stats.TargetCommits != wantCommits {
+			t.Fatalf("%s apply stats = %#v, want txns/rows/statements/commits %d/%d/%d/%d",
+				stream, stats, transactionCount, transactionCount, transactionCount, wantCommits)
+		}
+		if len(tables) != 1 ||
+			tables[0].Schema != "public" ||
+			tables[0].Table != table ||
+			tables[0].Rows != transactionCount ||
+			tables[0].DMLStatements != transactionCount {
+			t.Fatalf("%s table apply stats = %#v", stream, tables)
+		}
 		return elapsed
 	}
 
@@ -318,6 +337,7 @@ func TestPG17ConcurrentReplayRecoversAnOutOfOrderDurableCommit(t *testing.T) {
 	durable.Publish(durableLSN)
 	applier, err := NewApplier(ApplierConfig{
 		ConnString: target.URI, Directory: directory,
+		Catalog: writer.SegmentCatalog(),
 		// A restart with lower concurrency must still recognize receipts made
 		// by a previous multi-worker run.
 		Workers: 1, BatchSize: 1, Window: 8,
@@ -358,5 +378,23 @@ func TestPG17ConcurrentReplayRecoversAnOutOfOrderDurableCommit(t *testing.T) {
 	}
 	if receipts != 0 {
 		t.Fatalf("checkpoint left %d replay receipts, want 0", receipts)
+	}
+	stats, tables, err := ReadApplyStats(ctx, conn, stream, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats != (ApplyProgressStats{
+		Transactions: 3, Rows: 3, DMLStatements: 3, TargetCommits: 2,
+	}) {
+		t.Fatalf("recovered apply stats = %#v", stats)
+	}
+	if len(tables) != 2 ||
+		tables[0].Table != "receipt_first" ||
+		tables[0].Rows != 1 ||
+		tables[0].DMLStatements != 1 ||
+		tables[1].Table != "receipt_second" ||
+		tables[1].Rows != 2 ||
+		tables[1].DMLStatements != 2 {
+		t.Fatalf("recovered table apply stats = %#v", tables)
 	}
 }

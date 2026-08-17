@@ -401,8 +401,8 @@ func TestNewPartialDirectorySyncFailurePreventsAppend(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(entries) != 0 {
-		t.Fatalf("failed new segment left %d directory entries", len(entries))
+	if len(entries) != 1 || entries[0].Name() != segmentCatalogFilename {
+		t.Fatalf("failed new segment left entries %v, want only durable catalog", entries)
 	}
 }
 
@@ -734,7 +734,7 @@ func TestRecoveryTracksCommitOrderingSeparatelyFromEndLSN(t *testing.T) {
 	}
 }
 
-func TestRecoveryRejectsCorruptFinalizedSegment(t *testing.T) {
+func TestCatalogRecoveryDefersFinalizedCRCValidationUntilReplay(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	writer, _, err := OpenWriter(WriterConfig{Directory: dir, RotationBytes: 1})
@@ -759,8 +759,24 @@ func TestRecoveryRejectsCorruptFinalizedSegment(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Recover(dir); err == nil {
-		t.Fatal("expected finalized segment corruption to fail")
+	recovery, err := Recover(dir)
+	if err != nil {
+		t.Fatalf("metadata-only recovery: %v", err)
+	}
+	if recovery.ScannedBytes != 0 {
+		t.Fatalf("metadata-only recovery scanned %d finalized bytes", recovery.ScannedBytes)
+	}
+	reader, err := NewReaderWithConfig(ReaderConfig{
+		Directory:     dir,
+		DurableEndLSN: tx.EndLSN,
+		Catalog:       writer.SegmentCatalog(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	if _, err := reader.Next(); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("replay error = %v, want checksum mismatch", err)
 	}
 }
 

@@ -150,9 +150,22 @@ verify e2e.metrics: done 0/0 rows sampled (0.00%), 0/0 source pages, 0 target ro
 verify e2e.order_items: done 3059/3059 rows sampled (100.00%), 24/24 source pages, 3059 target rows, 123/123 applied rows checked
 findings: 4 open
 steps: 33 complete
-apply: 0/1BE9D08 staged, 0/1BE9D08 applied, 0 txns, 0 rows
+apply: 0/1BE9D08 staged, 0/1BE9D08 applied, 120 source txns, 600 rows, 200 DML statements, 30 target commits, 75 rows/s, 3.00 rows/statement, 4.00 txns/commit
+apply e2e.orders: 600 rows, 200 DML statements, 75 rows/s, 3.00 rows/statement
 lag: 0 bytes, 30.489s stale
 ```
+
+Apply counters advance only with the target's contiguous committed replay
+position, so failed or retried transactions are not counted twice. Per-table
+`rows/s` is the change in committed `INSERT`, `UPDATE`, and `DELETE` rows over
+the latest five-second reporting interval. `dml_statements` counts the target
+`INSERT`, `UPDATE`, and `DELETE` statements representing those rows.
+`TRUNCATE` is excluded from both because the logical stream does not report how
+many rows it removed. The two compression figures make batching explicit: rows
+per target row-DML statement measures row batching, while source transactions
+per target commit measures transaction batching. The same values are emitted in `progress` and
+`apply_table_progress` log events and under the `pgmigrate_apply_*`
+Prometheus metrics.
 
 `verify` can be run whenever you want an answer, including while the source is
 still taking writes. It prints a line per table as it works, and a summary that
@@ -691,6 +704,12 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
 
 - A torn `.partial` CDC tail is scanned and truncated to the last valid frame.
   Receiving resumes from the latest fsynced transaction EndLSN.
+- Finalized segments are recorded in a checksummed `segments.catalog` beside
+  the CDC files. The first restart after upgrading scans retained segments once
+  to build it; normal restarts stat finalized files, scan only the mutable tail
+  or an unindexed suffix, and seek replay near target progress. Recovery work
+  is visible in status, `cdc_recovery_progress`/`cdc_recovery_complete` log
+  events, and the `pgmigrate_recovery_*` Prometheus metrics.
 - Serial target DML and progress commit atomically. Parallel DML commits with a
   durable receipt, and checkpoint progress advances while deleting the
   contiguous receipt prefix in one target transaction. A restart therefore

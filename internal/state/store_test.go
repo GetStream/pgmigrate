@@ -103,6 +103,46 @@ func TestOpenUpgradesAnOlderStateDirectory(t *testing.T) {
 	openTestStore(t, dir)
 }
 
+func TestOpenUpgradesApplyAccounting(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	store := openTestStore(t, dir)
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openTestDB(t, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"ALTER TABLE apply_progress DROP COLUMN dml_statements",
+		"ALTER TABLE apply_progress DROP COLUMN target_commits",
+		"ALTER TABLE apply_progress DROP COLUMN rows_per_second",
+		"DROP TABLE apply_table_progress",
+		"PRAGMA user_version = 6",
+	} {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			t.Fatalf("%s: %v", statement, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	upgraded := openTestStore(t, dir)
+	defer upgraded.Close()
+	status, err := upgraded.Snapshot(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Apply.DMLStatements != 0 ||
+		status.Apply.TargetCommits != 0 ||
+		status.Apply.RowsPerSecond != 0 ||
+		len(status.ApplyTables) != 0 {
+		t.Fatalf("upgraded apply accounting = %#v/%#v", status.Apply, status.ApplyTables)
+	}
+}
+
 // TestVerifyTablesCarryForwardFromTheTwoSidedSchema covers the migration that
 // reshapes verification's own records. A directory left by a run of the exhaustive
 // comparison has to open, because the alternative is redoing a copy that took
@@ -238,7 +278,8 @@ func TestOpenInitializesDirectoryAndSchema(t *testing.T) {
 
 	wantTables := []string{
 		"migration", "tables", "parts", "indexes", "constraints",
-		"apply_progress", "verify_tables", "findings", "steps", "failed_attempt",
+		"apply_progress", "apply_table_progress", "recovery_progress",
+		"verify_tables", "findings", "steps", "failed_attempt",
 	}
 	for _, name := range wantTables {
 		var count int
@@ -384,9 +425,13 @@ func TestPersistenceProgressAndIdempotency(t *testing.T) {
 			t.Errorf("%s completion = %t, %v; want true, nil", check.name, done, err)
 		}
 	}
-	if err := store.UpdateApplyProgress(ctx, ApplyProgress{
+	if err := store.UpdateApplyProgressAndTables(ctx, ApplyProgress{
 		StagedLSN: "1/C", AppliedLSN: "1/B", Txns: 7, Rows: 23,
-	}); err != nil {
+		DMLStatements: 11, TargetCommits: 3, RowsPerSecond: 4.5,
+	}, []ApplyTableProgress{{
+		Schema: "public", Table: "orders", Rows: 23,
+		DMLStatements: 11, RowsPerSecond: 4.5,
+	}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpsertVerifyTable(ctx, VerifyTable{
@@ -431,8 +476,18 @@ func TestPersistenceProgressAndIdempotency(t *testing.T) {
 		t.Errorf("unexpected persisted counts: %#v", status)
 	}
 	if status.Apply.AppliedLSN != "1/B" || status.Apply.StagedLSN != "1/C" ||
-		status.Apply.Txns != 7 || status.Apply.Rows != 23 {
+		status.Apply.Txns != 7 || status.Apply.Rows != 23 ||
+		status.Apply.DMLStatements != 11 || status.Apply.TargetCommits != 3 ||
+		status.Apply.RowsPerSecond != 4.5 {
 		t.Errorf("unexpected persisted apply progress: %#v", status.Apply)
+	}
+	if len(status.ApplyTables) != 1 ||
+		status.ApplyTables[0].Schema != "public" ||
+		status.ApplyTables[0].Table != "orders" ||
+		status.ApplyTables[0].Rows != 23 ||
+		status.ApplyTables[0].DMLStatements != 11 ||
+		status.ApplyTables[0].RowsPerSecond != 4.5 {
+		t.Errorf("unexpected persisted apply table progress: %#v", status.ApplyTables)
 	}
 	if status.OpenFindings != 0 || status.CompletedSteps != 1 {
 		t.Errorf("finding/step status = %d/%d", status.OpenFindings, status.CompletedSteps)

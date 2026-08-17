@@ -159,11 +159,41 @@ type Constraint struct {
 
 // ApplyProgress is the status-only copy of target replication-origin progress.
 type ApplyProgress struct {
-	StagedLSN  string
-	AppliedLSN string
-	Txns       int64
-	Rows       int64
-	UpdatedAt  time.Time
+	StagedLSN     string
+	AppliedLSN    string
+	Txns          int64
+	Rows          int64
+	DMLStatements int64
+	TargetCommits int64
+	RowsPerSecond float64
+	UpdatedAt     time.Time
+}
+
+// ApplyTableProgress is the local status copy of one target-authoritative
+// relation counter, plus the monitor's latest interval rate.
+type ApplyTableProgress struct {
+	Schema        string
+	Table         string
+	Rows          int64
+	DMLStatements int64
+	RowsPerSecond float64
+	UpdatedAt     time.Time
+}
+
+// RecoveryProgress reports how startup established trust in the local CDC
+// segments. Trusted work came from durable metadata; scanned work was read and
+// checksummed again.
+type RecoveryProgress struct {
+	TotalBytes         int64
+	TrustedBytes       int64
+	ScannedBytes       int64
+	TotalSegments      int64
+	TrustedSegments    int64
+	ScannedSegments    int64
+	Elapsed            time.Duration
+	ScanBytesPerSecond float64
+	FallbackReason     string
+	ManifestRebuilt    bool
 }
 
 // VerifyTable is the live progress and outcome of checking one table.
@@ -244,4 +274,6 @@ type Status struct {
 	OpenFindings   int64
 	CompletedSteps int64
 	Apply          ApplyProgress
+	ApplyTables    []ApplyTableProgress
+	Recovery       RecoveryProgress
 }

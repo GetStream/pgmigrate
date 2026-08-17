@@ -32,6 +32,7 @@ type ApplierConfig struct {
 	ConnString           string
 	Directory            string
 	ReaderSpillDirectory string
+	Catalog              *SegmentCatalog
 	// Workers is the number of target sessions used for replay. Transactions
 	// that touch independent relations commit concurrently; per-relation order
 	// and the authoritative progress prefix remain in source order. Values below
@@ -198,7 +199,9 @@ func (a *Applier) runConnection(ctx context.Context) error {
 	reader, err := NewReaderWithConfig(ReaderConfig{
 		Directory:      a.config.Directory,
 		SpillDirectory: a.config.ReaderSpillDirectory,
+		AfterEndLSN:    LSN(progress),
 		DurableEndLSN:  a.config.Durable.Load(),
+		Catalog:        a.config.Catalog,
 	})
 	if err != nil {
 		return err
@@ -278,7 +281,9 @@ func (a *Applier) applyAvailable(ctx context.Context, conn *pgx.Conn, progress L
 	reader, err := NewReaderWithConfig(ReaderConfig{
 		Directory:      a.config.Directory,
 		SpillDirectory: a.config.ReaderSpillDirectory,
+		AfterEndLSN:    progress,
 		DurableEndLSN:  a.config.Durable.Load(),
+		Catalog:        a.config.Catalog,
 	})
 	if err != nil {
 		return false, progress, err
@@ -363,7 +368,9 @@ func (a *Applier) resolveEndPosition(requested, durable LSN) (LSN, error) {
 	if a.endPositionResolved && a.endPositionRequested == requested {
 		return a.endPositionBoundary, nil
 	}
-	resolution, err := NormalizeEndPosition(a.config.Directory, requested, durable)
+	resolution, err := NormalizeEndPositionWithCatalog(
+		a.config.Directory, a.config.Catalog, requested, durable,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -493,6 +500,7 @@ func (a *Applier) prepareTransactions(
 	}
 
 	replay := newApplyPipeline(ctx, conn.PgConn(), statementCache)
+	replay.stats = newApplyStats(len(transactions))
 	replay.begin()
 	var replayErr error
 	collectors := make([]*sampleCollector, 0, len(transactions))
@@ -551,12 +559,14 @@ func (a *Applier) queueTransaction(
 			if err := applyUpdate(replay, relation, change); err != nil {
 				return err
 			}
+			replay.stats.addRows(relation, 1)
 			collector.add(change)
 			i++
 		case ChangeDelete:
 			if err := applyDelete(replay, relation, change); err != nil {
 				return err
 			}
+			replay.stats.addRows(relation, 1)
 			collector.add(change)
 			i++
 		case ChangeTruncate:
@@ -759,6 +769,7 @@ func (a *Applier) applySpilledChanges(
 			if err := applyUpdate(replay, relation, &change); err != nil {
 				return err
 			}
+			replay.stats.addRows(relation, 1)
 			collector.add(&change)
 			return nil
 		case ChangeDelete:
@@ -768,6 +779,7 @@ func (a *Applier) applySpilledChanges(
 			if err := applyDelete(replay, relation, &change); err != nil {
 				return err
 			}
+			replay.stats.addRows(relation, 1)
 			collector.add(&change)
 			return nil
 		default:
@@ -818,6 +830,7 @@ type applyPipeline struct {
 	conn         *pgconn.PgConn
 	pipeline     *pgconn.Pipeline
 	statements   *applyStatementCache
+	stats        *applyStats
 	expectations []applyExpectation
 	commands     int
 	closed       bool
@@ -850,7 +863,7 @@ func (p *applyPipeline) commit() {
 func (p *applyPipeline) queueProgress(streamID, generation string, remoteLSN LSN) {
 	p.queueUnprepared(
 		streamProgressSQL,
-		streamProgressParams(streamID, generation, remoteLSN),
+		streamProgressParams(streamID, generation, remoteLSN, p.stats),
 		applyExpectation{
 			description: "update transactional apply progress", expectedRows: 1,
 			progressGuard: true,
@@ -865,7 +878,7 @@ func (p *applyPipeline) queueReplayReceipts(
 ) {
 	p.queueUnprepared(
 		streamReplayReceiptSQL,
-		streamReplayReceiptParams(streamID, generation, transactions),
+		streamReplayReceiptParams(streamID, generation, transactions, p.stats),
 		applyExpectation{
 			description: "record durable replay receipts", expectedRows: 1,
 			progressGuard: true,
@@ -878,6 +891,13 @@ func (p *applyPipeline) queue(
 	params []rawParam,
 	expectation applyExpectation,
 ) error {
+	if expectation.resultKind == applyCommandResult &&
+		expectation.relation != nil &&
+		(expectation.kind == ChangeInsert ||
+			expectation.kind == ChangeUpdate ||
+			expectation.kind == ChangeDelete) {
+		p.stats.addDMLStatement(expectation.relation)
+	}
 	values, oids, formats := rawParamArrays(params)
 	statement, added, evicted := p.statements.acquire(sql, oids)
 	if evicted != nil {
@@ -1123,6 +1143,7 @@ func applyInserts(replay *applyPipeline, relation *targetRelation, changes []Cha
 			return err
 		}
 	}
+	replay.stats.addRows(relation, int64(len(changes)))
 	return nil
 }
 
