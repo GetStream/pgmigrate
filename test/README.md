@@ -145,9 +145,12 @@ make crash-e2e
 ```
 
 The crash harness sends `SIGKILL` after the run reports `copy`, `indexes`,
-`catchup`, and `follow`, restarting from the same migration directory after
-each kill. It then verifies, cuts over, waits for a clean `run` exit, and runs
-the independent data comparison.
+`catchup`, and `follow`, plus once after CDC apply has started while the durable
+phase is still `indexes`. It restarts from the same migration directory after
+each kill. The two `indexes` failures cover both sides of the durable split
+between replay-critical objects and concurrent secondary indexes, including
+reuse of the original catch-up boundary. The harness then verifies, cuts over,
+waits for a clean `run` exit, and runs the independent data comparison.
 
 `PHASE_TIMEOUT` (default 60) is the seconds to wait for each phase. Every resume
 re-runs the schema archive steps first, and each client-tool invocation starts a
@@ -169,6 +172,18 @@ go test -run='^$' -bench=. -benchmem ./internal/cdc
 Benchmarks cover codec encode/decode, pgoutput decode, apply preparation,
 segment append, and large-record reading. Results are machine-local
 microbenchmarks; do not report them as database migration throughput.
+
+The end-to-end local CDC stress tool is separate:
+
+```sh
+make bench-cdc
+make bench-cdc BENCH_FLAGS='--duration 20s --min-updates-per-second 0'
+```
+
+It uses two disposable PostgreSQL containers, keeps source update traffic
+running while the target builds indexes and vacuums, drains CDC, and verifies
+the final source and target contents. Its default 10,000 updates/second gate is
+a local regression target, not a managed-database capacity claim.
 
 ## Before delivery
 

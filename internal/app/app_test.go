@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GetStream/pgmigrate/internal/cdc"
 	"github.com/GetStream/pgmigrate/internal/config"
@@ -211,6 +212,91 @@ func TestAwaitCatchupStopsWhenTheApplierStops(t *testing.T) {
 		}
 		<-stopped
 	})
+}
+
+func TestAwaitCatchupAndMaintenanceRequiresBoth(t *testing.T) {
+	waitGate := make(chan struct{})
+	maintenanceGate := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- awaitCatchupAndMaintenance(
+			context.Background(),
+			7,
+			func(_ context.Context, boundary cdc.LSN) error {
+				if boundary != 7 {
+					return fmt.Errorf("boundary = %d", boundary)
+				}
+				<-waitGate
+				return nil
+			},
+			make(chan error, 1),
+			func(context.Context) error {
+				<-maintenanceGate
+				return nil
+			},
+			nil,
+		)
+	}()
+	close(waitGate)
+	select {
+	case err := <-done:
+		t.Fatalf("returned before maintenance: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(maintenanceGate)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoveredWorkersMayRestartDuringIndexOverlap(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	store, err := state.Open(ctx, t.TempDir(), state.Fingerprints{Source: "source", Filter: "filter"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, phase := range []state.Phase{
+		state.PhaseSetup, state.PhaseSchema, state.PhaseCopy, state.PhaseIndexes,
+	} {
+		if err := store.TransitionPhase(ctx, phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- waitForRecoveredFollow(ctx, store) }()
+	select {
+	case err := <-done:
+		t.Fatalf("worker restarted before apply marker: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+	if err := store.CompleteStep(ctx, cdcApplyStartedStep, "ready"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplayStartBoundarySurvivesRestart(t *testing.T) {
+	ctx := context.Background()
+	store, err := state.Open(ctx, t.TempDir(), state.Fingerprints{Source: "source", Filter: "filter"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	first, err := replayStartBoundary(ctx, store, 0x123)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := replayStartBoundary(ctx, store, 0x999)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != 0x123 || second != first {
+		t.Fatalf("boundaries first=%x second=%x", first, second)
+	}
 }
 
 // TestRepeatedBaseCopyFailureStopsRestarting covers the amplification that makes

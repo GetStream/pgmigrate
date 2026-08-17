@@ -1,7 +1,7 @@
 GO ?= go
 GOFLAGS ?=
 
-.PHONY: fmt vet test race integration bench e2e crash-e2e
+.PHONY: fmt vet test race integration bench bench-cdc e2e crash-e2e
 
 fmt:
 	$(GO) $(GOFLAGS) fmt ./...
@@ -20,6 +20,9 @@ integration:
 
 bench:
 	$(GO) $(GOFLAGS) test -run='^$$' -bench=. ./...
+
+bench-cdc:
+	$(GO) $(GOFLAGS) run ./cmd/pgmigrate-bench $(BENCH_FLAGS)
 
 e2e:
 	$(GO) $(GOFLAGS) build -o ./pgmigrate ./cmd/pgmigrate

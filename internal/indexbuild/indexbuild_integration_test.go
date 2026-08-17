@@ -126,6 +126,86 @@ func TestPG17IndexesAndForeignKeys(t *testing.T) {
 	}
 }
 
+func TestPG17ReplayPlanBuildsCriticalBeforeDeferred(t *testing.T) {
+	source := pgtest.Start(t, 17)
+	target := pgtest.Start(t, 17)
+	ctx := context.Background()
+	src := source.Connect(t)
+	dst := target.Connect(t)
+	if _, err := src.Exec(ctx, `
+		CREATE TABLE items (
+			id bigint PRIMARY KEY,
+			code text NOT NULL UNIQUE,
+			token text NOT NULL,
+			payload text NOT NULL
+		);
+		CREATE UNIQUE INDEX items_token_idx ON items(token);
+		ALTER TABLE items REPLICA IDENTITY USING INDEX items_token_idx;
+		CREATE INDEX items_payload_idx ON items(payload);
+	`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(ctx, `
+		CREATE TABLE items (
+			id bigint NOT NULL,
+			code text NOT NULL,
+			token text NOT NULL,
+			payload text NOT NULL
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+	indexes, constraints, err := Inventory(ctx, src, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := openStore(ctx, t)
+	seedInventory(ctx, t, store, indexes, constraints)
+	hookCalled := false
+	runner := Runner{
+		Target:       func(ctx context.Context) (*pgx.Conn, error) { return pgx.Connect(ctx, target.URI) },
+		Workers:      2,
+		State:        store,
+		AfterManaged: func(context.Context) error { hookCalled = true; return nil },
+	}
+	plan := PlanReplay(indexes, constraints)
+	if err := runner.RunCritical(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if !hookCalled {
+		t.Fatal("critical phase did not restore deferred objects")
+	}
+	var critical, deferred bool
+	if err := dst.QueryRow(ctx, `
+		SELECT bool_and(to_regclass(name) IS NOT NULL),
+		       to_regclass('public.items_payload_idx') IS NOT NULL
+		FROM unnest(ARRAY[
+			'public.items_pkey',
+			'public.items_code_key',
+			'public.items_token_idx'
+		]) AS name
+	`).Scan(&critical, &deferred); err != nil {
+		t.Fatal(err)
+	}
+	if !critical || deferred {
+		t.Fatalf("after critical phase critical=%v deferred=%v", critical, deferred)
+	}
+	if err := runner.RunDeferred(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	var valid, ready bool
+	if err := dst.QueryRow(ctx, `
+		SELECT indisvalid, indisready
+		FROM pg_index
+		WHERE indexrelid='public.items_payload_idx'::regclass
+	`).Scan(&valid, &ready); err != nil {
+		t.Fatal(err)
+	}
+	if !valid || !ready {
+		t.Fatalf("deferred index valid=%v ready=%v", valid, ready)
+	}
+}
+
 // seedInventory records the tables, indexes and constraints that Runner.Run
 // registers before it builds anything, so that tests calling ensureIndex or
 // ensureConstraint directly start from the same state. Entries on a partition

@@ -578,3 +578,21 @@ func TestConcurrentWritesAreSerialized(t *testing.T) {
 		t.Errorf("completed steps = %d, want 1", status.CompletedSteps)
 	}
 }
+
+func TestStepReturnsDurableDetail(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, t.TempDir())
+	if _, exists, err := store.Step(ctx, "replay"); err != nil || exists {
+		t.Fatalf("missing step exists=%v err=%v", exists, err)
+	}
+	if err := store.CompleteStep(ctx, "replay", "0/123"); err != nil {
+		t.Fatal(err)
+	}
+	step, exists, err := store.Step(ctx, "replay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || !step.Completed || step.Detail != "0/123" {
+		t.Fatalf("step = %#v exists=%v", step, exists)
+	}
+}

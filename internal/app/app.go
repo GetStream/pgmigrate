@@ -38,6 +38,12 @@ import (
 
 var errComplete = errors.New("migration complete")
 
+const (
+	replayCriticalIndexesStep = "indexes.replay_critical.completed"
+	deferredIndexesStep       = "indexes.deferred.completed"
+	cdcApplyStartedStep       = "cdc.apply.started"
+)
+
 type App struct {
 	Out io.Writer
 	// Progress receives human-readable progress, separately from Out so a machine
@@ -593,20 +599,21 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 				return restoreDeferredOnce(ctx, cfg, store, service, archive, entries, restoreArgs)
 			},
 		}
-		if err := indexRunner.Run(groupCtx, indexes, constraints); err != nil {
+		replayPlan := indexbuild.PlanReplay(indexes, constraints)
+		if err := indexRunner.RunCritical(groupCtx, replayPlan); err != nil {
 			return err
 		}
-		if err := vacuumTarget(groupCtx, cfg, store, sessionGUCs); err != nil {
-			return err
-		}
-		if err := transition(groupCtx, cfg, store, state.PhaseCatchup); err != nil {
-			return err
-		}
-		if err := pauseForCrashTest(groupCtx, state.PhaseCatchup); err != nil {
+		if err := store.CompleteStep(
+			groupCtx, replayCriticalIndexesStep,
+			fmt.Sprintf("%d critical indexes", len(replayPlan.CriticalIndexes)),
+		); err != nil {
 			return err
 		}
 		return runApplierToFollow(
-			groupCtx, cfg, store, holder.Snapshot, durable, writer.SegmentCatalog(), state.PhaseCatchup,
+			groupCtx, cfg, store, holder.Snapshot, durable, writer.SegmentCatalog(), state.PhaseIndexes,
+			func(ctx context.Context) error {
+				return runDeferredTargetMaintenance(ctx, cfg, store, sessionGUCs, indexRunner, replayPlan)
+			},
 		)
 	})
 	if cfg.Metrics != "" {
@@ -697,13 +704,9 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 			if err := pauseForCrashTest(groupCtx, state.PhaseIndexes); err != nil {
 				return err
 			}
-			if err := resumeIndexes(groupCtx, cfg, store); err != nil {
-				return err
-			}
-			if err := transition(groupCtx, cfg, store, state.PhaseCatchup); err != nil {
-				return err
-			}
-			phase = state.PhaseCatchup
+			return resumeIndexes(
+				groupCtx, cfg, store, snapshot, durable, writer.SegmentCatalog(),
+			)
 		}
 		if phase == state.PhaseCatchup {
 			if err := pauseForCrashTest(groupCtx, state.PhaseCatchup); err != nil {
@@ -711,7 +714,7 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 			}
 		}
 		return runApplierToFollow(
-			groupCtx, cfg, store, snapshot, durable, writer.SegmentCatalog(), phase,
+			groupCtx, cfg, store, snapshot, durable, writer.SegmentCatalog(), phase, nil,
 		)
 	})
 	group.Go(func() error {
@@ -744,7 +747,14 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 	return err
 }
 
-func resumeIndexes(ctx context.Context, cfg config.Config, store *state.Store) error {
+func resumeIndexes(
+	ctx context.Context,
+	cfg config.Config,
+	store *state.Store,
+	snapshot setup.Snapshot,
+	durable *cdc.DurableWatermark,
+	segments *cdc.SegmentCatalog,
+) error {
 	archive := filepath.Join(cfg.Dir, "dump", "schema.dump")
 	service := schemaService(cfg, store)
 	entries, err := service.List(ctx, archive)
@@ -792,9 +802,44 @@ func resumeIndexes(ctx context.Context, cfg config.Config, store *state.Store) e
 			return restoreDeferredOnce(ctx, cfg, store, service, archive, entries, restoreArgs)
 		},
 	}
-	if err := runner.Run(ctx, indexes, constraints); err != nil {
+	replayPlan := indexbuild.PlanReplay(indexes, constraints)
+	if err := runner.RunCritical(ctx, replayPlan); err != nil {
 		return err
 	}
+	if err := store.CompleteStep(
+		ctx, replayCriticalIndexesStep,
+		fmt.Sprintf("%d critical indexes", len(replayPlan.CriticalIndexes)),
+	); err != nil {
+		return err
+	}
+	return runApplierToFollow(
+		ctx, cfg, store, snapshot, durable, segments, state.PhaseIndexes,
+		func(ctx context.Context) error {
+			return runDeferredTargetMaintenance(ctx, cfg, store, sessionGUCs, runner, replayPlan)
+		},
+	)
+}
+
+func runDeferredTargetMaintenance(
+	ctx context.Context,
+	cfg config.Config,
+	store *state.Store,
+	sessionGUCs map[string]string,
+	runner indexbuild.Runner,
+	plan indexbuild.ReplayPlan,
+) error {
+	if err := runner.RunDeferred(ctx, plan); err != nil {
+		return err
+	}
+	if err := store.CompleteStep(
+		ctx, deferredIndexesStep,
+		fmt.Sprintf("%d deferred indexes", len(plan.DeferredIndexes)),
+	); err != nil {
+		return err
+	}
+	// VACUUM runs after deferred index construction to avoid PostgreSQL lock
+	// cycles between CREATE INDEX CONCURRENTLY and VACUUM on the same relation.
+	// Both still overlap CDC replay, which is the latency-sensitive operation.
 	return vacuumTarget(ctx, cfg, store, sessionGUCs)
 }
 
@@ -1335,6 +1380,7 @@ func runApplierToFollow(
 	durable *cdc.DurableWatermark,
 	segments *cdc.SegmentCatalog,
 	phase state.Phase,
+	maintenance func(context.Context) error,
 ) error {
 	migration, err := store.Migration(ctx)
 	if err != nil {
@@ -1374,12 +1420,37 @@ func runApplierToFollow(
 		return runApplierWithPruner(ctx, applier, pruner, store)
 	}
 	boundary := durable.Load()
+	if phase == state.PhaseIndexes {
+		boundary, err = replayStartBoundary(ctx, store, boundary)
+		if err != nil {
+			return err
+		}
+	}
 	applyCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	result := make(chan error, 1)
 	go func() { result <- runApplierWithPruner(applyCtx, applier, pruner, store) }()
-	if err := awaitCatchup(ctx, boundary, applier.WaitUntil, result); err != nil {
+	var overlapStarted func() error
+	if phase == state.PhaseIndexes {
+		overlapStarted = func() error {
+			logEvent(cfg.Dir, "cdc_apply_start", map[string]any{
+				"phase": state.PhaseIndexes, "catchup_boundary": pglogrepl.LSN(boundary).String(),
+			})
+			return pauseForCrashTest(ctx, state.Phase("indexes-overlap"))
+		}
+	}
+	if err := awaitCatchupAndMaintenance(
+		ctx, boundary, applier.WaitUntil, result, maintenance, overlapStarted,
+	); err != nil {
 		return err
+	}
+	if phase == state.PhaseIndexes {
+		if err := transition(ctx, cfg, store, state.PhaseCatchup); err != nil {
+			return err
+		}
+		if err := pauseForCrashTest(ctx, state.PhaseCatchup); err != nil {
+			return err
+		}
 	}
 	if err := transition(ctx, cfg, store, state.PhaseFollow); err != nil {
 		return err
@@ -1394,6 +1465,79 @@ func runApplierToFollow(
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func replayStartBoundary(
+	ctx context.Context,
+	store *state.Store,
+	current cdc.LSN,
+) (cdc.LSN, error) {
+	step, exists, err := store.Step(ctx, cdcApplyStartedStep)
+	if err != nil {
+		return 0, err
+	}
+	if exists && step.Completed {
+		value, err := pglogrepl.ParseLSN(step.Detail)
+		if err != nil {
+			return 0, fmt.Errorf("parse durable CDC apply-start boundary %q: %w", step.Detail, err)
+		}
+		return cdc.LSN(value), nil
+	}
+	detail := pglogrepl.LSN(current).String()
+	if err := store.CompleteStep(ctx, cdcApplyStartedStep, detail); err != nil {
+		return 0, err
+	}
+	return current, nil
+}
+
+func awaitCatchupAndMaintenance(
+	ctx context.Context,
+	boundary cdc.LSN,
+	wait func(context.Context, cdc.LSN) error,
+	applier <-chan error,
+	maintenance func(context.Context) error,
+	started func() error,
+) error {
+	waitCtx, cancelWait := context.WithCancel(ctx)
+	defer cancelWait()
+	waited := make(chan error, 1)
+	go func() { waited <- wait(waitCtx, boundary) }()
+	maintained := make(chan error, 1)
+	if maintenance == nil {
+		maintained <- nil
+	} else {
+		go func() { maintained <- maintenance(ctx) }()
+	}
+	if started != nil {
+		if err := started(); err != nil {
+			return err
+		}
+	}
+	caughtUp, maintenanceDone := false, false
+	for !caughtUp || !maintenanceDone {
+		select {
+		case err := <-applier:
+			if err == nil {
+				err = errors.New("the CDC applier stopped before post-copy work completed")
+			}
+			return err
+		case err := <-waited:
+			if err != nil {
+				return err
+			}
+			caughtUp = true
+			waited = nil
+		case err := <-maintained:
+			if err != nil {
+				return err
+			}
+			maintenanceDone = true
+			maintained = nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 func runApplierWithPruner(
@@ -1467,8 +1611,19 @@ func waitForRecoveredFollow(ctx context.Context, store *state.Store) error {
 		if err != nil {
 			return err
 		}
-		if migration.Phase == state.PhaseFollow && migration.EndPosition == "" {
-			return nil
+		if migration.EndPosition == "" {
+			if migration.Phase == state.PhaseFollow {
+				return nil
+			}
+			if migration.Phase == state.PhaseIndexes {
+				started, err := store.StepCompleted(ctx, cdcApplyStartedStep)
+				if err != nil {
+					return err
+				}
+				if started {
+					return nil
+				}
+			}
 		}
 		select {
 		case <-ctx.Done():

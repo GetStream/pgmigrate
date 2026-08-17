@@ -33,7 +33,11 @@ type Index struct {
 	// Those are stored as parse trees, which PostgreSQL may normalize into a
 	// shape that deparses differently from the text it was given, so their
 	// rendering cannot be compared across two databases.
-	Expression                     bool
+	Expression bool
+	// Unique indexes and replica-identity indexes must exist before CDC replay
+	// starts. Without them, replay can silently accept duplicate keys or turn
+	// keyed UPDATE/DELETE operations into heap scans.
+	Unique, ReplicaIdentity        bool
 	ConstraintOID                  uint32
 	ConstraintName, ConstraintType string
 	// ConstraintDefinition is pg_get_constraintdef for the primary key or
@@ -85,6 +89,7 @@ func Inventory(ctx context.Context, source *pgx.Conn, selected func(uint32) bool
 		       nt.nspname, t.relname, x.relname,
 		       pg_get_indexdef(i.indexrelid), pg_relation_size(i.indexrelid),
 		       t.relkind='p', i.indexprs IS NOT NULL OR i.indpred IS NOT NULL,
+		       i.indisunique, i.indisreplident,
 		       coalesce(np.nspname,''), coalesce(xp.relname,''),
 		       coalesce(c.oid,0), coalesce(c.conname,''), coalesce(c.contype::text,''),
 		       coalesce(pg_get_constraintdef(c.oid,true),''),
@@ -105,6 +110,7 @@ func Inventory(ctx context.Context, source *pgx.Conn, selected func(uint32) bool
 		var x Index
 		if err := rows.Scan(&x.OID, &x.TableOID, &x.SelectedOID, &x.Schema, &x.Table, &x.Name,
 			&x.Definition, &x.Bytes, &x.Partitioned, &x.Expression,
+			&x.Unique, &x.ReplicaIdentity,
 			&x.ParentIndexSchema, &x.ParentIndexName,
 			&x.ConstraintOID, &x.ConstraintName, &x.ConstraintType, &x.ConstraintDefinition,
 			&x.ConstraintDeferrable, &x.ConstraintInitiallyDeferred); err != nil {
@@ -180,9 +186,106 @@ type Runner struct {
 	Log                           func(event string, values map[string]any)
 }
 
+// ReplayPlan separates objects required for correct CDC replay from secondary
+// indexes that can be built concurrently with replay.
+type ReplayPlan struct {
+	CriticalIndexes []Index
+	DeferredIndexes []Index
+	Constraints     []Constraint
+}
+
+// PlanReplay classifies all uniqueness, replica identity, constraint-backed,
+// and partitioned-parent indexes as replay critical. Partition children inherit
+// criticality from their parent index.
+func PlanReplay(indexes []Index, constraints []Constraint) ReplayPlan {
+	criticalNames := make(map[string]bool, len(indexes))
+	isCritical := make(map[uint32]bool, len(indexes))
+	for _, x := range indexes {
+		critical := x.ConstraintOID != 0 || x.Unique || x.ReplicaIdentity || x.Partitioned
+		isCritical[x.OID] = critical
+		if critical {
+			criticalNames[indexName(x.Schema, x.Name)] = true
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, x := range indexes {
+			if isCritical[x.OID] || x.ParentIndexName == "" ||
+				!criticalNames[indexName(x.ParentIndexSchema, x.ParentIndexName)] {
+				continue
+			}
+			isCritical[x.OID] = true
+			criticalNames[indexName(x.Schema, x.Name)] = true
+			changed = true
+		}
+	}
+	plan := ReplayPlan{Constraints: append([]Constraint(nil), constraints...)}
+	for _, x := range indexes {
+		if isCritical[x.OID] {
+			plan.CriticalIndexes = append(plan.CriticalIndexes, x)
+		} else {
+			plan.DeferredIndexes = append(plan.DeferredIndexes, x)
+		}
+	}
+	return plan
+}
+
+func indexName(schema, name string) string { return schema + "\x00" + name }
+
 // Run builds largest indexes first, attaches PK/unique constraints, creates
-// foreign keys NOT VALID then validates them, and analyzes affected tables.
+// foreign keys NOT VALID then validates them, and restores managed post-data.
 func (r Runner) Run(ctx context.Context, indexes []Index, constraints []Constraint) error {
+	if err := r.prepare(ctx, indexes, constraints); err != nil {
+		return err
+	}
+	indexes = LargestFirst(indexes)
+	if err := r.runIndexes(ctx, indexes, false); err != nil {
+		return err
+	}
+	if err := r.attachPartitionIndexes(ctx, indexes); err != nil {
+		return err
+	}
+	if err := r.runConstraints(ctx, constraints); err != nil {
+		return err
+	}
+	return r.runAfterManaged(ctx)
+}
+
+// RunCritical builds everything that must exist before CDC replay can safely
+// start. It also restores deferred rules and triggers before replay so their
+// appearance cannot change apply semantics mid-stream.
+func (r Runner) RunCritical(ctx context.Context, plan ReplayPlan) error {
+	allIndexes := append(append([]Index(nil), plan.CriticalIndexes...), plan.DeferredIndexes...)
+	if err := r.prepare(ctx, allIndexes, plan.Constraints); err != nil {
+		return err
+	}
+	indexes := LargestFirst(plan.CriticalIndexes)
+	if err := r.runIndexes(ctx, indexes, false); err != nil {
+		return err
+	}
+	if err := r.attachPartitionIndexes(ctx, indexes); err != nil {
+		return err
+	}
+	if err := r.runConstraints(ctx, plan.Constraints); err != nil {
+		return err
+	}
+	return r.runAfterManaged(ctx)
+}
+
+// RunDeferred builds non-unique secondary indexes with PostgreSQL's concurrent
+// algorithm so target DML remains available to the CDC applier.
+func (r Runner) RunDeferred(ctx context.Context, plan ReplayPlan) error {
+	if err := r.prepare(ctx, plan.DeferredIndexes, nil); err != nil {
+		return err
+	}
+	indexes := LargestFirst(plan.DeferredIndexes)
+	if err := r.runIndexes(ctx, indexes, true); err != nil {
+		return err
+	}
+	return r.attachPartitionIndexes(ctx, indexes)
+}
+
+func (r *Runner) prepare(ctx context.Context, indexes []Index, constraints []Constraint) error {
 	if r.Target == nil || r.State == nil {
 		return errors.New("target and state are required")
 	}
@@ -199,13 +302,10 @@ func (r Runner) Run(ctx context.Context, indexes []Index, constraints []Constrai
 			return err
 		}
 	}
-	indexes = LargestFirst(indexes)
-	if err := r.runIndexes(ctx, indexes); err != nil {
-		return err
-	}
-	if err := r.attachPartitionIndexes(ctx, indexes); err != nil {
-		return err
-	}
+	return nil
+}
+
+func (r Runner) runConstraints(ctx context.Context, constraints []Constraint) error {
 	var foreign []Constraint
 	for _, c := range constraints {
 		done, err := r.State.ConstraintCompleted(ctx, c.OID)
@@ -229,6 +329,10 @@ func (r Runner) Run(ctx context.Context, indexes []Index, constraints []Constrai
 	if err := r.validateForeignKeys(ctx, foreign); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (r Runner) runAfterManaged(ctx context.Context) error {
 	if r.AfterManaged != nil {
 		if err := r.AfterManaged(ctx); err != nil {
 			return fmt.Errorf("restore deferred post-data: %w", err)
@@ -249,7 +353,7 @@ func LargestFirst(indexes []Index) []Index {
 	return result
 }
 
-func (r Runner) runIndexes(ctx context.Context, indexes []Index) error {
+func (r Runner) runIndexes(ctx context.Context, indexes []Index, concurrently bool) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	jobs := make(chan Index)
@@ -263,7 +367,7 @@ func (r Runner) runIndexes(ctx context.Context, indexes []Index) error {
 			for x := range jobs {
 				done, err := r.State.IndexCompleted(runCtx, x.OID)
 				if err == nil && !done {
-					err = r.ensureIndex(runCtx, x)
+					err = r.ensureIndexMode(runCtx, x, concurrently)
 					if err == nil {
 						err = r.State.CompleteIndex(runCtx, x.OID)
 					}
@@ -349,6 +453,7 @@ type targetIndex struct {
 	OID                            uint32
 	TableSchema, Table, Definition string
 	Expression                     bool
+	Valid, Ready                   bool
 	ConstraintName, ConstraintType string
 	ConstraintDeferrable           bool
 	ConstraintInitiallyDeferred    bool
@@ -364,6 +469,7 @@ func (r Runner) inspectIndex(ctx context.Context, x Index) (targetIndex, bool, e
 	err = conn.QueryRow(ctx, `
 		SELECT i.indexrelid, nt.nspname, t.relname, pg_get_indexdef(i.indexrelid),
 		       i.indexprs IS NOT NULL OR i.indpred IS NOT NULL,
+		       i.indisvalid, i.indisready,
 		       coalesce(c.conname,''),coalesce(c.contype::text,''),
 		       coalesce(c.condeferrable,false),coalesce(c.condeferred,false)
 		FROM pg_class ix JOIN pg_namespace ni ON ni.oid=ix.relnamespace
@@ -373,6 +479,7 @@ func (r Runner) inspectIndex(ctx context.Context, x Index) (targetIndex, bool, e
 		LEFT JOIN pg_constraint c ON c.conindid=i.indexrelid
 		WHERE ni.nspname=$1 AND ix.relname=$2`, x.Schema, x.Name).
 		Scan(&got.OID, &got.TableSchema, &got.Table, &got.Definition, &got.Expression,
+			&got.Valid, &got.Ready,
 			&got.ConstraintName, &got.ConstraintType, &got.ConstraintDeferrable,
 			&got.ConstraintInitiallyDeferred)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -385,16 +492,30 @@ func (r Runner) inspectIndex(ctx context.Context, x Index) (targetIndex, bool, e
 }
 
 func (r Runner) ensureIndex(ctx context.Context, x Index) error {
+	return r.ensureIndexMode(ctx, x, false)
+}
+
+func (r Runner) ensureIndexMode(ctx context.Context, x Index, concurrently bool) error {
 	got, exists, err := r.inspectIndex(ctx, x)
 	if err != nil {
 		return err
+	}
+	if exists && (!got.Valid || !got.Ready) {
+		if !concurrently {
+			return fmt.Errorf("index %s.%s exists but is not valid and ready", x.Schema, x.Name)
+		}
+		if err := r.dropInvalidConcurrentIndex(ctx, x); err != nil {
+			return err
+		}
+		exists = false
+		got = targetIndex{}
 	}
 	if exists {
 		if err := r.matchIndex(ctx, x, got); err != nil {
 			return err
 		}
 	} else {
-		if err := r.createIndex(ctx, x); err != nil {
+		if err := r.createIndexMode(ctx, x, concurrently); err != nil {
 			return err
 		}
 		got, exists, err = r.inspectIndex(ctx, x)
@@ -460,6 +581,14 @@ func (r Runner) ensureIndex(ctx context.Context, x Index) error {
 			Have: fmt.Sprintf("%s %s deferrable=%v deferred=%v", got.ConstraintType, got.ConstraintName, got.ConstraintDeferrable, got.ConstraintInitiallyDeferred),
 			Want: fmt.Sprintf("%s %s deferrable=%v deferred=%v", x.ConstraintType, x.ConstraintName, x.ConstraintDeferrable, x.ConstraintInitiallyDeferred),
 		}
+	}
+	return nil
+}
+
+func (r Runner) dropInvalidConcurrentIndex(ctx context.Context, x Index) error {
+	if err := r.exec(ctx, "DROP INDEX CONCURRENTLY IF EXISTS "+
+		pgx.Identifier{x.Schema, x.Name}.Sanitize()); err != nil {
+		return fmt.Errorf("drop invalid concurrent index %s.%s: %w", x.Schema, x.Name, err)
 	}
 	return nil
 }
@@ -563,6 +692,10 @@ func (r Runner) inspectConstraint(ctx context.Context, c Constraint) (targetCons
 // keeps it off the partitions, which carry their own constraints and attach to
 // this one.
 func (r Runner) createIndex(ctx context.Context, x Index) error {
+	return r.createIndexMode(ctx, x, false)
+}
+
+func (r Runner) createIndexMode(ctx context.Context, x Index, concurrently bool) error {
 	if x.Partitioned && x.ConstraintOID != 0 {
 		if x.ConstraintDefinition == "" {
 			return fmt.Errorf("constraint %s on partitioned table %s.%s has no definition",
@@ -576,10 +709,31 @@ func (r Runner) createIndex(ctx context.Context, x Index) error {
 		}
 		return nil
 	}
-	if err := r.exec(ctx, x.Definition); err != nil {
+	definition := x.Definition
+	if concurrently {
+		var err error
+		definition, err = concurrentIndexDefinition(x)
+		if err != nil {
+			return err
+		}
+	}
+	if err := r.exec(ctx, definition); err != nil {
 		return fmt.Errorf("create index %s.%s: %w", x.Schema, x.Name, err)
 	}
 	return nil
+}
+
+func concurrentIndexDefinition(x Index) (string, error) {
+	if x.Partitioned || x.ConstraintOID != 0 || x.Unique || x.ReplicaIdentity {
+		return "", fmt.Errorf("index %s.%s is replay-critical and cannot be deferred", x.Schema, x.Name)
+	}
+	const prefix = "CREATE INDEX"
+	if len(x.Definition) <= len(prefix) ||
+		!strings.EqualFold(x.Definition[:len(prefix)], prefix) ||
+		x.Definition[len(prefix)] != ' ' {
+		return "", fmt.Errorf("index %s.%s has unsupported definition %q", x.Schema, x.Name, x.Definition)
+	}
+	return x.Definition[:len(prefix)] + " CONCURRENTLY" + x.Definition[len(prefix):], nil
 }
 
 // attachPartitionIndexes attaches every partition's index to the partitioned

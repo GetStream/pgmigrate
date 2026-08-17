@@ -283,6 +283,30 @@ func (s *Store) PendingSteps(ctx context.Context) ([]Step, error) {
 	return s.listSteps(ctx, true)
 }
 
+// Step returns one durable orchestrator step.
+func (s *Store) Step(ctx context.Context, name string) (Step, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return Step{}, false, ErrClosed
+	}
+	var item Step
+	var completedAt int64
+	err := s.db.QueryRowContext(
+		ctx,
+		"SELECT name, detail, completed, completed_at FROM steps WHERE name=?",
+		name,
+	).Scan(&item.Name, &item.Detail, &item.Completed, &completedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Step{}, false, nil
+	}
+	if err != nil {
+		return Step{}, false, fmt.Errorf("read step %s: %w", name, err)
+	}
+	item.CompletedAt = fromUnixNano(completedAt)
+	return item, true, nil
+}
+
 func (s *Store) listSteps(ctx context.Context, pending bool) ([]Step, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

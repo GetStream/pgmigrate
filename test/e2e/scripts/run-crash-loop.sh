@@ -90,8 +90,36 @@ crash_at() {
     echo "crash-loop: killed at $phase"
 }
 
+crash_during_overlap() {
+    echo "crash-loop: starting for indexes-overlap"
+    # shellcheck disable=SC2086
+    PGMIGRATE_TEST_PAUSE_PHASE=indexes-overlap "$binary" run $common_args >>"$migration_dir/run.log" 2>&1 &
+    run_pid=$!
+    attempts=0
+    while [ "$attempts" -lt "$phase_timeout" ]; do
+        if awk '/"event":"cdc_apply_start"/ { found=1 } END { exit !found }' "$migration_dir/log/pgmigrate.log" 2>/dev/null; then
+            kill -9 "$run_pid"
+            wait "$run_pid" 2>/dev/null || true
+            run_pid=
+            echo "crash-loop: killed during indexes-overlap"
+            return 0
+        fi
+        if ! kill -0 "$run_pid" 2>/dev/null; then
+            wait "$run_pid" || true
+            echo "run exited while waiting for indexes-overlap" >&2
+            awk '{print}' "$migration_dir/run.log" >&2
+            return 1
+        fi
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+    echo "indexes-overlap not reached in ${phase_timeout}s" >&2
+    return 1
+}
+
 crash_at copy
 crash_at indexes
+crash_during_overlap
 crash_at catchup
 crash_at follow
 
@@ -99,7 +127,7 @@ crash_at follow
 "$binary" run $common_args >>"$migration_dir/run.log" 2>&1 &
 run_pid=$!
 wait_phase follow
-# Four kills and four resumes have each re-derived the tuning. The target must
+# Five kills and five resumes have each re-derived the tuning. The target must
 # still be tuned, and the recorded originals must still be the pre-migration
 # values rather than a bulk-load value recorded over them by a resume.
 "$E2E_DIR/scripts/assert-tuning.sh" applied
