@@ -50,8 +50,17 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 		t, "PGMIGRATE_CDC_BENCH_MIN_CHANGES_PER_SECOND", 200_000,
 	)
 	accountCount := 20_000
+	accountCount = benchmarkPositiveIntEnv(
+		t, "PGMIGRATE_CDC_BENCH_ACCOUNT_COUNT", accountCount,
+	)
+	barrierEvery := benchmarkNonNegativeIntEnv(
+		t, "PGMIGRATE_CDC_BENCH_BARRIER_EVERY", 0,
+	)
 	sessionCount := transactionCount * cdcReplayDeletesPerTransaction
 	expectedChanges := transactionCount * cdcReplayChangesPerTransaction
+	if barrierEvery > 0 {
+		expectedChanges += (transactionCount-1)/barrierEvery + 1
+	}
 
 	source := pgtest.Start(t, 17)
 	target := pgtest.Start(t, 17)
@@ -70,7 +79,8 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 		CREATE PUBLICATION pgmigrate_cdc_replay_benchmark
 		FOR TABLE cdc_benchmark.accounts,
 		          cdc_benchmark.events,
-		          cdc_benchmark.sessions
+		          cdc_benchmark.sessions,
+		          cdc_benchmark.guarded
 	`); err != nil {
 		t.Fatalf("create benchmark publication: %v", err)
 	}
@@ -171,20 +181,24 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 	})
 
 	for batch := 0; batch < transactionCount; batch++ {
-		var inserted, updated, deleted int
+		var inserted, updated, deleted, guarded int
 		if err := sourceSQL.QueryRow(
-			ctx, cdcReplayWorkloadSQL, batch, accountCount,
-		).Scan(&inserted, &updated, &deleted); err != nil {
+			ctx, cdcReplayWorkloadSQL, batch, accountCount, barrierEvery,
+		).Scan(&inserted, &updated, &deleted, &guarded); err != nil {
 			t.Fatalf("emit CDC benchmark transaction %d: %v", batch, err)
+		}
+		expectedGuarded := 0
+		if barrierEvery > 0 && batch%barrierEvery == 0 {
+			expectedGuarded = 1
 		}
 		if inserted != cdcReplayInsertsPerTransaction ||
 			updated != cdcReplayUpdatesPerTransaction ||
-			deleted != cdcReplayDeletesPerTransaction {
+			deleted != cdcReplayDeletesPerTransaction || guarded != expectedGuarded {
 			t.Fatalf(
-				"benchmark transaction %d changed insert/update/delete=%d/%d/%d, want %d/%d/%d",
-				batch, inserted, updated, deleted,
+				"benchmark transaction %d changed insert/update/delete/guarded=%d/%d/%d/%d, want %d/%d/%d/%d",
+				batch, inserted, updated, deleted, guarded,
 				cdcReplayInsertsPerTransaction, cdcReplayUpdatesPerTransaction,
-				cdcReplayDeletesPerTransaction,
+				cdcReplayDeletesPerTransaction, expectedGuarded,
 			)
 		}
 	}
@@ -303,7 +317,7 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 		t.Fatalf("stop benchmark applier: %v", err)
 	}
 
-	for _, table := range []string{"accounts", "events", "sessions"} {
+	for _, table := range []string{"accounts", "events", "sessions", "guarded"} {
 		sourceCount, sourceDigest := benchmarkTableDigest(t, sourceSQL, table)
 		targetCount, targetDigest := benchmarkTableDigest(t, targetSQL, table)
 		if sourceCount != targetCount || sourceDigest != targetDigest {
@@ -316,8 +330,9 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 
 	rate := float64(expectedChanges) / elapsed.Seconds()
 	t.Logf(
-		"cdc_replay changes=%d source_transactions=%d elapsed=%s changes_per_second=%.0f target=%.0f",
-		expectedChanges, transactionCount, elapsed.Round(time.Millisecond), rate, minimumRate,
+		"cdc_replay changes=%d source_transactions=%d accounts=%d barrier_every=%d elapsed=%s changes_per_second=%.0f target=%.0f",
+		expectedChanges, transactionCount, accountCount, barrierEvery,
+		elapsed.Round(time.Millisecond), rate, minimumRate,
 	)
 	if rate < minimumRate {
 		t.Fatalf(
@@ -388,6 +403,12 @@ func cdcReplayFixtureSQL(accountCount, sessionCount int) string {
 		CREATE INDEX sessions_account_idx ON cdc_benchmark.sessions (account_id);
 		CREATE INDEX sessions_expiry_idx ON cdc_benchmark.sessions (expires_at);
 
+		CREATE TABLE cdc_benchmark.guarded (
+			id bigint PRIMARY KEY,
+			revision integer NOT NULL,
+			payload text NOT NULL CHECK (payload <> '')
+		);
+
 		INSERT INTO cdc_benchmark.accounts
 		SELECT id,
 		       ((id - 1) %% 500) + 1,
@@ -403,6 +424,10 @@ func cdcReplayFixtureSQL(accountCount, sessionCount int) string {
 		       md5('session-' || id::text),
 		       TIMESTAMPTZ '2026-02-01 00:00:00+00' + id * interval '1 second'
 		FROM generate_series(1, %d) AS id;
+
+		INSERT INTO cdc_benchmark.guarded
+		SELECT id, 0, md5('guarded-' || id::text)
+		FROM generate_series(1, 1024) AS id;
 	`, accountCount, accountCount, sessionCount)
 }
 
@@ -437,10 +462,20 @@ const cdcReplayWorkloadSQL = `
 		USING generate_series(1, 1) AS item
 		WHERE session.id = $1::bigint + item
 		RETURNING 1
+	),
+	guarded AS (
+		UPDATE cdc_benchmark.guarded AS guarded_row
+		SET revision = guarded_row.revision + 1,
+		    payload = md5($1::text || ':' || guarded_row.id::text)
+		WHERE $1::bigint % NULLIF($3::bigint, 0) = 0
+		  AND guarded_row.id =
+		      (($1::bigint / NULLIF($3::bigint, 0)) % 1024) + 1
+		RETURNING 1
 	)
 	SELECT (SELECT count(*) FROM inserted),
 	       (SELECT count(*) FROM updated),
-	       (SELECT count(*) FROM deleted)
+	       (SELECT count(*) FROM deleted),
+	       (SELECT count(*) FROM guarded)
 `
 
 func benchmarkTableDigest(t *testing.T, conn *pgx.Conn, table string) (int64, string) {
@@ -483,6 +518,19 @@ func benchmarkPositiveFloatEnv(t *testing.T, name string, fallback float64) floa
 	parsed, err := strconv.ParseFloat(value, 64)
 	if err != nil || parsed <= 0 {
 		t.Fatalf("%s must be a positive number, got %q", name, value)
+	}
+	return parsed
+}
+
+func benchmarkNonNegativeIntEnv(t *testing.T, name string, fallback int) int {
+	t.Helper()
+	value := os.Getenv(name)
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 0 {
+		t.Fatalf("%s must be a non-negative integer, got %q", name, value)
 	}
 	return parsed
 }

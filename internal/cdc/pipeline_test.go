@@ -246,6 +246,166 @@ func TestArrayParamTextEscapingAndMixedFallback(t *testing.T) {
 	}
 }
 
+func TestTextCopyStageDataEscapesNullEmptyAndControlBytes(t *testing.T) {
+	t.Parallel()
+	relation := preparationRelation()
+	relation.source.Columns[1].Type = 20000
+	column := relation.columns[1]
+	column.oid = 20000
+	data, supported, err := textCopyStageData(
+		relation,
+		ChangeInsert,
+		[]targetColumn{column},
+		[]TupleDatum{
+			{Kind: DatumNull},
+			{Kind: DatumText},
+			{Kind: DatumText, Data: []byte(`\N`)},
+			{Kind: DatumText, Data: []byte("a\tb\nc\r\\d\be\ff\vg")},
+		},
+		4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !supported {
+		t.Fatal("text stage unexpectedly unsupported")
+	}
+	want := "0\t\\N\n1\t\n2\t\\\\N\n3\ta\\tb\\nc\\r\\\\d\\be\\ff\\vg\n"
+	if string(data) != want {
+		t.Fatalf("stage data = %q, want %q", data, want)
+	}
+
+	_, supported, err = textCopyStageData(
+		relation,
+		ChangeInsert,
+		[]targetColumn{column},
+		[]TupleDatum{{Kind: DatumBinary}},
+		1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supported {
+		t.Fatal("binary datum unexpectedly supported by text stage")
+	}
+}
+
+func TestTextCopyStageNameTracksShapeAndOperation(t *testing.T) {
+	t.Parallel()
+	relation := preparationRelation()
+	relation.columns[1].oid = 20000
+	insert := textCopyStageName(relation, ChangeInsert, relation.columns)
+	if insert != textCopyStageName(relation, ChangeInsert, relation.columns) {
+		t.Fatal("stage name is not deterministic")
+	}
+	if insert == textCopyStageName(relation, ChangeUpdate, relation.columns) {
+		t.Fatal("insert and update stages share a name")
+	}
+	if insert == textCopyStageName(relation, ChangeInsert, relation.columns[:1]) {
+		t.Fatal("different stage shapes share a name")
+	}
+}
+
+func TestRelationReplayPlanIsolatesOrderedBarriers(t *testing.T) {
+	t.Parallel()
+	safeA := &targetRelation{capabilities: targetRelationCapabilities{relationLane: true}}
+	safeB := &targetRelation{capabilities: targetRelationCapabilities{relationLane: true}}
+	ordered := &targetRelation{}
+	transactions := []Transaction{
+		{Changes: []Change{
+			{RelationOID: 1, Kind: ChangeInsert},
+			{RelationOID: 2, Kind: ChangeInsert},
+		}},
+		{Changes: []Change{
+			{RelationOID: 3, Kind: ChangeInsert},
+			{RelationOID: 3, Kind: ChangeUpdate},
+		}},
+		{Changes: []Change{
+			{RelationOID: 1, Kind: ChangeDelete},
+			{RelationOID: 2, Kind: ChangeUpdate},
+		}},
+	}
+	relations := []map[uint32]*targetRelation{
+		{1: safeA, 2: safeB},
+		{3: ordered},
+		{1: safeA, 2: safeB},
+	}
+	steps, planned, err := planRelationBatchedChanges(
+		relations, transactions, make([]*sampleCollector, len(transactions)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !planned || len(steps) != 3 {
+		t.Fatalf("planned=%t steps=%d, want true/3", planned, len(steps))
+	}
+	if steps[0].ordered || len(steps[0].lanes) != 2 ||
+		!steps[1].ordered || len(steps[1].items) != 2 ||
+		steps[2].ordered || len(steps[2].lanes) != 2 {
+		t.Fatalf("unexpected replay plan: %#v", steps)
+	}
+	if steps[1].items[0].transactionIndex != 1 || steps[1].items[1].transactionIndex != 1 {
+		t.Fatalf("ordered barrier lost source transaction: %#v", steps[1].items)
+	}
+}
+
+func TestRelationReplayPlanTreatsTruncateAsBarrierAndSpillAsFallback(t *testing.T) {
+	t.Parallel()
+	safe := &targetRelation{capabilities: targetRelationCapabilities{relationLane: true}}
+	transactions := []Transaction{{Changes: []Change{
+		{RelationOID: 1, Kind: ChangeInsert},
+		{RelationOID: 1, Kind: ChangeTruncate},
+		{RelationOID: 1, Kind: ChangeInsert},
+	}}}
+	steps, planned, err := planRelationBatchedChanges(
+		[]map[uint32]*targetRelation{{1: safe}}, transactions, []*sampleCollector{nil},
+	)
+	if err != nil || !planned || len(steps) != 3 || !steps[1].ordered {
+		t.Fatalf("truncate plan=%#v planned=%t err=%v", steps, planned, err)
+	}
+
+	transactions[0].Spill = &TransactionSpill{}
+	steps, planned, err = planRelationBatchedChanges(
+		[]map[uint32]*targetRelation{{1: safe}}, transactions, []*sampleCollector{nil},
+	)
+	if err != nil || planned || steps != nil {
+		t.Fatalf("spill plan=%#v planned=%t err=%v", steps, planned, err)
+	}
+}
+
+func TestBatchUpdateOmitsUnchangedIdentityAndRejectsUniqueAssignments(t *testing.T) {
+	t.Parallel()
+	relation := preparationRelation()
+	relation.columns[0].conflicting = true
+	change := Change{
+		Old: &Tuple{
+			{Kind: DatumText, Data: []byte("7")},
+			{Kind: DatumNull},
+		},
+		New: &Tuple{
+			{Kind: DatumText, Data: []byte("7")},
+			{Kind: DatumText, Data: []byte("new")},
+		},
+	}
+	setColumns := updateSetColumnIndexes(relation, &change)
+	if !slices.Equal(setColumns, []int{1}) || !updateSetColumnsBatchSafe(relation, setColumns) {
+		t.Fatalf("unchanged identity set columns=%v safe=%t", setColumns, updateSetColumnsBatchSafe(relation, setColumns))
+	}
+
+	(*change.New)[0].Data = []byte("8")
+	setColumns = updateSetColumnIndexes(relation, &change)
+	if !slices.Equal(setColumns, []int{0, 1}) || updateSetColumnsBatchSafe(relation, setColumns) {
+		t.Fatalf("changed identity set columns=%v safe=%t", setColumns, updateSetColumnsBatchSafe(relation, setColumns))
+	}
+
+	(*change.New)[0].Data = []byte("7")
+	relation.columns[1].conflicting = true
+	setColumns = updateSetColumnIndexes(relation, &change)
+	if updateSetColumnsBatchSafe(relation, setColumns) {
+		t.Fatalf("unique non-identity assignment was batch safe: %v", setColumns)
+	}
+}
+
 func TestApplyPreparationPreservesTruncateOptionsAndBoundaries(t *testing.T) {
 	t.Parallel()
 	change := Change{
@@ -321,6 +481,9 @@ func preparationRelation() *targetRelation {
 			},
 		},
 		quoted: `"Odd Schema"."order"`,
+		capabilities: targetRelationCapabilities{
+			relationLane: true, keyedSetDML: true, binaryCopy: true, textCopyStage: true,
+		},
 		columns: []targetColumn{
 			{name: "select", quoted: `"select"`, oid: 23, key: true, sourceIndex: 0, notNull: true},
 			{name: "payload", quoted: `"payload"`, oid: 25, sourceIndex: 1},

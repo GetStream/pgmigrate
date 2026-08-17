@@ -79,3 +79,15 @@ func (c *applyStatementCache) acquire(
 	c.entries[key] = statement
 	return statement, true, evicted
 }
+
+// invalidate forgets statements after a failed pipeline. A command error can
+// skip later Parse messages even though acquire already admitted their names.
+// Keep nextID monotonic so any server-side statements that did survive the
+// rollback cannot collide with replacements.
+func (c *applyStatementCache) invalidate() {
+	if c == nil {
+		return
+	}
+	c.entries = make(map[applyStatementKey]*applyPreparedStatement, c.capacity)
+	c.lru.Init()
+}

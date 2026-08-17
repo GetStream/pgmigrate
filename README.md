@@ -781,6 +781,7 @@ make race
 PGTEST_MAJORS=17 make integration
 PGTEST_MAJORS=16,17,18 make integration
 make bench
+make cdc-bench
 make e2e
 make crash-e2e
 ```
@@ -790,6 +791,14 @@ runtime. The PostgreSQL 17 Compose e2e harness independently checks final table
 inventory, row counts, and canonical row digests, including one digest per leaf
 partition and a comparison of every index and constraint definition in the
 schema.
+
+`make cdc-bench` times only replay of a durable 500,000-change backlog and
+compares full source/target table digests. Use
+`PGMIGRATE_CDC_BENCH_BARRIER_EVERY=N` to add a check-constrained ordering
+barrier every N source transactions, and `PGMIGRATE_CDC_BENCH_ACCOUNT_COUNT=N`
+to exercise hot-key skew. Transaction count and the minimum accepted rate are
+controlled by `PGMIGRATE_CDC_BENCH_TRANSACTIONS` and
+`PGMIGRATE_CDC_BENCH_MIN_CHANGES_PER_SECOND`.
 
 ## Limitations
 

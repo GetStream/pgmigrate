@@ -3,6 +3,7 @@ package cdc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -420,7 +421,20 @@ type targetRelation struct {
 	mappedColumns    []targetColumn
 	generatedColumns []targetColumn
 	overrideIdentity bool
-	reorderSafe      bool
+	capabilities     targetRelationCapabilities
+}
+
+// targetRelationCapabilities separates ordering safety from the available
+// transport. A relation that cannot cross an ordering barrier may still admit
+// set-based DML inside its original source position (for example, an enum table
+// whose values need a typed COPY stage instead of built-in binary arrays).
+// Keeping these decisions independent prevents one slow relation from forcing
+// every otherwise-independent relation in a catch-up batch onto the scalar path.
+type targetRelationCapabilities struct {
+	relationLane  bool
+	keyedSetDML   bool
+	binaryCopy    bool
+	textCopyStage bool
 }
 
 type targetColumn struct {
@@ -433,6 +447,7 @@ type targetColumn struct {
 	sourceIndex int
 	generated   bool
 	notNull     bool
+	conflicting bool
 }
 
 type targetRelationCache struct {
@@ -618,9 +633,154 @@ func (a *Applier) applyTransactionBatch(
 }
 
 type relationBatchedChange struct {
-	change    *Change
-	relation  *targetRelation
-	collector *sampleCollector
+	transactionIndex int
+	change           *Change
+	relation         *targetRelation
+	collector        *sampleCollector
+}
+
+type relationReplayStep struct {
+	ordered     bool
+	items       []relationBatchedChange
+	lanes       [][]relationBatchedChange
+	laneIndexes map[*targetRelation]int
+}
+
+// planRelationBatchedChanges partitions one target transaction into alternating
+// safe epochs and ordered barriers. Safe epochs retain exact order inside each
+// relation while allowing independent relations to be grouped. An unsafe row
+// no longer disables batching for the entire prefix: it drains the preceding
+// epoch, remains in source order with adjacent unsafe work, and starts a fresh
+// epoch after it. The target transaction still wraps every step and progress.
+func planRelationBatchedChanges(
+	relations []map[uint32]*targetRelation,
+	transactions []Transaction,
+	collectors []*sampleCollector,
+) ([]relationReplayStep, bool, error) {
+	for i := range transactions {
+		if transactions[i].Spill != nil {
+			return nil, false, nil
+		}
+	}
+	steps := make([]relationReplayStep, 0, 3)
+	for transactionIndex := range transactions {
+		for changeIndex := range transactions[transactionIndex].Changes {
+			change := &transactions[transactionIndex].Changes[changeIndex]
+			relation := relations[transactionIndex][change.RelationOID]
+			if relation == nil {
+				return nil, true, divergenceFor(nil, change.Kind, "required relation metadata is missing")
+			}
+			item := relationBatchedChange{
+				transactionIndex: transactionIndex,
+				change:           change,
+				relation:         relation,
+				collector:        collectors[transactionIndex],
+			}
+			laneSafe := relation.capabilities.relationLane && change.Kind != ChangeTruncate
+			if !laneSafe {
+				if len(steps) == 0 || !steps[len(steps)-1].ordered {
+					steps = append(steps, relationReplayStep{ordered: true})
+				}
+				step := &steps[len(steps)-1]
+				step.items = append(step.items, item)
+				continue
+			}
+
+			if len(steps) == 0 || steps[len(steps)-1].ordered {
+				steps = append(steps, relationReplayStep{
+					laneIndexes: make(map[*targetRelation]int),
+				})
+			}
+			step := &steps[len(steps)-1]
+			laneIndex, exists := step.laneIndexes[relation]
+			if !exists {
+				laneIndex = len(step.lanes)
+				step.laneIndexes[relation] = laneIndex
+				step.lanes = append(step.lanes, nil)
+			}
+			step.lanes[laneIndex] = append(step.lanes[laneIndex], item)
+		}
+	}
+	return steps, true, nil
+}
+
+func queueRelationReplayLane(replay *applyPipeline, lane []relationBatchedChange) error {
+	for start := 0; start < len(lane); {
+		end := start + 1
+		for end < len(lane) && lane[end].change.Kind == lane[start].change.Kind {
+			end++
+		}
+		if err := queueRelationReplayRun(replay, nil, lane[start:end]); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
+}
+
+func queueOrderedReplayStep(
+	replay *applyPipeline,
+	relations []map[uint32]*targetRelation,
+	items []relationBatchedChange,
+) error {
+	for start := 0; start < len(items); {
+		end := start + 1
+		for end < len(items) && orderedReplayItemsShareStatement(items[start], items[end]) {
+			end++
+		}
+		if err := queueRelationReplayRun(replay, relations, items[start:end]); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
+}
+
+func orderedReplayItemsShareStatement(left, right relationBatchedChange) bool {
+	if left.transactionIndex != right.transactionIndex || left.change.Kind != right.change.Kind {
+		return false
+	}
+	if left.change.Kind == ChangeTruncate {
+		return sameTruncateOptions(*left.change, *right.change)
+	}
+	return left.relation == right.relation
+}
+
+func queueRelationReplayRun(
+	replay *applyPipeline,
+	relations []map[uint32]*targetRelation,
+	run []relationBatchedChange,
+) error {
+	if len(run) == 0 {
+		return nil
+	}
+	changes := make([]Change, len(run))
+	for i := range run {
+		changes[i] = *run[i].change
+	}
+	var err error
+	switch changes[0].Kind {
+	case ChangeInsert:
+		err = applyInserts(replay, run[0].relation, changes)
+	case ChangeUpdate:
+		err = applyUpdates(replay, run[0].relation, changes)
+	case ChangeDelete:
+		err = applyDeletes(replay, run[0].relation, changes)
+	case ChangeTruncate:
+		if relations == nil {
+			return divergenceFor(run[0].relation, ChangeTruncate, "truncate escaped its ordering barrier")
+		}
+		err = applyTruncates(replay, relations[run[0].transactionIndex], changes)
+	default:
+		return divergenceFor(run[0].relation, changes[0].Kind, "unknown change kind")
+	}
+	if err != nil {
+		return err
+	}
+	for i := range run {
+		run[i].collector.add(run[i].change)
+	}
+	return nil
 }
 
 func queueRelationBatchedChanges(
@@ -629,60 +789,21 @@ func queueRelationBatchedChanges(
 	transactions []Transaction,
 	collectors []*sampleCollector,
 ) (bool, error) {
-	lanes := make([][]relationBatchedChange, 0)
-	laneIndexes := make(map[*targetRelation]int)
-	for transactionIndex := range transactions {
-		if transactions[transactionIndex].Spill != nil {
-			return false, nil
-		}
-		for changeIndex := range transactions[transactionIndex].Changes {
-			change := &transactions[transactionIndex].Changes[changeIndex]
-			relation := relations[transactionIndex][change.RelationOID]
-			if relation == nil || !relation.reorderSafe || change.Kind == ChangeTruncate {
-				return false, nil
-			}
-			laneIndex, exists := laneIndexes[relation]
-			if !exists {
-				laneIndex = len(lanes)
-				laneIndexes[relation] = laneIndex
-				lanes = append(lanes, nil)
-			}
-			lanes[laneIndex] = append(lanes[laneIndex], relationBatchedChange{
-				change: change, relation: relation, collector: collectors[transactionIndex],
-			})
-		}
+	steps, planned, err := planRelationBatchedChanges(relations, transactions, collectors)
+	if err != nil || !planned {
+		return planned, err
 	}
-
-	for _, lane := range lanes {
-		for start := 0; start < len(lane); {
-			end := start + 1
-			for end < len(lane) && lane[end].change.Kind == lane[start].change.Kind {
-				end++
-			}
-			changes := make([]Change, end-start)
-			for i := start; i < end; i++ {
-				changes[i-start] = *lane[i].change
-			}
-			var err error
-			switch changes[0].Kind {
-			case ChangeInsert:
-				err = applyInserts(replay, lane[start].relation, changes)
-			case ChangeUpdate:
-				err = applyUpdates(replay, lane[start].relation, changes)
-			case ChangeDelete:
-				err = applyDeletes(replay, lane[start].relation, changes)
-			default:
-				return true, divergenceFor(
-					lane[start].relation, changes[0].Kind, "unknown change kind",
-				)
-			}
-			if err != nil {
+	for _, step := range steps {
+		if step.ordered {
+			if err := queueOrderedReplayStep(replay, relations, step.items); err != nil {
 				return true, err
 			}
-			for i := start; i < end; i++ {
-				lane[i].collector.add(lane[i].change)
+			continue
+		}
+		for _, lane := range step.lanes {
+			if err := queueRelationReplayLane(replay, lane); err != nil {
+				return true, err
 			}
-			start = end
 		}
 	}
 	return true, nil
@@ -799,11 +920,16 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		       a.attidentity::text,
 		       a.attgenerated <> '',
 		       a.attnotnull,
+		       EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_index conflict_index
+		         WHERE conflict_index.indrelid = c.oid
+		           AND (conflict_index.indisunique OR conflict_index.indisexclusion)
+		           AND a.attnum = ANY(conflict_index.indkey)
+		       ) AS conflict_sensitive,
 		       c.relkind = 'r'
 		         AND NOT c.relrowsecurity
 		         AND NOT c.relforcerowsecurity
 		         AND a.attgenerated = ''
-		         AND t.oid < 16384
 		         AND NOT EXISTS (
 		           SELECT 1 FROM pg_catalog.pg_trigger trigger_row
 		           WHERE trigger_row.tgrelid = c.oid AND trigger_row.tgenabled IN ('R', 'A')
@@ -822,7 +948,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		           SELECT 1 FROM pg_catalog.pg_index index_row
 		           WHERE index_row.indrelid = c.oid
 		             AND (index_row.indexprs IS NOT NULL OR index_row.indpred IS NOT NULL)
-		         ) AS reorder_safe
+		         ) AS set_dml_safe,
+		       t.oid < 16384 AS built_in_type
 		FROM pg_catalog.pg_attribute a
 		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -836,21 +963,29 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 	}
 	defer rows.Close()
 	result := &targetRelation{
-		source:      *source,
-		quoted:      pgx.Identifier{source.Namespace, source.Name}.Sanitize(),
-		reorderSafe: true,
+		source: *source,
+		quoted: pgx.Identifier{source.Namespace, source.Name}.Sanitize(),
+		capabilities: targetRelationCapabilities{
+			relationLane:  true,
+			keyedSetDML:   true,
+			binaryCopy:    true,
+			textCopyStage: true,
+		},
 	}
 	for rows.Next() {
 		var column targetColumn
-		var reorderSafe bool
+		var setDMLSafe, builtIn bool
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
-			&column.generated, &column.notNull,
-			&reorderSafe,
+			&column.generated, &column.notNull, &column.conflicting,
+			&setDMLSafe, &builtIn,
 		); err != nil {
 			return nil, err
 		}
-		result.reorderSafe = result.reorderSafe && reorderSafe
+		result.capabilities.relationLane = result.capabilities.relationLane && setDMLSafe && builtIn
+		result.capabilities.keyedSetDML = result.capabilities.keyedSetDML && setDMLSafe
+		result.capabilities.binaryCopy = result.capabilities.binaryCopy && setDMLSafe && builtIn
+		result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe
 		if column.identity == "a" {
 			result.overrideIdentity = true
 		}
@@ -1431,7 +1566,7 @@ func (p *applyPipeline) resume() {
 	}
 }
 
-func (p *applyPipeline) binaryCopy(
+func (p *applyPipeline) copyFrom(
 	relation *targetRelation,
 	kind ChangeKind,
 	description string,
@@ -1462,6 +1597,159 @@ func (p *applyPipeline) binaryCopy(
 	return nil
 }
 
+const minimumTextCopyStageRows = 64
+
+// loadTextCopyStage copies text pgoutput values into a target-typed temporary
+// relation. This is the escape hatch that parameter arrays cannot provide
+// efficiently for user-defined types: PostgreSQL's COPY input functions do the
+// conversion once, then one set-based target statement consumes the stage.
+// The stage lives in the same target transaction as DML and progress.
+func (p *applyPipeline) loadTextCopyStage(
+	relation *targetRelation,
+	kind ChangeKind,
+	columns []targetColumn,
+	values []TupleDatum,
+	rowCount int,
+) (string, bool, error) {
+	if rowCount < minimumTextCopyStageRows || len(columns) == 0 ||
+		!relation.capabilities.textCopyStage || !textCopyStagePreferred(columns) {
+		return "", false, nil
+	}
+	data, supported, err := textCopyStageData(relation, kind, columns, values, rowCount)
+	if err != nil || !supported {
+		return "", supported, err
+	}
+
+	stage := textCopyStageName(relation, kind, columns)
+	var create strings.Builder
+	create.WriteString("CREATE TEMP TABLE IF NOT EXISTS ")
+	create.WriteString(stage)
+	create.WriteString(" ON COMMIT DELETE ROWS AS SELECT 0::bigint AS ordinal")
+	for i, column := range columns {
+		create.WriteByte(',')
+		create.WriteString("pgmigrate_target.")
+		create.WriteString(column.quoted)
+		fmt.Fprintf(&create, " AS column_%d", i)
+	}
+	create.WriteString(" FROM ")
+	create.WriteString(relation.quoted)
+	create.WriteString(" AS pgmigrate_target WITH NO DATA")
+	p.queueUnprepared(create.String(), nil, applyExpectation{
+		relation: relation, kind: kind,
+		description: "create typed replay stage for " + relation.quoted, expectedRows: -1,
+	})
+	p.queueUnprepared("TRUNCATE "+stage, nil, applyExpectation{
+		relation: relation, kind: kind,
+		description: "clear typed replay stage for " + relation.quoted, expectedRows: -1,
+	})
+
+	var copySQL strings.Builder
+	copySQL.WriteString("COPY ")
+	copySQL.WriteString(stage)
+	copySQL.WriteString(" (ordinal")
+	for i := range columns {
+		fmt.Fprintf(&copySQL, ",column_%d", i)
+	}
+	copySQL.WriteString(") FROM STDIN")
+	if err := p.copyFrom(
+		relation, kind, "text copy into typed stage for "+relation.quoted,
+		copySQL.String(), data, rowCount,
+	); err != nil {
+		return "", true, err
+	}
+	return stage, true, nil
+}
+
+func textCopyStagePreferred(columns []targetColumn) bool {
+	for _, column := range columns {
+		if column.oid >= 16384 {
+			return true
+		}
+	}
+	return false
+}
+
+func textCopyStageName(
+	relation *targetRelation,
+	kind ChangeKind,
+	columns []targetColumn,
+) string {
+	hash := sha256.New()
+	_, _ = io.WriteString(hash, relation.quoted)
+	_, _ = hash.Write([]byte{byte(kind)})
+	var encoded [8]byte
+	for _, column := range columns {
+		binary.BigEndian.PutUint32(encoded[:4], column.oid)
+		binary.BigEndian.PutUint32(encoded[4:], uint32(column.sourceIndex))
+		_, _ = hash.Write(encoded[:])
+		_, _ = io.WriteString(hash, column.name)
+		_, _ = hash.Write([]byte{0})
+	}
+	sum := hash.Sum(nil)
+	name := fmt.Sprintf("pgmigrate_stage_%x", sum[:12])
+	return pgx.Identifier{"pg_temp", name}.Sanitize()
+}
+
+func textCopyStageData(
+	relation *targetRelation,
+	kind ChangeKind,
+	columns []targetColumn,
+	values []TupleDatum,
+	rowCount int,
+) ([]byte, bool, error) {
+	if rowCount < 0 || len(values) != rowCount*len(columns) {
+		return nil, true, divergenceFor(relation, kind, fmt.Sprintf(
+			"typed stage has %d values for %d rows of %d columns",
+			len(values), rowCount, len(columns),
+		))
+	}
+	data := make([]byte, 0, rowCount*(16+len(columns)*8))
+	for ordinal := 0; ordinal < rowCount; ordinal++ {
+		data = strconv.AppendInt(data, int64(ordinal), 10)
+		for i := range columns {
+			datum := values[ordinal*len(columns)+i]
+			if _, err := datumParamForColumn(relation, columns[i], datum, kind); err != nil {
+				return nil, true, err
+			}
+			data = append(data, '\t')
+			switch datum.Kind {
+			case DatumNull:
+				data = append(data, '\\', 'N')
+			case DatumText:
+				data = appendTextCopyValue(data, datum.Data)
+			default:
+				return nil, false, nil
+			}
+		}
+		data = append(data, '\n')
+	}
+	return data, true, nil
+}
+
+func appendTextCopyValue(dst, value []byte) []byte {
+	for _, character := range value {
+		switch character {
+		case '\\':
+			dst = append(dst, '\\', '\\')
+		case '\t':
+			dst = append(dst, '\\', 't')
+		case '\n':
+			dst = append(dst, '\\', 'n')
+		case '\r':
+			dst = append(dst, '\\', 'r')
+		case '\b':
+			dst = append(dst, '\\', 'b')
+		case '\f':
+			dst = append(dst, '\\', 'f')
+		case '\v':
+			dst = append(dst, '\\', 'v')
+		default:
+			dst = append(dst, character)
+		}
+	}
+	return dst
+}
+
 func (p *applyPipeline) abort() error {
 	if p.closed {
 		return nil
@@ -1481,7 +1769,9 @@ func (p *applyPipeline) abort() error {
 			"cdc: target transaction status after rollback is %q, want %q", status, 'I',
 		))
 	}
-	return errors.Join(result, p.close())
+	closeErr := p.close()
+	p.statements.invalidate()
+	return errors.Join(result, closeErr)
 }
 
 // emptyParamValue is a non-nil zero-length parameter value, which the extended
@@ -1499,6 +1789,14 @@ func applyInserts(replay *applyPipeline, relation *targetRelation, changes []Cha
 		}
 		arrayChanges := changes[arrayStart:arrayEnd]
 		if len(relation.columns) != 0 {
+			if applied, err := applyInsertTextStage(replay, relation, arrayChanges); applied {
+				if err != nil {
+					return err
+				}
+				continue
+			} else if err != nil {
+				return err
+			}
 			if applied, err := applyInsertArrayChunk(replay, relation, arrayChanges); applied {
 				if err != nil {
 					return err
@@ -1530,7 +1828,7 @@ func applyInsertCopy(
 	changes []Change,
 ) (bool, error) {
 	const minimumCopyRows = 256
-	if len(changes) < minimumCopyRows || len(relation.columns) == 0 || !relation.reorderSafe {
+	if len(changes) < minimumCopyRows || len(relation.columns) == 0 || !relation.capabilities.binaryCopy {
 		return false, nil
 	}
 	data, supported, err := binaryCopyData(relation, changes)
@@ -1548,7 +1846,7 @@ func applyInsertCopy(
 		sql.WriteString(column.quoted)
 	}
 	sql.WriteString(") FROM STDIN BINARY")
-	return true, replay.binaryCopy(
+	return true, replay.copyFrom(
 		relation, ChangeInsert, "binary copy into "+relation.quoted,
 		sql.String(), data, len(changes),
 	)
@@ -1592,6 +1890,61 @@ func binaryCopyData(relation *targetRelation, changes []Change) ([]byte, bool, e
 	}
 	data = binary.BigEndian.AppendUint16(data, ^uint16(0))
 	return data, true, nil
+}
+
+func applyInsertTextStage(
+	replay *applyPipeline,
+	relation *targetRelation,
+	changes []Change,
+) (bool, error) {
+	if len(changes) < minimumTextCopyStageRows ||
+		!relation.capabilities.textCopyStage || !textCopyStagePreferred(relation.columns) {
+		return false, nil
+	}
+	values := make([]TupleDatum, 0, len(changes)*len(relation.columns))
+	for row := range changes {
+		if err := validateTuple(relation, changes[row].New, ChangeInsert); err != nil {
+			return true, err
+		}
+		for _, column := range relation.columns {
+			values = append(values, (*changes[row].New)[column.sourceIndex])
+		}
+	}
+	stage, applied, err := replay.loadTextCopyStage(
+		relation, ChangeInsert, relation.columns, values, len(changes),
+	)
+	if err != nil || !applied {
+		return applied, err
+	}
+
+	var sql strings.Builder
+	sql.WriteString("INSERT INTO ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" (")
+	for i, column := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString(column.quoted)
+	}
+	sql.WriteByte(')')
+	if relation.overrideIdentity {
+		sql.WriteString(" OVERRIDING SYSTEM VALUE")
+	}
+	sql.WriteString(" SELECT ")
+	for i := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "column_%d", i)
+	}
+	sql.WriteString(" FROM ")
+	sql.WriteString(stage)
+	sql.WriteString(" ORDER BY ordinal")
+	return true, replay.queue(sql.String(), nil, applyExpectation{
+		relation: relation, kind: ChangeInsert,
+		description: "staged insert into " + relation.quoted, expectedRows: int64(len(changes)),
+	})
 }
 
 func insertChunkRows(columnCount int) int {
@@ -1755,6 +2108,13 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 			return err
 		}
 		setColumns := updateSetColumnIndexes(relation, &changes[start])
+		if !updateSetColumnsBatchSafe(relation, setColumns) {
+			if err := applyUpdate(replay, relation, &changes[start]); err != nil {
+				return err
+			}
+			start++
+			continue
+		}
 		chunkRows := applyArrayChunkRows
 		seen := map[string]struct{}{firstKey: {}}
 		end := start + 1
@@ -1763,7 +2123,9 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 			if err != nil {
 				return err
 			}
-			if !sameUpdateSetColumns(relation, &changes[start], &changes[end]) {
+			candidateSetColumns := updateSetColumnIndexes(relation, &changes[end])
+			if !slices.Equal(setColumns, candidateSetColumns) ||
+				!updateSetColumnsBatchSafe(relation, candidateSetColumns) {
 				break
 			}
 			if _, duplicate := seen[key]; duplicate {
@@ -1787,7 +2149,7 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 }
 
 func batchUpdateIdentityColumns(relation *targetRelation) []targetColumn {
-	if relation == nil || !relation.reorderSafe || relation.source.ReplicaIdentity == 'f' {
+	if relation == nil || !relation.capabilities.keyedSetDML || relation.source.ReplicaIdentity == 'f' {
 		return nil
 	}
 	columns := make([]targetColumn, 0, len(predicateTargetColumns(relation)))
@@ -1840,19 +2202,33 @@ func batchUpdateIdentityKey(
 
 func updateSetColumnIndexes(relation *targetRelation, change *Change) []int {
 	result := make([]int, 0, len(relation.columns))
+	predicate := change.Old
+	if predicate == nil {
+		predicate = change.New
+	}
 	for i := range relation.columns {
-		if (*change.New)[relation.columns[i].sourceIndex].Kind != DatumUnchangedToast {
-			result = append(result, i)
+		column := relation.columns[i]
+		datum := (*change.New)[column.sourceIndex]
+		if datum.Kind == DatumUnchangedToast {
+			continue
 		}
+		// pgoutput includes unchanged replica-identity values in the new tuple.
+		// Assigning them again does needless unique-index work and makes otherwise
+		// independent updates conflict inside one set statement.
+		if column.key && predicate != nil {
+			old := (*predicate)[column.sourceIndex]
+			if datum.Kind == old.Kind && bytes.Equal(datum.Data, old.Data) {
+				continue
+			}
+		}
+		result = append(result, i)
 	}
 	return result
 }
 
-func sameUpdateSetColumns(relation *targetRelation, left, right *Change) bool {
-	for i := range relation.columns {
-		sourceIndex := relation.columns[i].sourceIndex
-		if ((*left.New)[sourceIndex].Kind == DatumUnchangedToast) !=
-			((*right.New)[sourceIndex].Kind == DatumUnchangedToast) {
+func updateSetColumnsBatchSafe(relation *targetRelation, setColumns []int) bool {
+	for _, columnIndex := range setColumns {
+		if relation.columns[columnIndex].conflicting {
 			return false
 		}
 	}
@@ -1884,6 +2260,11 @@ func applyUpdateChunk(
 	setColumns []int,
 	changes []Change,
 ) error {
+	if applied, err := applyUpdateTextStage(
+		replay, relation, identityColumns, setColumns, changes,
+	); applied || err != nil {
+		return err
+	}
 	if applied, err := applyUpdateArrayChunk(
 		replay, relation, identityColumns, setColumns, changes,
 	); applied || err != nil {
@@ -1902,6 +2283,81 @@ func applyUpdateChunk(
 		}
 	}
 	return nil
+}
+
+func applyUpdateTextStage(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+	changes []Change,
+) (bool, error) {
+	if len(changes) < minimumTextCopyStageRows || !relation.capabilities.textCopyStage {
+		return false, nil
+	}
+	stageColumns := make([]targetColumn, 0, len(setColumns)+len(identityColumns))
+	for _, columnIndex := range setColumns {
+		stageColumns = append(stageColumns, relation.columns[columnIndex])
+	}
+	stageColumns = append(stageColumns, identityColumns...)
+	if !textCopyStagePreferred(stageColumns) {
+		return false, nil
+	}
+	values := make([]TupleDatum, 0, len(changes)*len(stageColumns))
+	for row := range changes {
+		for _, columnIndex := range setColumns {
+			column := relation.columns[columnIndex]
+			values = append(values, (*changes[row].New)[column.sourceIndex])
+		}
+		predicate := changes[row].Old
+		if predicate == nil {
+			predicate = changes[row].New
+		}
+		for _, column := range identityColumns {
+			values = append(values, (*predicate)[column.sourceIndex])
+		}
+	}
+	stage, applied, err := replay.loadTextCopyStage(
+		relation, ChangeUpdate, stageColumns, values, len(changes),
+	)
+	if err != nil || !applied {
+		return applied, err
+	}
+
+	var sql strings.Builder
+	sql.WriteString("UPDATE ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_target SET ")
+	if len(setColumns) == 0 {
+		sql.WriteString(relation.columns[0].quoted)
+		sql.WriteString("=pgmigrate_target.")
+		sql.WriteString(relation.columns[0].quoted)
+	} else {
+		for i, columnIndex := range setColumns {
+			if i != 0 {
+				sql.WriteByte(',')
+			}
+			sql.WriteString(relation.columns[columnIndex].quoted)
+			fmt.Fprintf(&sql, "=pgmigrate_batch.column_%d", i)
+		}
+	}
+	sql.WriteString(" FROM ")
+	sql.WriteString(stage)
+	sql.WriteString(" AS pgmigrate_batch WHERE ")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString("pgmigrate_target.")
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(&sql, "=pgmigrate_batch.column_%d", len(setColumns)+i)
+	}
+	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
+	return true, replay.queue(sql.String(), nil, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description:  "staged update " + relation.quoted,
+		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
+	})
 }
 
 func applyUpdateValueChunk(
@@ -2253,6 +2709,11 @@ func applyDeleteChunk(
 	identityColumns []targetColumn,
 	changes []Change,
 ) error {
+	if applied, err := applyDeleteTextStage(
+		replay, relation, identityColumns, changes,
+	); applied || err != nil {
+		return err
+	}
 	if applied, err := applyDeleteArrayChunk(
 		replay, relation, identityColumns, changes,
 	); applied || err != nil {
@@ -2271,6 +2732,51 @@ func applyDeleteChunk(
 		}
 	}
 	return nil
+}
+
+func applyDeleteTextStage(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	changes []Change,
+) (bool, error) {
+	if len(changes) < minimumTextCopyStageRows ||
+		!relation.capabilities.textCopyStage || !textCopyStagePreferred(identityColumns) {
+		return false, nil
+	}
+	values := make([]TupleDatum, 0, len(changes)*len(identityColumns))
+	for row := range changes {
+		for _, column := range identityColumns {
+			values = append(values, (*changes[row].Old)[column.sourceIndex])
+		}
+	}
+	stage, applied, err := replay.loadTextCopyStage(
+		relation, ChangeDelete, identityColumns, values, len(changes),
+	)
+	if err != nil || !applied {
+		return applied, err
+	}
+
+	var sql strings.Builder
+	sql.WriteString("DELETE FROM ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_target USING ")
+	sql.WriteString(stage)
+	sql.WriteString(" AS pgmigrate_batch WHERE ")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString("pgmigrate_target.")
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(&sql, "=pgmigrate_batch.column_%d", i)
+	}
+	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
+	return true, replay.queue(sql.String(), nil, applyExpectation{
+		relation: relation, kind: ChangeDelete,
+		description:  "staged delete from " + relation.quoted,
+		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
+	})
 }
 
 func applyDeleteValueChunk(

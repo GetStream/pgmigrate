@@ -48,3 +48,17 @@ func TestApplyStatementCacheCanDisablePreparation(t *testing.T) {
 		t.Fatalf("disabled cache acquire = %#v added=%t evicted=%#v", statement, added, evicted)
 	}
 }
+
+func TestApplyStatementCacheInvalidationKeepsNamesMonotonic(t *testing.T) {
+	t.Parallel()
+	cache := newApplyStatementCache(2)
+	first, _, _ := cache.acquire("SELECT $1", []uint32{23})
+	cache.invalidate()
+	replacement, added, evicted := cache.acquire("SELECT $1", []uint32{23})
+	if replacement == nil || replacement == first || !added || evicted != nil {
+		t.Fatalf("replacement=%#v added=%t evicted=%#v", replacement, added, evicted)
+	}
+	if replacement.name == first.name {
+		t.Fatalf("invalidated statement name was reused: %q", replacement.name)
+	}
+}
