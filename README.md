@@ -38,10 +38,12 @@ until cutover completes:
    `COPY`. A table larger than `--split-threshold` is split into at most
    `--workers` parts. Equal-major migrations whose columns all use allowlisted
    built-in types copy in binary; everything else copies as text.
-4. **indexes** restores the managed indexes and constraints, driving the builds
-   itself so they run concurrently, restores the deferred post-data objects one
-   at a time behind durable markers, and vacuums the loaded tables.
-5. **catchup** applies the transactions staged during the copy, in source order.
+4. **indexes** first restores every uniqueness, replica-identity, partition,
+   constraint, trigger, and rule object required for correct replay. CDC apply
+   then starts immediately while non-unique secondary indexes are built with
+   `CREATE INDEX CONCURRENTLY`, followed by `VACUUM (ANALYZE)`.
+5. **catchup** is reached once post-copy maintenance is complete and apply has
+   drained the boundary recorded when replay started.
 6. **follow** applies live changes and watches source and slot health.
 
 Change data capture uses `pgoutput`, the logical decoding plugin built into
@@ -763,6 +765,7 @@ make race
 PGTEST_MAJORS=17 make integration
 PGTEST_MAJORS=16,17,18 make integration
 make bench
+make bench-cdc
 make e2e
 make crash-e2e
 ```
@@ -772,6 +775,20 @@ runtime. The PostgreSQL 17 Compose e2e harness independently checks final table
 inventory, row counts, and canonical row digests, including one digest per leaf
 partition and a comparison of every index and constraint definition in the
 schema.
+
+`make bench-cdc` starts disposable PostgreSQL 17 source and target containers,
+stages an update backlog, then measures committed CDC apply while non-unique
+indexes are built with `CREATE INDEX CONCURRENTLY` and then while
+`VACUUM (ANALYZE)` runs on the target. The default run lasts about two minutes
+and fails below 10,000 updates/second, when replay does not outrun continuing
+source traffic, when the requested source rate is not sustained, or when the
+backlog drains before target maintenance finishes. It drains the stream and
+compares source and target row counts, revision totals, and checksums before
+returning success. Customize it through `BENCH_FLAGS`, for example:
+
+```sh
+make bench-cdc BENCH_FLAGS='--duration 30s --min-updates-per-second 0 --json'
+```
 
 ## Limitations
 
@@ -795,9 +812,9 @@ schema.
   does not verify the copy, so writes made after the end position are left behind
   silently and a divergent table will not stop it. Both are the operator's to
   establish beforehand, the second with `verify`.
-- Local microbenchmarks (`make bench`) cover in-memory and file primitives only.
-  They establish no sustainable CDC rate, cutover duration, or managed-cloud
-  performance.
+- Local microbenchmarks (`make bench`) cover in-memory and file primitives.
+  `make bench-cdc` measures a disposable local PostgreSQL deployment; neither
+  establishes managed-cloud throughput or cutover duration.
 
 ## License
 
