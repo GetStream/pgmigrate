@@ -32,7 +32,10 @@ make_pg_tool() {
 set -e
 args=()
 for arg in "\$@"; do args+=("\${arg//localhost/host.docker.internal}"); done
-exec docker run --rm -v "$migration_dir:$migration_dir" postgres:17-bookworm "$tool" "\${args[@]}"
+exec docker run --rm \
+    --add-host host.docker.internal:host-gateway \
+    -v "$migration_dir:$migration_dir" \
+    postgres:17-bookworm "$tool" "\${args[@]}"
 EOF
     chmod 700 "$path"
 }
