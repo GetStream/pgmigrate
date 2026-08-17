@@ -2,6 +2,7 @@ package cdc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"strings"
@@ -187,6 +188,61 @@ func TestApplyPreparationRejectsBinaryTypeMismatch(t *testing.T) {
 	var divergence *DivergenceError
 	if !strings.Contains(err.Error(), "source OID") || !errors.As(err, &divergence) {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestArrayParamPreservesBinaryValuesAndNulls(t *testing.T) {
+	t.Parallel()
+	relation := preparationRelation()
+	column := relation.columns[0]
+	column.arrayOID = 1007
+	value := make([]byte, 4)
+	binary.BigEndian.PutUint32(value, 7)
+	param, supported, err := arrayParamForColumn(relation, column, []TupleDatum{
+		{Kind: DatumBinary, Data: value},
+		{Kind: DatumNull},
+	}, ChangeUpdate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !supported || param.oid != 1007 || param.format != 1 {
+		t.Fatalf("binary array supported=%t oid=%d format=%d", supported, param.oid, param.format)
+	}
+	if len(param.data) != 32 {
+		t.Fatalf("binary array bytes=%d, want 32", len(param.data))
+	}
+	wantWords := []uint32{1, 1, 23, 2, 1, 4, 7, ^uint32(0)}
+	for i, want := range wantWords {
+		if got := binary.BigEndian.Uint32(param.data[i*4:]); got != want {
+			t.Fatalf("binary array word %d=%d, want %d", i, got, want)
+		}
+	}
+}
+
+func TestArrayParamTextEscapingAndMixedFallback(t *testing.T) {
+	t.Parallel()
+	relation := preparationRelation()
+	column := relation.columns[1]
+	column.arrayOID = 1009
+	param, supported, err := arrayParamForColumn(relation, column, []TupleDatum{
+		{Kind: DatumText, Data: []byte(`a,"\`)},
+		{Kind: DatumNull},
+	}, ChangeInsert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !supported || param.format != 0 || string(param.data) != `{"a,\"\\",NULL}` {
+		t.Fatalf("text array supported=%t format=%d data=%q", supported, param.format, param.data)
+	}
+	_, supported, err = arrayParamForColumn(relation, column, []TupleDatum{
+		{Kind: DatumText, Data: []byte("7")},
+		{Kind: DatumBinary, Data: []byte("7")},
+	}, ChangeInsert)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supported {
+		t.Fatal("mixed text/binary array unexpectedly supported")
 	}
 }
 

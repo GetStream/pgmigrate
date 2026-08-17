@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -717,6 +718,19 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		CREATE TABLE public.pipeline_missing (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_binary (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_prepared (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_batch (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_batch_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (value <> 'bad')
+		);
+		CREATE TABLE public.pipeline_batch_deferred (
+			id integer PRIMARY KEY,
+			value text,
+			UNIQUE (value) DEFERRABLE INITIALLY DEFERRED
+		);
+		CREATE TABLE public.pipeline_update_batch (id integer PRIMARY KEY, value text);
+		CREATE TABLE public.pipeline_update_batch_duplicates (id integer NOT NULL, value text);
+		CREATE TABLE public.pipeline_copy (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_progress_guard (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_deferred_commit (
 			id integer PRIMARY KEY,
@@ -760,6 +774,22 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}}
 		return applier.applyTransaction(ctx, conn, relationCache, statementCache, transaction)
 	}
+	applyBatch := func(
+		stream string, progress LSN, transactions []Transaction,
+	) (bool, LSN, error) {
+		generation := stream + "-generation"
+		if err := EnsureStreamProgressIdentity(ctx, conn, StreamIdentityConfig{
+			StreamID: stream, Generation: generation, FreshSetup: true,
+		}); err != nil {
+			return false, progress, err
+		}
+		applier := &Applier{config: ApplierConfig{
+			StreamID: stream, StreamGeneration: generation,
+		}}
+		return applier.applyTransactionBatch(
+			ctx, conn, relationCache, statementCache, transactions, progress,
+		)
+	}
 	assertProgress := func(t *testing.T, stream string, want LSN) {
 		t.Helper()
 		progress, exists, err := postgres.ReadProgress(ctx, conn, stream)
@@ -770,6 +800,314 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatalf("%s progress=%x exists=%t, want %x", stream, progress, exists, want)
 		}
 	}
+
+	t.Run("catalog gates cross-transaction relation lanes", func(t *testing.T) {
+		plainSource := relation(1190, "pipeline_copy", 25)
+		plain, err := relationCache.resolve(ctx, conn, &plainSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !plain.reorderSafe {
+			t.Fatal("plain built-in relation was not eligible for relation-lane replay")
+		}
+		checkedSource := relation(1191, "pipeline_batch_checked", 25)
+		checked, err := relationCache.resolve(ctx, conn, &checkedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if checked.reorderSafe {
+			t.Fatal("checked relation was eligible for relation-lane replay")
+		}
+	})
+
+	t.Run("bounded source transaction group commits at final progress", func(t *testing.T) {
+		source := relation(1112, "pipeline_batch", 25)
+		transactions := []Transaction{
+			{
+				CommitLSN: 200, EndLSN: 201, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("1"), text("first")),
+				}},
+			},
+			{
+				CommitLSN: 201, EndLSN: 202, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("1"), TupleDatum{Kind: DatumNull}),
+					New: tuple(text("1"), text("second")),
+				}},
+			},
+			{
+				CommitLSN: 202, EndLSN: 203, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("2"), text("third")),
+				}},
+			},
+		}
+		applied, next, err := applyBatch("pipeline-batch-success", 0, transactions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !applied || next != 203 {
+			t.Fatalf("batch applied=%t progress=%x, want true/203", applied, next)
+		}
+		var values string
+		if err := conn.QueryRow(ctx, `
+			SELECT string_agg(value, ',' ORDER BY id) FROM public.pipeline_batch
+		`).Scan(&values); err != nil {
+			t.Fatal(err)
+		}
+		if values != "second,third" {
+			t.Fatalf("batched values=%q, want second,third", values)
+		}
+		assertProgress(t, "pipeline-batch-success", 203)
+	})
+
+	t.Run("mid-batch SQL failure rolls back the whole group", func(t *testing.T) {
+		source := relation(1113, "pipeline_batch_checked", 25)
+		transactions := []Transaction{
+			{
+				CommitLSN: 210, EndLSN: 211, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("1"), text("before")),
+				}},
+			},
+			{
+				CommitLSN: 211, EndLSN: 212, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("2"), text("bad")),
+				}},
+			},
+			{
+				CommitLSN: 212, EndLSN: 213, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("3"), text("after")),
+				}},
+			},
+		}
+		applied, next, err := applyBatch("pipeline-batch-failure", 0, transactions)
+		var divergence *DivergenceError
+		if !errors.As(err, &divergence) {
+			t.Fatalf("batch SQL error=%v, want divergence", err)
+		}
+		if applied || next != 0 {
+			t.Fatalf("failed batch applied=%t progress=%x, want false/0", applied, next)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM public.pipeline_batch_checked").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("failed batch retained %d rows", count)
+		}
+		assertProgress(t, "pipeline-batch-failure", 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after failed batch=%q, want idle", status)
+		}
+	})
+
+	t.Run("batched deferred commit failure rolls back data and progress", func(t *testing.T) {
+		source := relation(1114, "pipeline_batch_deferred", 25)
+		transactions := []Transaction{
+			{
+				CommitLSN: 220, EndLSN: 221, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("1"), text("duplicate")),
+				}},
+			},
+			{
+				CommitLSN: 221, EndLSN: 222, Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeInsert,
+					New: tuple(text("2"), text("duplicate")),
+				}},
+			},
+		}
+		applied, next, err := applyBatch("pipeline-batch-deferred", 0, transactions)
+		var divergence *DivergenceError
+		if !errors.As(err, &divergence) {
+			t.Fatalf("batched deferred commit error=%v, want divergence", err)
+		}
+		if applied || next != 0 {
+			t.Fatalf("failed deferred batch applied=%t progress=%x, want false/0", applied, next)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM public.pipeline_batch_deferred").Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("failed deferred batch retained %d rows", count)
+		}
+		assertProgress(t, "pipeline-batch-deferred", 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after failed deferred batch=%q, want idle", status)
+		}
+	})
+
+	t.Run("consecutive keyed updates use one checked set operation", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO public.pipeline_update_batch
+			VALUES (1, 'old-1'), (2, 'old-2'), (3, 'old-3'), (4, 'old-4')
+		`); err != nil {
+			t.Fatal(err)
+		}
+		source := relation(1115, "pipeline_update_batch", 25)
+		transaction := &Transaction{
+			CommitLSN: 230, EndLSN: 231, Relations: []Relation{source},
+		}
+		for id := 1; id <= 4; id++ {
+			transaction.Changes = append(transaction.Changes, Change{
+				RelationOID: source.OID, Kind: ChangeUpdate,
+				Old: tuple(text(strconv.Itoa(id)), TupleDatum{Kind: DatumNull}),
+				New: tuple(text(strconv.Itoa(id)), text(fmt.Sprintf("new-%d", id))),
+			})
+		}
+		if err := apply("pipeline-update-batch", transaction); err != nil {
+			t.Fatal(err)
+		}
+		var values string
+		if err := conn.QueryRow(ctx, `
+			SELECT string_agg(value, ',' ORDER BY id) FROM public.pipeline_update_batch
+		`).Scan(&values); err != nil {
+			t.Fatal(err)
+		}
+		if values != "new-1,new-2,new-3,new-4" {
+			t.Fatalf("batched update values=%q", values)
+		}
+		var prepared int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*) FROM pg_catalog.pg_prepared_statements
+			WHERE statement LIKE 'UPDATE "public"."pipeline_update_batch" AS pgmigrate_target%'
+			  AND statement LIKE '%RETURNING pgmigrate_batch.ordinal%'
+		`).Scan(&prepared); err != nil {
+			t.Fatal(err)
+		}
+		if prepared != 1 {
+			t.Fatalf("set-based update prepared statements=%d, want 1", prepared)
+		}
+		assertProgress(t, "pipeline-update-batch", 231)
+	})
+
+	t.Run("repeated source identity remains sequential", func(t *testing.T) {
+		source := relation(1115, "pipeline_update_batch", 25)
+		transaction := &Transaction{
+			CommitLSN: 231, EndLSN: 232, Relations: []Relation{source},
+			Changes: []Change{
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("1"), TupleDatum{Kind: DatumNull}),
+					New: tuple(text("1"), text("first")),
+				},
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("1"), TupleDatum{Kind: DatumNull}),
+					New: tuple(text("1"), text("second")),
+				},
+			},
+		}
+		if err := apply("pipeline-update-repeated-identity", transaction); err != nil {
+			t.Fatal(err)
+		}
+		var value string
+		if err := conn.QueryRow(ctx, `
+			SELECT value FROM public.pipeline_update_batch WHERE id = 1
+		`).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		if value != "second" {
+			t.Fatalf("repeated identity value=%q, want second", value)
+		}
+		assertProgress(t, "pipeline-update-repeated-identity", 232)
+	})
+
+	t.Run("duplicate target match in update batch rolls back", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO public.pipeline_update_batch_duplicates
+			VALUES (1, 'original'), (1, 'original')
+		`); err != nil {
+			t.Fatal(err)
+		}
+		source := relation(1116, "pipeline_update_batch_duplicates", 25)
+		transaction := &Transaction{
+			CommitLSN: 240, EndLSN: 241, Relations: []Relation{source},
+			Changes: []Change{
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("1"), TupleDatum{Kind: DatumNull}),
+					New: tuple(text("1"), text("changed")),
+				},
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("2"), TupleDatum{Kind: DatumNull}),
+					New: tuple(text("2"), text("missing")),
+				},
+			},
+		}
+		err := apply("pipeline-update-duplicate-target", transaction)
+		var divergence *DivergenceError
+		if !errors.As(err, &divergence) || !strings.Contains(err.Error(), "identity ordinal 0 more than once") {
+			t.Fatalf("duplicate target update error=%v, want ordinal divergence", err)
+		}
+		var changed int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*) FROM public.pipeline_update_batch_duplicates WHERE value <> 'original'
+		`).Scan(&changed); err != nil {
+			t.Fatal(err)
+		}
+		if changed != 0 {
+			t.Fatalf("duplicate target update retained %d changed rows", changed)
+		}
+		assertProgress(t, "pipeline-update-duplicate-target", 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after duplicate target=%q, want idle", status)
+		}
+	})
+
+	t.Run("binary copy failure rolls back data and progress", func(t *testing.T) {
+		source := relation(1117, "pipeline_copy", 25)
+		transaction := &Transaction{
+			CommitLSN: 250, EndLSN: 251, Relations: []Relation{source},
+			Changes: make([]Change, 0, 300),
+		}
+		for id := 1; id <= 300; id++ {
+			encodedID := make([]byte, 4)
+			binary.BigEndian.PutUint32(encodedID, uint32(id))
+			if id == 300 {
+				binary.BigEndian.PutUint32(encodedID, 150)
+			}
+			transaction.Changes = append(transaction.Changes, Change{
+				RelationOID: source.OID, Kind: ChangeInsert,
+				New: tuple(
+					TupleDatum{Kind: DatumBinary, Data: encodedID},
+					TupleDatum{Kind: DatumBinary, Data: []byte("copied")},
+				),
+			})
+		}
+		err := apply("pipeline-copy-failure", transaction)
+		var divergence *DivergenceError
+		if !errors.As(err, &divergence) {
+			t.Fatalf("binary copy error=%v, want divergence", err)
+		}
+		var count int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*) FROM public.pipeline_copy
+		`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 0 {
+			t.Fatalf("failed binary copy retained %d rows", count)
+		}
+		assertProgress(t, "pipeline-copy-failure", 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after failed binary copy=%q, want idle", status)
+		}
+	})
 
 	t.Run("mixed DML remains ordered", func(t *testing.T) {
 		source := relation(1101, "pipeline_mixed", 25)

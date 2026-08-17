@@ -1,11 +1,14 @@
 package cdc
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -249,6 +252,16 @@ func (a *Applier) applyAvailable(ctx context.Context, conn *pgx.Conn, progress L
 	)
 }
 
+const (
+	// Catch-up batches are bounded independently by source transaction count,
+	// row changes, and decoded payload size. Transactions above the per-source
+	// change limit retain the original standalone apply path.
+	applyBatchMaxTransactions       = 16384
+	applyBatchMaxChanges            = 131072
+	applyBatchMaxTransactionChanges = 256
+	applyBatchMaxDataBytes          = 32 << 20
+)
+
 func (a *Applier) applyFromReader(
 	ctx context.Context,
 	conn *pgx.Conn,
@@ -257,12 +270,28 @@ func (a *Applier) applyFromReader(
 	statementCache *applyStatementCache,
 	progress LSN,
 ) (bool, LSN, error) {
+	batch := make([]Transaction, 0, applyBatchMaxTransactions)
+	batchChanges := 0
+	batchDataBytes := 0
 	for {
 		transaction, err := reader.Next()
 		if errors.Is(err, io.EOF) {
-			return false, progress, nil // nothing staged is left to apply
+			if len(batch) == 0 {
+				return false, progress, nil // nothing staged is left to apply
+			}
+			return a.applyTransactionBatch(
+				ctx, conn, relationCache, statementCache, batch, progress,
+			)
 		}
 		if err != nil {
+			// Publish the verified prefix before surfacing a corrupt or otherwise
+			// unreadable suffix. The next apply pass resumes at the committed
+			// progress and reports the same suffix error.
+			if len(batch) != 0 {
+				return a.applyTransactionBatch(
+					ctx, conn, relationCache, statementCache, batch, progress,
+				)
+			}
 			return false, progress, err
 		}
 		// Target progress is an EndLSN. Re-scan is deliberate: it remains
@@ -282,19 +311,71 @@ func (a *Applier) applyFromReader(
 				if err := transaction.CleanupSpill(); err != nil {
 					return false, progress, fmt.Errorf("cdc: cleanup post-boundary reader spill: %w", err)
 				}
-				return false, progress, nil
+				if len(batch) == 0 {
+					return false, progress, nil
+				}
+				return a.applyTransactionBatch(
+					ctx, conn, relationCache, statementCache, batch, progress,
+				)
 			}
 		}
-		applyErr := a.applyTransaction(ctx, conn, relationCache, statementCache, &transaction)
-		cleanupErr := transaction.CleanupSpill()
-		if applyErr != nil {
-			return false, progress, errors.Join(applyErr, cleanupErr)
+		if transaction.IsSpilled() || transaction.ChangeCount() > applyBatchMaxTransactionChanges {
+			if len(batch) != 0 {
+				// The reader already advanced over this transaction. Hold it for
+				// the next call so the completed small batch can publish progress
+				// and maintenance callbacks before a large transaction starts.
+				reader.pending = &transaction
+				return a.applyTransactionBatch(
+					ctx, conn, relationCache, statementCache, batch, progress,
+				)
+			}
+			applyErr := a.applyTransaction(ctx, conn, relationCache, statementCache, &transaction)
+			cleanupErr := transaction.CleanupSpill()
+			if applyErr != nil {
+				return false, progress, errors.Join(applyErr, cleanupErr)
+			}
+			if cleanupErr != nil {
+				return false, progress, fmt.Errorf("cdc: cleanup applied reader spill: %w", cleanupErr)
+			}
+			return true, transaction.EndLSN, nil
 		}
-		if cleanupErr != nil {
-			return false, progress, fmt.Errorf("cdc: cleanup applied reader spill: %w", cleanupErr)
+		batchChanges += int(transaction.ChangeCount())
+		batchDataBytes += transactionApplyDataBytes(&transaction)
+		batch = append(batch, transaction)
+		if len(batch) >= applyBatchMaxTransactions ||
+			batchChanges >= applyBatchMaxChanges ||
+			batchDataBytes >= applyBatchMaxDataBytes {
+			return a.applyTransactionBatch(
+				ctx, conn, relationCache, statementCache, batch, progress,
+			)
 		}
-		return true, transaction.EndLSN, nil
 	}
+}
+
+func transactionApplyDataBytes(transaction *Transaction) int {
+	if transaction == nil {
+		return 0
+	}
+	bytes := 0
+	for i := range transaction.Relations {
+		bytes += len(transaction.Relations[i].Namespace) + len(transaction.Relations[i].Name)
+		for j := range transaction.Relations[i].Columns {
+			bytes += len(transaction.Relations[i].Columns[j].Name)
+		}
+	}
+	addTuple := func(tuple *Tuple) {
+		if tuple == nil {
+			return
+		}
+		for i := range *tuple {
+			bytes += len((*tuple)[i].Data)
+		}
+	}
+	for i := range transaction.Changes {
+		addTuple(transaction.Changes[i].Old)
+		addTuple(transaction.Changes[i].New)
+	}
+	return bytes
 }
 
 func (a *Applier) effectiveEndPosition(ctx context.Context) (LSN, bool, error) {
@@ -339,12 +420,14 @@ type targetRelation struct {
 	mappedColumns    []targetColumn
 	generatedColumns []targetColumn
 	overrideIdentity bool
+	reorderSafe      bool
 }
 
 type targetColumn struct {
 	name        string
 	quoted      string
 	oid         uint32
+	arrayOID    uint32
 	key         bool
 	identity    string
 	sourceIndex int
@@ -406,77 +489,15 @@ func (a *Applier) applyTransaction(
 	statementCache *applyStatementCache,
 	transaction *Transaction,
 ) error {
-	relations := make(map[uint32]*targetRelation, len(transaction.Relations))
-	for i := range transaction.Relations {
-		relation, err := relationCache.resolve(ctx, conn, &transaction.Relations[i], loadTargetRelation)
-		if err != nil {
-			return err
-		}
-		relations[relation.source.OID] = relation
+	relations, err := resolveTargetRelations(ctx, conn, relationCache, transaction)
+	if err != nil {
+		return err
 	}
 
 	collector := newSampleCollector(a.config.Sampler, transaction)
 	replay := newApplyPipeline(ctx, conn.PgConn(), statementCache)
 	replay.begin()
-	var replayErr error
-	if transaction.Spill != nil {
-		replayErr = a.applySpilledChanges(replay, relations, transaction.Spill, collector)
-	} else {
-		for i := 0; i < len(transaction.Changes); {
-			change := &transaction.Changes[i]
-			relation := relations[change.RelationOID]
-			if relation == nil {
-				replayErr = divergenceFor(nil, change.Kind, "required relation metadata is missing")
-				break
-			}
-			switch change.Kind {
-			case ChangeInsert:
-				end := i + 1
-				for end < len(transaction.Changes) &&
-					transaction.Changes[end].Kind == ChangeInsert &&
-					transaction.Changes[end].RelationOID == change.RelationOID {
-					end++
-				}
-				if err := applyInserts(replay, relation, transaction.Changes[i:end]); err != nil {
-					replayErr = err
-					break
-				}
-				collector.addAll(transaction.Changes[i:end])
-				i = end
-			case ChangeUpdate:
-				if err := applyUpdate(replay, relation, change); err != nil {
-					replayErr = err
-					break
-				}
-				collector.add(change)
-				i++
-			case ChangeDelete:
-				if err := applyDelete(replay, relation, change); err != nil {
-					replayErr = err
-					break
-				}
-				collector.add(change)
-				i++
-			case ChangeTruncate:
-				end := i + 1
-				for end < len(transaction.Changes) &&
-					transaction.Changes[end].Kind == ChangeTruncate &&
-					sameTruncateOptions(transaction.Changes[end], *change) {
-					end++
-				}
-				if err := applyTruncates(replay, relations, transaction.Changes[i:end]); err != nil {
-					replayErr = err
-					break
-				}
-				i = end
-			default:
-				replayErr = divergenceFor(relation, change.Kind, "unknown change kind")
-			}
-			if replayErr != nil {
-				break
-			}
-		}
-	}
+	replayErr := a.queueTransactionChanges(replay, relations, transaction, collector)
 	if replayErr == nil {
 		replayErr = replay.sync()
 	}
@@ -507,12 +528,305 @@ func (a *Applier) applyTransaction(
 	return nil
 }
 
+// applyTransactionBatch replays a bounded prefix of source transactions in one
+// target transaction. The final source EndLSN is committed atomically with all
+// DML, so a crash leaves either the whole prefix and its progress present or
+// neither. Plain relations whose catalog proves that replica-mode writes have
+// no cross-relation behavior may be grouped into relation-local lanes; every
+// other batch retains exact source order.
+func (a *Applier) applyTransactionBatch(
+	ctx context.Context,
+	conn *pgx.Conn,
+	relationCache *targetRelationCache,
+	statementCache *applyStatementCache,
+	transactions []Transaction,
+	progress LSN,
+) (bool, LSN, error) {
+	if len(transactions) == 0 {
+		return false, progress, nil
+	}
+	relations := make([]map[uint32]*targetRelation, len(transactions))
+	for i := range transactions {
+		resolved, err := resolveTargetRelations(ctx, conn, relationCache, &transactions[i])
+		if err != nil {
+			return false, progress, errors.Join(err, cleanupTransactionBatch(transactions))
+		}
+		relations[i] = resolved
+	}
+
+	replay := newApplyPipeline(ctx, conn.PgConn(), statementCache)
+	replay.syncWindow = applyBatchPipelineWindow
+	replay.begin()
+	collectors := make([]*sampleCollector, len(transactions))
+	for i := range transactions {
+		collectors[i] = newSampleCollector(a.config.Sampler, &transactions[i])
+	}
+	var replayErr error
+	if reordered, err := queueRelationBatchedChanges(
+		replay, relations, transactions, collectors,
+	); reordered {
+		replayErr = err
+	} else {
+		for i := range transactions {
+			if err := a.queueTransactionChanges(
+				replay, relations[i], &transactions[i], collectors[i],
+			); err != nil {
+				replayErr = err
+				break
+			}
+		}
+	}
+	// A successful SQL command can still be a replay divergence when an UPDATE
+	// or DELETE affects the wrong number of rows. Observe all DML results while
+	// the coalesced target transaction can still be rolled back.
+	if replayErr == nil {
+		replayErr = replay.sync()
+	}
+	if replayErr == nil && replay.conn.TxStatus() != 'T' {
+		replayErr = fmt.Errorf(
+			"cdc: target transaction status after batched replay is %q, want %q",
+			replay.conn.TxStatus(), 'T',
+		)
+	}
+	if replayErr == nil {
+		last := transactions[len(transactions)-1].EndLSN
+		replay.queueProgress(a.config.StreamID, a.config.StreamGeneration, last)
+		replay.commit()
+		replayErr = replay.sync()
+	}
+	if replayErr == nil && replay.conn.TxStatus() != 'I' {
+		replayErr = fmt.Errorf(
+			"cdc: target transaction status after batched commit is %q, want %q",
+			replay.conn.TxStatus(), 'I',
+		)
+	}
+	if replayErr != nil {
+		return false, progress, errors.Join(
+			replayErr, replay.abort(), cleanupTransactionBatch(transactions),
+		)
+	}
+	if err := replay.close(); err != nil {
+		return false, progress, errors.Join(err, cleanupTransactionBatch(transactions))
+	}
+	if err := cleanupTransactionBatch(transactions); err != nil {
+		return false, progress, err
+	}
+	for _, collector := range collectors {
+		collector.flush()
+	}
+	return true, transactions[len(transactions)-1].EndLSN, nil
+}
+
+type relationBatchedChange struct {
+	change    *Change
+	relation  *targetRelation
+	collector *sampleCollector
+}
+
+func queueRelationBatchedChanges(
+	replay *applyPipeline,
+	relations []map[uint32]*targetRelation,
+	transactions []Transaction,
+	collectors []*sampleCollector,
+) (bool, error) {
+	lanes := make([][]relationBatchedChange, 0)
+	laneIndexes := make(map[*targetRelation]int)
+	for transactionIndex := range transactions {
+		if transactions[transactionIndex].Spill != nil {
+			return false, nil
+		}
+		for changeIndex := range transactions[transactionIndex].Changes {
+			change := &transactions[transactionIndex].Changes[changeIndex]
+			relation := relations[transactionIndex][change.RelationOID]
+			if relation == nil || !relation.reorderSafe || change.Kind == ChangeTruncate {
+				return false, nil
+			}
+			laneIndex, exists := laneIndexes[relation]
+			if !exists {
+				laneIndex = len(lanes)
+				laneIndexes[relation] = laneIndex
+				lanes = append(lanes, nil)
+			}
+			lanes[laneIndex] = append(lanes[laneIndex], relationBatchedChange{
+				change: change, relation: relation, collector: collectors[transactionIndex],
+			})
+		}
+	}
+
+	for _, lane := range lanes {
+		for start := 0; start < len(lane); {
+			end := start + 1
+			for end < len(lane) && lane[end].change.Kind == lane[start].change.Kind {
+				end++
+			}
+			changes := make([]Change, end-start)
+			for i := start; i < end; i++ {
+				changes[i-start] = *lane[i].change
+			}
+			var err error
+			switch changes[0].Kind {
+			case ChangeInsert:
+				err = applyInserts(replay, lane[start].relation, changes)
+			case ChangeUpdate:
+				err = applyUpdates(replay, lane[start].relation, changes)
+			case ChangeDelete:
+				err = applyDeletes(replay, lane[start].relation, changes)
+			default:
+				return true, divergenceFor(
+					lane[start].relation, changes[0].Kind, "unknown change kind",
+				)
+			}
+			if err != nil {
+				return true, err
+			}
+			for i := start; i < end; i++ {
+				lane[i].collector.add(lane[i].change)
+			}
+			start = end
+		}
+	}
+	return true, nil
+}
+
+func cleanupTransactionBatch(transactions []Transaction) error {
+	var result error
+	for i := range transactions {
+		if err := transactions[i].CleanupSpill(); err != nil {
+			result = errors.Join(result, fmt.Errorf(
+				"cdc: cleanup batched transaction %x spill: %w", transactions[i].EndLSN, err,
+			))
+		}
+	}
+	return result
+}
+
+func resolveTargetRelations(
+	ctx context.Context,
+	conn *pgx.Conn,
+	relationCache *targetRelationCache,
+	transaction *Transaction,
+) (map[uint32]*targetRelation, error) {
+	relations := make(map[uint32]*targetRelation, len(transaction.Relations))
+	for i := range transaction.Relations {
+		relation, err := relationCache.resolve(ctx, conn, &transaction.Relations[i], loadTargetRelation)
+		if err != nil {
+			return nil, err
+		}
+		relations[relation.source.OID] = relation
+	}
+	return relations, nil
+}
+
+func (a *Applier) queueTransactionChanges(
+	replay *applyPipeline,
+	relations map[uint32]*targetRelation,
+	transaction *Transaction,
+	collector *sampleCollector,
+) error {
+	var replayErr error
+	if transaction.Spill != nil {
+		replayErr = a.applySpilledChanges(replay, relations, transaction.Spill, collector)
+	} else {
+		for i := 0; i < len(transaction.Changes); {
+			change := &transaction.Changes[i]
+			relation := relations[change.RelationOID]
+			if relation == nil {
+				replayErr = divergenceFor(nil, change.Kind, "required relation metadata is missing")
+				break
+			}
+			switch change.Kind {
+			case ChangeInsert:
+				end := i + 1
+				for end < len(transaction.Changes) &&
+					transaction.Changes[end].Kind == ChangeInsert &&
+					transaction.Changes[end].RelationOID == change.RelationOID {
+					end++
+				}
+				if err := applyInserts(replay, relation, transaction.Changes[i:end]); err != nil {
+					replayErr = err
+					break
+				}
+				collector.addAll(transaction.Changes[i:end])
+				i = end
+			case ChangeUpdate:
+				end := i + 1
+				for end < len(transaction.Changes) &&
+					transaction.Changes[end].Kind == ChangeUpdate &&
+					transaction.Changes[end].RelationOID == change.RelationOID {
+					end++
+				}
+				if err := applyUpdates(replay, relation, transaction.Changes[i:end]); err != nil {
+					replayErr = err
+					break
+				}
+				collector.addAll(transaction.Changes[i:end])
+				i = end
+			case ChangeDelete:
+				if err := applyDelete(replay, relation, change); err != nil {
+					replayErr = err
+					break
+				}
+				collector.add(change)
+				i++
+			case ChangeTruncate:
+				end := i + 1
+				for end < len(transaction.Changes) &&
+					transaction.Changes[end].Kind == ChangeTruncate &&
+					sameTruncateOptions(transaction.Changes[end], *change) {
+					end++
+				}
+				if err := applyTruncates(replay, relations, transaction.Changes[i:end]); err != nil {
+					replayErr = err
+					break
+				}
+				i = end
+			default:
+				replayErr = divergenceFor(relation, change.Kind, "unknown change kind")
+			}
+			if replayErr != nil {
+				break
+			}
+		}
+	}
+	return replayErr
+}
+
 func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *Relation) (*targetRelation, error) {
 	rows, err := db.Query(ctx, `
-		SELECT a.attname, a.atttypid, a.attidentity::text, a.attgenerated <> '', a.attnotnull
+		SELECT a.attname,
+		       a.atttypid,
+		       t.typarray,
+		       a.attidentity::text,
+		       a.attgenerated <> '',
+		       a.attnotnull,
+		       c.relkind = 'r'
+		         AND NOT c.relrowsecurity
+		         AND NOT c.relforcerowsecurity
+		         AND a.attgenerated = ''
+		         AND t.oid < 16384
+		         AND NOT EXISTS (
+		           SELECT 1 FROM pg_catalog.pg_trigger trigger_row
+		           WHERE trigger_row.tgrelid = c.oid AND trigger_row.tgenabled IN ('R', 'A')
+		         )
+		         AND NOT EXISTS (
+		           SELECT 1 FROM pg_catalog.pg_rewrite rule_row
+		           WHERE rule_row.ev_class = c.oid
+		             AND rule_row.rulename <> '_RETURN'
+		             AND rule_row.ev_enabled IN ('R', 'A')
+		         )
+		         AND NOT EXISTS (
+		           SELECT 1 FROM pg_catalog.pg_constraint constraint_row
+		           WHERE constraint_row.conrelid = c.oid AND constraint_row.contype = 'c'
+		         )
+		         AND NOT EXISTS (
+		           SELECT 1 FROM pg_catalog.pg_index index_row
+		           WHERE index_row.indrelid = c.oid
+		             AND (index_row.indexprs IS NOT NULL OR index_row.indpred IS NOT NULL)
+		         ) AS reorder_safe
 		FROM pg_catalog.pg_attribute a
 		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
 		WHERE n.nspname = $1 AND c.relname = $2
 		  AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum
@@ -522,16 +836,21 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 	}
 	defer rows.Close()
 	result := &targetRelation{
-		source: *source,
-		quoted: pgx.Identifier{source.Namespace, source.Name}.Sanitize(),
+		source:      *source,
+		quoted:      pgx.Identifier{source.Namespace, source.Name}.Sanitize(),
+		reorderSafe: true,
 	}
 	for rows.Next() {
 		var column targetColumn
+		var reorderSafe bool
 		if err := rows.Scan(
-			&column.name, &column.oid, &column.identity, &column.generated, &column.notNull,
+			&column.name, &column.oid, &column.arrayOID, &column.identity,
+			&column.generated, &column.notNull,
+			&reorderSafe,
 		); err != nil {
 			return nil, err
 		}
+		result.reorderSafe = result.reorderSafe && reorderSafe
 		if column.identity == "a" {
 			result.overrideIdentity = true
 		}
@@ -679,7 +998,81 @@ type rawParam struct {
 	isNull bool
 }
 
-const applyPipelineWindow = 256
+func arrayParamForColumn(
+	relation *targetRelation,
+	column targetColumn,
+	datums []TupleDatum,
+	kind ChangeKind,
+) (rawParam, bool, error) {
+	if column.arrayOID == 0 || len(datums) == 0 {
+		return rawParam{}, false, nil
+	}
+	format := DatumNull
+	hasNull := false
+	for _, datum := range datums {
+		if _, err := datumParamForColumn(relation, column, datum, kind); err != nil {
+			return rawParam{}, false, err
+		}
+		if datum.Kind == DatumNull {
+			hasNull = true
+			continue
+		}
+		if format == DatumNull {
+			format = datum.Kind
+		} else if format != datum.Kind {
+			return rawParam{}, false, nil
+		}
+	}
+	if format == DatumNull || format == DatumBinary {
+		data := make([]byte, 0, 20+len(datums)*8)
+		data = binary.BigEndian.AppendUint32(data, 1)
+		if hasNull {
+			data = binary.BigEndian.AppendUint32(data, 1)
+		} else {
+			data = binary.BigEndian.AppendUint32(data, 0)
+		}
+		data = binary.BigEndian.AppendUint32(data, column.oid)
+		data = binary.BigEndian.AppendUint32(data, uint32(len(datums)))
+		data = binary.BigEndian.AppendUint32(data, 1)
+		for _, datum := range datums {
+			if datum.Kind == DatumNull {
+				data = binary.BigEndian.AppendUint32(data, ^uint32(0))
+				continue
+			}
+			data = binary.BigEndian.AppendUint32(data, uint32(len(datum.Data)))
+			data = append(data, datum.Data...)
+		}
+		return rawParam{data: data, oid: column.arrayOID, format: 1}, true, nil
+	}
+
+	var data strings.Builder
+	data.Grow(2 + len(datums)*8)
+	data.WriteByte('{')
+	for i, datum := range datums {
+		if i != 0 {
+			data.WriteByte(',')
+		}
+		if datum.Kind == DatumNull {
+			data.WriteString("NULL")
+			continue
+		}
+		data.WriteByte('"')
+		for _, value := range datum.Data {
+			if value == '\\' || value == '"' {
+				data.WriteByte('\\')
+			}
+			data.WriteByte(value)
+		}
+		data.WriteByte('"')
+	}
+	data.WriteByte('}')
+	return rawParam{data: []byte(data.String()), oid: column.arrayOID}, true, nil
+}
+
+const (
+	applyPipelineWindow      = 256
+	applyBatchPipelineWindow = 65536
+)
 
 type applyResultKind byte
 
@@ -690,23 +1083,26 @@ const (
 )
 
 type applyExpectation struct {
-	resultKind    applyResultKind
-	relation      *targetRelation
-	kind          ChangeKind
-	description   string
-	expectedRows  int64
-	expectedTag   string
-	progressGuard bool
-	statement     string
-	paramOIDs     []uint32
+	resultKind       applyResultKind
+	relation         *targetRelation
+	kind             ChangeKind
+	description      string
+	expectedRows     int64
+	expectedOrdinals int
+	expectedTag      string
+	progressGuard    bool
+	statement        string
+	paramOIDs        []uint32
 }
 
 type applyPipeline struct {
+	ctx          context.Context
 	conn         *pgconn.PgConn
 	pipeline     *pgconn.Pipeline
 	statements   *applyStatementCache
 	expectations []applyExpectation
 	commands     int
+	syncWindow   int
 	closed       bool
 }
 
@@ -716,9 +1112,11 @@ func newApplyPipeline(
 	statements *applyStatementCache,
 ) *applyPipeline {
 	return &applyPipeline{
+		ctx:        ctx,
 		conn:       conn,
 		pipeline:   conn.StartPipeline(ctx),
 		statements: statements,
+		syncWindow: applyPipelineWindow,
 	}
 }
 
@@ -778,7 +1176,7 @@ func (p *applyPipeline) queue(
 	}
 	p.expectations = append(p.expectations, expectation)
 	p.commands++
-	if p.commands >= applyPipelineWindow {
+	if p.syncWindow > 0 && p.commands >= p.syncWindow {
 		return p.sync()
 	}
 	return nil
@@ -870,12 +1268,16 @@ func (p *applyPipeline) sync() error {
 				}
 				continue
 			}
+			ordinalErr := expectation.validateOrdinals(reader)
 			tag, closeErr := reader.Close()
 			if closeErr != nil {
 				if firstErr == nil {
 					firstErr = expectation.classify(closeErr)
 				}
 				continue
+			}
+			if ordinalErr != nil && firstErr == nil {
+				firstErr = ordinalErr
 			}
 			if expectation.expectedRows >= 0 && tag.RowsAffected() != expectation.expectedRows && firstErr == nil {
 				firstErr = divergenceFor(expectation.relation, expectation.kind, fmt.Sprintf(
@@ -922,6 +1324,54 @@ func (p *applyPipeline) sync() error {
 	}
 }
 
+func (expectation applyExpectation) validateOrdinals(reader *pgconn.ResultReader) error {
+	if expectation.expectedOrdinals == 0 {
+		return nil
+	}
+	seen := make([]bool, expectation.expectedOrdinals)
+	var result error
+	for reader.NextRow() {
+		values := reader.Values()
+		if len(values) != 1 {
+			if result == nil {
+				result = divergenceFor(expectation.relation, expectation.kind, fmt.Sprintf(
+					"batched replay returned %d identity columns, expected 1", len(values),
+				))
+			}
+			continue
+		}
+		ordinal, err := strconv.Atoi(string(values[0]))
+		if err != nil || ordinal < 0 || ordinal >= len(seen) {
+			if result == nil {
+				result = divergenceFor(expectation.relation, expectation.kind, fmt.Sprintf(
+					"batched replay returned invalid identity ordinal %q", values[0],
+				))
+			}
+			continue
+		}
+		if seen[ordinal] {
+			if result == nil {
+				result = divergenceFor(expectation.relation, expectation.kind, fmt.Sprintf(
+					"batched replay matched identity ordinal %d more than once", ordinal,
+				))
+			}
+			continue
+		}
+		seen[ordinal] = true
+	}
+	if result != nil {
+		return result
+	}
+	for ordinal, matched := range seen {
+		if !matched {
+			return divergenceFor(expectation.relation, expectation.kind, fmt.Sprintf(
+				"batched replay did not match identity ordinal %d", ordinal,
+			))
+		}
+	}
+	return nil
+}
+
 func closeUnexpectedPipelineResult(result any) error {
 	if reader, ok := result.(*pgconn.ResultReader); ok {
 		_, err := reader.Close()
@@ -958,6 +1408,60 @@ func (p *applyPipeline) close() error {
 	return closeErr
 }
 
+func (p *applyPipeline) suspend() error {
+	if len(p.expectations) != 0 {
+		if err := p.sync(); err != nil {
+			return err
+		}
+	}
+	if err := p.pipeline.Close(); err != nil {
+		p.pipeline = nil
+		p.resume()
+		return classifyApplyError(nil, 0, fmt.Errorf(
+			"cdc: suspend replay pipeline: %w", err,
+		))
+	}
+	p.pipeline = nil
+	return nil
+}
+
+func (p *applyPipeline) resume() {
+	if p.pipeline == nil {
+		p.pipeline = p.conn.StartPipeline(p.ctx)
+	}
+}
+
+func (p *applyPipeline) binaryCopy(
+	relation *targetRelation,
+	kind ChangeKind,
+	description string,
+	copySQL string,
+	data []byte,
+	expectedRows int,
+) error {
+	if err := p.suspend(); err != nil {
+		return err
+	}
+	if p.conn.TxStatus() != 'T' {
+		p.resume()
+		return fmt.Errorf(
+			"cdc: target transaction status before %s is %q, want %q",
+			description, p.conn.TxStatus(), 'T',
+		)
+	}
+	tag, copyErr := p.conn.CopyFrom(p.ctx, bytes.NewReader(data), copySQL)
+	p.resume()
+	if copyErr != nil {
+		return classifyApplyError(relation, kind, fmt.Errorf("%s: %w", description, copyErr))
+	}
+	if tag.RowsAffected() != int64(expectedRows) {
+		return divergenceFor(relation, kind, fmt.Sprintf(
+			"%s affected %d rows, expected %d", description, tag.RowsAffected(), expectedRows,
+		))
+	}
+	return nil
+}
+
 func (p *applyPipeline) abort() error {
 	if p.closed {
 		return nil
@@ -985,17 +1489,109 @@ func (p *applyPipeline) abort() error {
 var emptyParamValue = []byte{}
 
 func applyInserts(replay *applyPipeline, relation *targetRelation, changes []Change) error {
-	chunkRows := insertChunkRows(len(relation.columns))
-	for start := 0; start < len(changes); start += chunkRows {
-		end := start + chunkRows
-		if end > len(changes) {
-			end = len(changes)
+	if copied, err := applyInsertCopy(replay, relation, changes); copied || err != nil {
+		return err
+	}
+	for arrayStart := 0; arrayStart < len(changes); arrayStart += applyArrayChunkRows {
+		arrayEnd := arrayStart + applyArrayChunkRows
+		if arrayEnd > len(changes) {
+			arrayEnd = len(changes)
 		}
-		if err := applyInsertChunk(replay, relation, changes[start:end]); err != nil {
-			return err
+		arrayChanges := changes[arrayStart:arrayEnd]
+		if len(relation.columns) != 0 {
+			if applied, err := applyInsertArrayChunk(replay, relation, arrayChanges); applied {
+				if err != nil {
+					return err
+				}
+				continue
+			} else if err != nil {
+				return err
+			}
+		}
+		chunkRows := insertChunkRows(len(relation.columns))
+		for start := 0; start < len(arrayChanges); start += chunkRows {
+			end := start + chunkRows
+			if end > len(arrayChanges) {
+				end = len(arrayChanges)
+			}
+			if err := applyInsertChunk(replay, relation, arrayChanges[start:end]); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+const applyArrayChunkRows = 8192
+
+func applyInsertCopy(
+	replay *applyPipeline,
+	relation *targetRelation,
+	changes []Change,
+) (bool, error) {
+	const minimumCopyRows = 256
+	if len(changes) < minimumCopyRows || len(relation.columns) == 0 || !relation.reorderSafe {
+		return false, nil
+	}
+	data, supported, err := binaryCopyData(relation, changes)
+	if err != nil || !supported {
+		return supported, err
+	}
+	var sql strings.Builder
+	sql.WriteString("COPY ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" (")
+	for i, column := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString(column.quoted)
+	}
+	sql.WriteString(") FROM STDIN BINARY")
+	return true, replay.binaryCopy(
+		relation, ChangeInsert, "binary copy into "+relation.quoted,
+		sql.String(), data, len(changes),
+	)
+}
+
+func binaryCopyData(relation *targetRelation, changes []Change) ([]byte, bool, error) {
+	estimatedBytes := 21 + len(changes)*(2+len(relation.columns)*4)
+	for row := range changes {
+		if err := validateTuple(relation, changes[row].New, ChangeInsert); err != nil {
+			return nil, true, err
+		}
+		for _, column := range relation.columns {
+			datum := (*changes[row].New)[column.sourceIndex]
+			switch datum.Kind {
+			case DatumNull:
+			case DatumBinary:
+				if _, err := datumParamForColumn(relation, column, datum, ChangeInsert); err != nil {
+					return nil, true, err
+				}
+				estimatedBytes += len(datum.Data)
+			default:
+				return nil, false, nil
+			}
+		}
+	}
+	data := make([]byte, 0, estimatedBytes)
+	data = append(data, []byte("PGCOPY\n\xff\r\n\x00")...)
+	data = binary.BigEndian.AppendUint32(data, 0)
+	data = binary.BigEndian.AppendUint32(data, 0)
+	for row := range changes {
+		data = binary.BigEndian.AppendUint16(data, uint16(len(relation.columns)))
+		for _, column := range relation.columns {
+			datum := (*changes[row].New)[column.sourceIndex]
+			if datum.Kind == DatumNull {
+				data = binary.BigEndian.AppendUint32(data, ^uint32(0))
+				continue
+			}
+			data = binary.BigEndian.AppendUint32(data, uint32(len(datum.Data)))
+			data = append(data, datum.Data...)
+		}
+	}
+	data = binary.BigEndian.AppendUint16(data, ^uint16(0))
+	return data, true, nil
 }
 
 func insertChunkRows(columnCount int) int {
@@ -1073,6 +1669,417 @@ func applyInsertChunk(replay *applyPipeline, relation *targetRelation, changes [
 	return replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeInsert,
 		description: "insert into " + relation.quoted, expectedRows: int64(len(changes)),
+	})
+}
+
+func applyInsertArrayChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	changes []Change,
+) (bool, error) {
+	params := make([]rawParam, 0, len(relation.columns))
+	for _, column := range relation.columns {
+		datums := make([]TupleDatum, len(changes))
+		for row := range changes {
+			if err := validateTuple(relation, changes[row].New, ChangeInsert); err != nil {
+				return true, err
+			}
+			datums[row] = (*changes[row].New)[column.sourceIndex]
+		}
+		param, supported, err := arrayParamForColumn(relation, column, datums, ChangeInsert)
+		if err != nil {
+			return true, err
+		}
+		if !supported {
+			return false, nil
+		}
+		params = append(params, param)
+	}
+
+	var sql strings.Builder
+	sql.WriteString("INSERT INTO ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" (")
+	for i, column := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString(column.quoted)
+	}
+	sql.WriteByte(')')
+	if relation.overrideIdentity {
+		sql.WriteString(" OVERRIDING SYSTEM VALUE")
+	}
+	sql.WriteString(" SELECT ")
+	for i := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "pgmigrate_batch.column_%d", i)
+	}
+	sql.WriteString(" FROM unnest(")
+	for i := range params {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "$%d", i+1)
+	}
+	sql.WriteString(") AS pgmigrate_batch(")
+	for i := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "column_%d", i)
+	}
+	sql.WriteByte(')')
+	return true, replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeInsert,
+		description: "array insert into " + relation.quoted, expectedRows: int64(len(changes)),
+	})
+}
+
+func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Change) error {
+	identityColumns := batchUpdateIdentityColumns(relation)
+	if len(changes) < 2 || len(identityColumns) == 0 || len(relation.columns) == 0 {
+		for i := range changes {
+			if err := applyUpdate(replay, relation, &changes[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	for start := 0; start < len(changes); {
+		firstKey, err := batchUpdateIdentityKey(relation, identityColumns, &changes[start])
+		if err != nil {
+			return err
+		}
+		setColumns := updateSetColumnIndexes(relation, &changes[start])
+		chunkRows := applyArrayChunkRows
+		seen := map[string]struct{}{firstKey: {}}
+		end := start + 1
+		for end < len(changes) && end-start < chunkRows {
+			key, err := batchUpdateIdentityKey(relation, identityColumns, &changes[end])
+			if err != nil {
+				return err
+			}
+			if !sameUpdateSetColumns(relation, &changes[start], &changes[end]) {
+				break
+			}
+			if _, duplicate := seen[key]; duplicate {
+				break
+			}
+			seen[key] = struct{}{}
+			end++
+		}
+		if end-start == 1 {
+			if err := applyUpdate(replay, relation, &changes[start]); err != nil {
+				return err
+			}
+		} else if err := applyUpdateChunk(
+			replay, relation, identityColumns, setColumns, changes[start:end],
+		); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
+}
+
+func batchUpdateIdentityColumns(relation *targetRelation) []targetColumn {
+	if relation == nil || !relation.reorderSafe || relation.source.ReplicaIdentity == 'f' {
+		return nil
+	}
+	columns := make([]targetColumn, 0, len(predicateTargetColumns(relation)))
+	for _, column := range predicateTargetColumns(relation) {
+		if !column.key {
+			continue
+		}
+		// Replica identity indexes are expected to be unique and NOT NULL. Keep
+		// nullable or drifted targets on the one-row path, whose row-count check
+		// is unambiguous without relying on that invariant.
+		if !column.notNull {
+			return nil
+		}
+		columns = append(columns, column)
+	}
+	return columns
+}
+
+func batchUpdateIdentityKey(
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	change *Change,
+) (string, error) {
+	if err := validateTuple(relation, change.New, ChangeUpdate); err != nil {
+		return "", err
+	}
+	predicate := change.Old
+	if predicate == nil {
+		predicate = change.New
+	}
+	if err := validateTuple(relation, predicate, ChangeUpdate); err != nil {
+		return "", err
+	}
+	var key strings.Builder
+	for _, column := range identityColumns {
+		datum := (*predicate)[column.sourceIndex]
+		if datum.Kind == DatumUnchangedToast {
+			return "", divergenceFor(relation, ChangeUpdate, "replica identity contains unchanged TOAST")
+		}
+		if _, err := datumParamForColumn(relation, column, datum, ChangeUpdate); err != nil {
+			return "", err
+		}
+		key.WriteByte(byte(datum.Kind))
+		key.WriteString(strconv.Itoa(len(datum.Data)))
+		key.WriteByte(':')
+		key.Write(datum.Data)
+	}
+	return key.String(), nil
+}
+
+func updateSetColumnIndexes(relation *targetRelation, change *Change) []int {
+	result := make([]int, 0, len(relation.columns))
+	for i := range relation.columns {
+		if (*change.New)[relation.columns[i].sourceIndex].Kind != DatumUnchangedToast {
+			result = append(result, i)
+		}
+	}
+	return result
+}
+
+func sameUpdateSetColumns(relation *targetRelation, left, right *Change) bool {
+	for i := range relation.columns {
+		sourceIndex := relation.columns[i].sourceIndex
+		if ((*left.New)[sourceIndex].Kind == DatumUnchangedToast) !=
+			((*right.New)[sourceIndex].Kind == DatumUnchangedToast) {
+			return false
+		}
+	}
+	return true
+}
+
+func updateChunkRows(parametersPerRow int) int {
+	const (
+		maxBindParameters = 65535
+		maxSQLRows        = 1000
+	)
+	if parametersPerRow <= 0 {
+		return 1
+	}
+	rows := maxBindParameters / parametersPerRow
+	if rows > maxSQLRows {
+		rows = maxSQLRows
+	}
+	if rows < 1 {
+		rows = 1
+	}
+	return rows
+}
+
+func applyUpdateChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+	changes []Change,
+) error {
+	if applied, err := applyUpdateArrayChunk(
+		replay, relation, identityColumns, setColumns, changes,
+	); applied || err != nil {
+		return err
+	}
+	chunkRows := updateChunkRows(len(setColumns) + len(identityColumns))
+	for start := 0; start < len(changes); start += chunkRows {
+		end := start + chunkRows
+		if end > len(changes) {
+			end = len(changes)
+		}
+		if err := applyUpdateValueChunk(
+			replay, relation, identityColumns, setColumns, changes[start:end],
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyUpdateValueChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+	changes []Change,
+) error {
+	var sql strings.Builder
+	sql.WriteString("UPDATE ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_target SET ")
+	if len(setColumns) == 0 {
+		sql.WriteString(relation.columns[0].quoted)
+		sql.WriteString("=pgmigrate_target.")
+		sql.WriteString(relation.columns[0].quoted)
+	} else {
+		for i, columnIndex := range setColumns {
+			if i != 0 {
+				sql.WriteByte(',')
+			}
+			sql.WriteString(relation.columns[columnIndex].quoted)
+			fmt.Fprintf(&sql, "=pgmigrate_batch.set_%d", i)
+		}
+	}
+	sql.WriteString(" FROM (VALUES ")
+	params := make([]rawParam, 0, len(changes)*(len(setColumns)+len(identityColumns)))
+	for row := range changes {
+		if row != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "(%d", row)
+		for _, columnIndex := range setColumns {
+			datum := (*changes[row].New)[relation.columns[columnIndex].sourceIndex]
+			param, err := datumParam(relation, columnIndex, datum, ChangeUpdate)
+			if err != nil {
+				return err
+			}
+			params = append(params, param)
+			fmt.Fprintf(&sql, ",$%d", len(params))
+		}
+		predicate := changes[row].Old
+		if predicate == nil {
+			predicate = changes[row].New
+		}
+		for _, column := range identityColumns {
+			param, err := datumParamForColumn(
+				relation, column, (*predicate)[column.sourceIndex], ChangeUpdate,
+			)
+			if err != nil {
+				return err
+			}
+			params = append(params, param)
+			fmt.Fprintf(&sql, ",$%d", len(params))
+		}
+		sql.WriteByte(')')
+	}
+	sql.WriteString(") AS pgmigrate_batch(ordinal")
+	for i := range setColumns {
+		fmt.Fprintf(&sql, ",set_%d", i)
+	}
+	for i := range identityColumns {
+		fmt.Fprintf(&sql, ",identity_%d", i)
+	}
+	sql.WriteString(") WHERE ")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString("pgmigrate_target.")
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(&sql, "=pgmigrate_batch.identity_%d", i)
+	}
+	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
+	return replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description: "batch update " + relation.quoted, expectedRows: int64(len(changes)),
+		expectedOrdinals: len(changes),
+	})
+}
+
+func applyUpdateArrayChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+	changes []Change,
+) (bool, error) {
+	params := make([]rawParam, 0, len(setColumns)+len(identityColumns))
+	for _, columnIndex := range setColumns {
+		column := relation.columns[columnIndex]
+		datums := make([]TupleDatum, len(changes))
+		for row := range changes {
+			datums[row] = (*changes[row].New)[column.sourceIndex]
+		}
+		param, supported, err := arrayParamForColumn(relation, column, datums, ChangeUpdate)
+		if err != nil {
+			return true, err
+		}
+		if !supported {
+			return false, nil
+		}
+		params = append(params, param)
+	}
+	for _, column := range identityColumns {
+		datums := make([]TupleDatum, len(changes))
+		for row := range changes {
+			predicate := changes[row].Old
+			if predicate == nil {
+				predicate = changes[row].New
+			}
+			datums[row] = (*predicate)[column.sourceIndex]
+		}
+		param, supported, err := arrayParamForColumn(relation, column, datums, ChangeUpdate)
+		if err != nil {
+			return true, err
+		}
+		if !supported {
+			return false, nil
+		}
+		params = append(params, param)
+	}
+
+	var sql strings.Builder
+	sql.WriteString("UPDATE ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_target SET ")
+	if len(setColumns) == 0 {
+		sql.WriteString(relation.columns[0].quoted)
+		sql.WriteString("=pgmigrate_target.")
+		sql.WriteString(relation.columns[0].quoted)
+	} else {
+		for i, columnIndex := range setColumns {
+			if i != 0 {
+				sql.WriteByte(',')
+			}
+			sql.WriteString(relation.columns[columnIndex].quoted)
+			fmt.Fprintf(&sql, "=pgmigrate_batch.set_%d", i)
+		}
+	}
+	sql.WriteString(" FROM unnest(")
+	for i := range params {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "$%d", i+1)
+	}
+	sql.WriteString(") WITH ORDINALITY AS pgmigrate_batch(")
+	for i := range setColumns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "set_%d", i)
+	}
+	for i := range identityColumns {
+		if len(setColumns) != 0 || i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "identity_%d", i)
+	}
+	if len(setColumns)+len(identityColumns) != 0 {
+		sql.WriteByte(',')
+	}
+	sql.WriteString("ordinal) WHERE ")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString("pgmigrate_target.")
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(&sql, "=pgmigrate_batch.identity_%d", i)
+	}
+	sql.WriteString(" RETURNING pgmigrate_batch.ordinal - 1")
+	return true, replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description:  "array batch update " + relation.quoted,
+		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
 	})
 }
 
@@ -1169,6 +2176,206 @@ func hasReplicaIdentityColumns(relation *targetRelation) bool {
 		}
 	}
 	return false
+}
+
+func applyDeletes(replay *applyPipeline, relation *targetRelation, changes []Change) error {
+	identityColumns := batchUpdateIdentityColumns(relation)
+	if len(changes) < 2 || len(identityColumns) == 0 {
+		for i := range changes {
+			if err := applyDelete(replay, relation, &changes[i]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	chunkRows := applyArrayChunkRows
+	for start := 0; start < len(changes); {
+		firstKey, err := batchDeleteIdentityKey(relation, identityColumns, &changes[start])
+		if err != nil {
+			return err
+		}
+		seen := map[string]struct{}{firstKey: {}}
+		end := start + 1
+		for end < len(changes) && end-start < chunkRows {
+			key, err := batchDeleteIdentityKey(relation, identityColumns, &changes[end])
+			if err != nil {
+				return err
+			}
+			if _, duplicate := seen[key]; duplicate {
+				break
+			}
+			seen[key] = struct{}{}
+			end++
+		}
+		if end-start == 1 {
+			if err := applyDelete(replay, relation, &changes[start]); err != nil {
+				return err
+			}
+		} else if err := applyDeleteChunk(
+			replay, relation, identityColumns, changes[start:end],
+		); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
+}
+
+func batchDeleteIdentityKey(
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	change *Change,
+) (string, error) {
+	if err := validateTuple(relation, change.Old, ChangeDelete); err != nil {
+		return "", err
+	}
+	var key strings.Builder
+	for _, column := range identityColumns {
+		datum := (*change.Old)[column.sourceIndex]
+		if datum.Kind == DatumUnchangedToast {
+			return "", divergenceFor(relation, ChangeDelete, "replica identity contains unchanged TOAST")
+		}
+		if _, err := datumParamForColumn(relation, column, datum, ChangeDelete); err != nil {
+			return "", err
+		}
+		key.WriteByte(byte(datum.Kind))
+		key.WriteString(strconv.Itoa(len(datum.Data)))
+		key.WriteByte(':')
+		key.Write(datum.Data)
+	}
+	return key.String(), nil
+}
+
+func applyDeleteChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	changes []Change,
+) error {
+	if applied, err := applyDeleteArrayChunk(
+		replay, relation, identityColumns, changes,
+	); applied || err != nil {
+		return err
+	}
+	chunkRows := updateChunkRows(len(identityColumns))
+	for start := 0; start < len(changes); start += chunkRows {
+		end := start + chunkRows
+		if end > len(changes) {
+			end = len(changes)
+		}
+		if err := applyDeleteValueChunk(
+			replay, relation, identityColumns, changes[start:end],
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyDeleteValueChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	changes []Change,
+) error {
+	var sql strings.Builder
+	sql.WriteString("DELETE FROM ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_target USING (VALUES ")
+	params := make([]rawParam, 0, len(changes)*len(identityColumns))
+	for row := range changes {
+		if row != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "(%d", row)
+		for _, column := range identityColumns {
+			param, err := datumParamForColumn(
+				relation, column, (*changes[row].Old)[column.sourceIndex], ChangeDelete,
+			)
+			if err != nil {
+				return err
+			}
+			params = append(params, param)
+			fmt.Fprintf(&sql, ",$%d", len(params))
+		}
+		sql.WriteByte(')')
+	}
+	sql.WriteString(") AS pgmigrate_batch(ordinal")
+	for i := range identityColumns {
+		fmt.Fprintf(&sql, ",identity_%d", i)
+	}
+	sql.WriteString(") WHERE ")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString("pgmigrate_target.")
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(&sql, "=pgmigrate_batch.identity_%d", i)
+	}
+	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
+	return replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeDelete,
+		description: "batch delete from " + relation.quoted, expectedRows: int64(len(changes)),
+		expectedOrdinals: len(changes),
+	})
+}
+
+func applyDeleteArrayChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	changes []Change,
+) (bool, error) {
+	params := make([]rawParam, 0, len(identityColumns))
+	for _, column := range identityColumns {
+		datums := make([]TupleDatum, len(changes))
+		for row := range changes {
+			datums[row] = (*changes[row].Old)[column.sourceIndex]
+		}
+		param, supported, err := arrayParamForColumn(relation, column, datums, ChangeDelete)
+		if err != nil {
+			return true, err
+		}
+		if !supported {
+			return false, nil
+		}
+		params = append(params, param)
+	}
+
+	var sql strings.Builder
+	sql.WriteString("DELETE FROM ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_target USING unnest(")
+	for i := range params {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "$%d", i+1)
+	}
+	sql.WriteString(") WITH ORDINALITY AS pgmigrate_batch(")
+	for i := range identityColumns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "identity_%d", i)
+	}
+	sql.WriteString(",ordinal) WHERE ")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString("pgmigrate_target.")
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(&sql, "=pgmigrate_batch.identity_%d", i)
+	}
+	sql.WriteString(" RETURNING pgmigrate_batch.ordinal - 1")
+	return true, replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeDelete,
+		description:  "array batch delete from " + relation.quoted,
+		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
+	})
 }
 
 func applyDelete(replay *applyPipeline, relation *targetRelation, change *Change) error {

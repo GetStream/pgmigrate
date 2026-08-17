@@ -41,7 +41,8 @@ until cutover completes:
 4. **indexes** restores the managed indexes and constraints, driving the builds
    itself so they run concurrently, restores the deferred post-data objects one
    at a time behind durable markers, and vacuums the loaded tables.
-5. **catchup** applies the transactions staged during the copy, in source order.
+5. **catchup** applies the transactions staged during the copy with atomic
+   progress and source-order fallbacks.
 6. **follow** applies live changes and watches source and slot health.
 
 Change data capture uses `pgoutput`, the logical decoding plugin built into
@@ -461,6 +462,23 @@ with them after a crash, and then replay either loses transactions or repeats
 them. A source-and-filter-derived stream generation binds copied data to that
 progress, and a resume refuses progress that is missing or belongs to another
 stream.
+
+During catch-up, the applier coalesces an available ordered prefix of small
+source transactions into one bounded target transaction. It never waits to fill
+a group, so follow-mode latency stays low when traffic is light. A group is
+capped by transaction count, row changes, and decoded data bytes; spilled or
+large source transactions are replayed on their own. The final source EndLSN is
+committed atomically with the whole group, so a crash or replay error leaves
+either all grouped changes and their progress or neither.
+
+For plain built-in relations, catalog checks prove that replica-mode writes have
+no cross-relation behavior: no replica/always triggers or rules, RLS, checks,
+generated columns, domains, or expression/partial indexes. The applier can then
+preserve exact per-relation order while grouping independent relation lanes,
+using binary `COPY` for large insert runs and ordinal-checked array operations
+for keyed updates and deletes. Any relation outside that conservative set keeps
+exact source order and the scalar fallback. This removes most SQL, commit/fsync,
+and progress overhead while the target is still offline for migration.
 
 Every connection that reads or executes a catalog definition pins `search_path`
 to the empty path, so definitions are fully qualified and mean the same thing on

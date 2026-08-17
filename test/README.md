@@ -164,11 +164,26 @@ and corrupt active tails; cutover unit tests cover report/marker crash windows.
 ```sh
 make bench
 go test -run='^$' -bench=. -benchmem ./internal/cdc
+make cdc-bench
 ```
 
 Benchmarks cover codec encode/decode, pgoutput decode, apply preparation,
 segment append, and large-record reading. Results are machine-local
 microbenchmarks; do not report them as database migration throughput.
+
+`make cdc-bench` is the opt-in database-facing replay benchmark. It starts
+independent PostgreSQL 17 source and target containers, creates a durable CDC
+backlog from real WAL, then measures a cold applier draining 500,000 row changes
+in 50,000 transactions with a 5/4/1 insert/update/delete mix across realistic
+indexed tables. Exact source and target table digests are compared before the
+default 200,000 changes/second target is enforced.
+
+Use `PGMIGRATE_CDC_BENCH_TRANSACTIONS` to change the default 50,000 source
+transactions, and `PGMIGRATE_CDC_BENCH_MIN_CHANGES_PER_SECOND` to set a
+machine-specific gate. The reported rate covers replay of an already durable
+backlog; source workload generation and pgoutput staging are deliberately
+outside the timed interval. Set `PGMIGRATE_CDC_BENCH_CPU_PROFILE` to a writable
+path to capture a CPU profile covering only the timed replay interval.
 
 ## Before delivery
 
