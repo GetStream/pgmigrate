@@ -41,7 +41,8 @@ until cutover completes:
 4. **indexes** restores the managed indexes and constraints, driving the builds
    itself so they run concurrently, restores the deferred post-data objects one
    at a time behind durable markers, and vacuums the loaded tables.
-5. **catchup** applies the transactions staged during the copy, in source order.
+5. **catchup** applies the transactions staged during the copy with atomic
+   progress and source-order fallbacks.
 6. **follow** applies live changes and watches source and slot health.
 
 Change data capture uses `pgoutput`, the logical decoding plugin built into
@@ -462,6 +463,23 @@ them. A source-and-filter-derived stream generation binds copied data to that
 progress, and a resume refuses progress that is missing or belongs to another
 stream.
 
+During catch-up, the applier coalesces an available ordered prefix of small
+source transactions into one bounded target transaction. It never waits to fill
+a group, so follow-mode latency stays low when traffic is light. A group is
+capped by transaction count, row changes, and decoded data bytes; spilled or
+large source transactions are replayed on their own. The final source EndLSN is
+committed atomically with the whole group, so a crash or replay error leaves
+either all grouped changes and their progress or neither.
+
+For plain built-in relations, catalog checks prove that replica-mode writes have
+no cross-relation behavior: no replica/always triggers or rules, RLS, checks,
+generated columns, domains, or expression/partial indexes. The applier can then
+preserve exact per-relation order while grouping independent relation lanes,
+using binary `COPY` for large insert runs and ordinal-checked array operations
+for keyed updates and deletes. Any relation outside that conservative set keeps
+exact source order and the scalar fallback. This removes most SQL, commit/fsync,
+and progress overhead while the target is still offline for migration.
+
 Every connection that reads or executes a catalog definition pins `search_path`
 to the empty path, so definitions are fully qualified and mean the same thing on
 both sides. pgmigrate also records how the target rendered each index and
@@ -763,6 +781,7 @@ make race
 PGTEST_MAJORS=17 make integration
 PGTEST_MAJORS=16,17,18 make integration
 make bench
+make cdc-bench
 make e2e
 make crash-e2e
 ```
@@ -772,6 +791,14 @@ runtime. The PostgreSQL 17 Compose e2e harness independently checks final table
 inventory, row counts, and canonical row digests, including one digest per leaf
 partition and a comparison of every index and constraint definition in the
 schema.
+
+`make cdc-bench` times only replay of a durable 500,000-change backlog and
+compares full source/target table digests. Use
+`PGMIGRATE_CDC_BENCH_BARRIER_EVERY=N` to add a check-constrained ordering
+barrier every N source transactions, and `PGMIGRATE_CDC_BENCH_ACCOUNT_COUNT=N`
+to exercise hot-key skew. Transaction count and the minimum accepted rate are
+controlled by `PGMIGRATE_CDC_BENCH_TRANSACTIONS` and
+`PGMIGRATE_CDC_BENCH_MIN_CHANGES_PER_SECOND`.
 
 ## Limitations
 
