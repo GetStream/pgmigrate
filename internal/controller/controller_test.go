@@ -99,6 +99,12 @@ func TestStatusReportsDurableProgress(t *testing.T) {
 	if err := store.CompletePart(ctx, 1, "all", 1234, 5678, 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.UpdateApplyProgress(ctx, state.ApplyProgress{
+		StagedLSN: "0/30", AppliedLSN: "0/20", Txns: 17, Rows: 41,
+		UpdatedAt: time.Now().UTC().Add(-time.Second),
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -119,6 +125,9 @@ func TestStatusReportsDurableProgress(t *testing.T) {
 	}
 	if response.Copy.Rows != 1234 || response.Copy.Bytes != 5678 || response.Copy.Duration != 2*time.Second {
 		t.Fatalf("copy progress = %#v", response.Copy)
+	}
+	if response.Snapshot.Apply.Txns != 17 || response.Snapshot.Apply.Rows != 41 {
+		t.Fatalf("replay progress = %#v, want 17 transactions/41 rows", response.Snapshot.Apply)
 	}
 }
 
@@ -159,6 +168,36 @@ func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
 	}
 	waitForState(t, server, "verification", "stopped")
 	waitForState(t, server, "migration", "stopped")
+}
+
+func TestPanickingRunCanBeResumedFromDurablePhase(t *testing.T) {
+	dir := t.TempDir()
+	initializeStateAt(t, dir, state.PhaseFollow)
+	var calls atomic.Int32
+	actions := noOpActions()
+	actions.Run = func(context.Context, config.Config, io.Writer) error {
+		if calls.Add(1) == 1 {
+			panic("synthetic replay panic")
+		}
+		return nil
+	}
+	server := newTestServer(t, config.Config{Dir: dir}, "", actions)
+	revision := server.configurationViewSnapshot().Revision
+
+	if got := requestAction(t, server, "run", revision, ""); got.Code != http.StatusAccepted {
+		t.Fatalf("first run status = %d, body = %s", got.Code, got.Body.String())
+	}
+	waitForState(t, server, "migration", "failed")
+	if got := server.operationSnapshots()["migration"].Error; !strings.Contains(got, "panicked") {
+		t.Fatalf("panic operation error = %q", got)
+	}
+	if got := requestAction(t, server, "run", revision, ""); got.Code != http.StatusAccepted {
+		t.Fatalf("resume status = %d, body = %s", got.Code, got.Body.String())
+	}
+	waitForState(t, server, "migration", "succeeded")
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("run calls = %d, want failed attempt plus resume", got)
+	}
 }
 
 func TestCopyRateUsesObservedByteDelta(t *testing.T) {
@@ -592,6 +631,12 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		"rate_bytes_per_second",
 		"data streamed",
 		"rows streamed",
+		"replay rate",
+		"transactions applied",
+		"sampleReplay",
+		"row changes",
+		"Resume continues from durable",
+		"target apply position will be reused",
 		"Steps run in order.",
 		"accepted risk",
 		"performance only",

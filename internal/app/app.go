@@ -1736,20 +1736,26 @@ func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamI
 		if err != nil {
 			return err
 		}
-		applied, _, readErr := postgres.ReadProgress(ctx, conn, streamID)
+		progress, _, readErr := postgres.ReadReplicationProgress(ctx, conn, streamID)
 		conn.Close(context.Background())
 		if readErr != nil {
 			return readErr
 		}
 		if err := store.UpdateApplyProgress(ctx, state.ApplyProgress{
-			StagedLSN: pglogrepl.LSN(durable.Load()).String(), AppliedLSN: applied.String(),
+			StagedLSN:  pglogrepl.LSN(durable.Load()).String(),
+			AppliedLSN: progress.RemoteLSN.String(),
+			Txns:       progress.Transactions,
+			Rows:       progress.Rows,
+			UpdatedAt:  progress.UpdatedAt,
 		}); err != nil {
 			return err
 		}
 		if !time.Now().Before(nextLog) {
 			logEvent(dir, "progress", map[string]any{
-				"staged_lsn":  pglogrepl.LSN(durable.Load()).String(),
-				"applied_lsn": applied.String(),
+				"staged_lsn":   pglogrepl.LSN(durable.Load()).String(),
+				"applied_lsn":  progress.RemoteLSN.String(),
+				"transactions": progress.Transactions,
+				"rows":         progress.Rows,
 			})
 			nextLog = time.Now().Add(5 * time.Second)
 		}

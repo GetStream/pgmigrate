@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -798,12 +799,32 @@ func (s *Server) start(name string, revision string, action Action) (operationVi
 	s.operations[slot] = operation
 	view := operation.view()
 	cfg := s.cfg
-	go s.execute(ctx, slot, operation.ID, output, cfg, action)
+	go s.execute(ctx, cancel, slot, operation.ID, output, cfg, action)
 	return view, nil
 }
 
-func (s *Server) execute(ctx context.Context, slot string, id int64, output io.Writer, cfg config.Config, action Action) {
-	err := action(ctx, cfg, output)
+func (s *Server) execute(
+	ctx context.Context,
+	cancel context.CancelFunc,
+	slot string,
+	id int64,
+	output io.Writer,
+	cfg config.Config,
+	action Action,
+) {
+	err := func() (err error) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				_, _ = fmt.Fprintf(output, "controller action panic: %v\n%s", recovered, debug.Stack())
+				err = fmt.Errorf("controller action panicked: %v", recovered)
+			}
+		}()
+		return action(ctx, cfg, output)
+	}()
+	// An action may own helper goroutines. End their shared operation context on
+	// every return path, including a recovered panic, before making the slot
+	// available for a fresh resume.
+	cancel()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()

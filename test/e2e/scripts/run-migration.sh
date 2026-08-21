@@ -303,6 +303,35 @@ echo "copied $copied_parts part(s) across $copied_tables table(s)"
 "$E2E_DIR/scripts/assert-replica-identity.sh" applied
 "$E2E_DIR/scripts/assert-traffic.sh"
 
+# Replay counters are committed in the same target transaction as the DML and
+# remote LSN. They are the durable source for the dashboard's rolling changes/s
+# and transactions/s rates, not an estimate from WAL bytes.
+replay_stats=$(target_sql -Atqc "
+    SELECT transactions_applied::text || '|' || rows_applied::text
+    FROM pgmigrate_internal.replication_progress
+    LIMIT 1
+")
+replay_txns=${replay_stats%%|*}
+replay_rows=${replay_stats#*|}
+if [ -z "$replay_txns" ] || [ -z "$replay_rows" ] ||
+   [ "$replay_txns" -le 0 ] || [ "$replay_rows" -le 0 ]; then
+    echo "replay counters did not advance: $replay_stats" >&2
+    exit 1
+fi
+if [ "$driver" = controller ]; then
+    replay_status=$(controller_status)
+    controller_replay=$(printf '%s\n' "$replay_status" |
+        sed -n 's/.*"apply":{[^}]*"transactions":\([0-9][0-9]*\),"rows":\([0-9][0-9]*\).*/\1|\2/p')
+    controller_txns=${controller_replay%%|*}
+    controller_rows=${controller_replay#*|}
+    if [ -z "$controller_replay" ] || [ "$controller_txns" -le 0 ] || [ "$controller_rows" -le 0 ]; then
+        echo "controller did not expose positive durable replay counters" >&2
+        printf '%s\n' "$replay_status" >&2
+        exit 1
+    fi
+fi
+echo "replayed $replay_rows row changes in $replay_txns source transactions"
+
 # Verification while the source is still taking writes. A row read from a live
 # source and a target that is still applying is expected to differ, and this is
 # where the rule that tells that apart from a real divergence is exercised end to

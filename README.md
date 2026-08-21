@@ -149,7 +149,7 @@ verify e2e.metrics: done 0/0 rows sampled (0.00%), 0/0 source pages, 0 target ro
 verify e2e.order_items: done 3059/3059 rows sampled (100.00%), 24/24 source pages, 3059 target rows, 123/123 applied rows checked
 findings: 4 open
 steps: 33 complete
-apply: 0/1BE9D08 staged, 0/1BE9D08 applied, 0 txns, 0 rows
+apply: 0/1BE9D08 staged, 0/1BE9D08 applied, 4821 txns, 10234 rows
 lag: 0 bytes, 30.489s stale
 ```
 
@@ -315,8 +315,12 @@ beside an active `run`. It needs no database connection and no DSNs.
 Serves an embedded web dashboard backed by the same durable state as `status`.
 It shows the lifecycle stage, exact object completion counts, copied rows and
 bytes, live in-flight COPY rows/bytes and aggregate transfer rate, apply lag and
-staleness, per-table verification coverage and rates, findings, failures, and
-action output. In-flight COPY counters come from the target's
+staleness, exact replayed transaction/change totals, rolling replay rates,
+per-table verification coverage and rates, findings, failures, and action
+output. Replay totals advance in the same target transaction as their DML and
+resume LSN; the dashboard derives transactions/s and row changes/s from a
+rolling window over those crash-safe counters rather than estimating work from
+WAL bytes. In-flight COPY counters come from the target's
 `pg_stat_progress_copy`; they keep long-running parts visibly moving before the
 first durable part completion. The lifecycle bar is stage progress, not an
 elapsed-time estimate; the object and verification bars use the recorded
@@ -334,7 +338,14 @@ configuration before using an action. Controls track the durable lifecycle and
 remain disabled while configuration has unsaved changes, when an action is not
 valid, or when the migration is complete. Configuration is locked while either
 a migration or verification operation is active. Verification is permitted only
-while `run` is following.
+while `run` is following. If `run` stops or fails after durable state exists,
+the control becomes `Resume from <phase>` and explains which committed copy,
+CDC, and target apply state will be reused. A failed controller operation does
+not lock its action slot; the next confirmed `run` starts a fresh operation over
+the durable migration state. Each action has its own cancellable operation
+context. An action error or recovered panic ends that context and marks only its
+operation failed, leaving the HTTP controller available to show diagnostics and
+accept the resume.
 
 When a token is configured, its field is at the top of the dashboard. Until a
 valid token is entered, the dashboard reports itself as locked and does not
@@ -790,6 +801,8 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
 - Target DML and authoritative progress commit atomically, so a reconnect or
   restart skips transactions already recorded on the target. Missing or
   mismatched stream generation or progress is fatal once copied data exists.
+  Exact transaction and row-change counters commit with that same progress row,
+  survive process failure, and never count a rolled-back replay batch.
 - Restarts from `indexes`, `catchup`, or `follow` retain the completed base copy
   and recover staged CDC.
 - Restarts from `setup`, `schema`, or `copy` deliberately discard **all**
