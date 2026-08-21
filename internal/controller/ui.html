@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pgmigrate controller</title>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1020; --panel:#131b2e; --line:#273451; --text:#edf2ff; --muted:#96a2bd; --cyan:#45d4ff; --green:#40d89b; --amber:#f5b942; --red:#ff6b7d; }
+    * { box-sizing: border-box; }
+    body { margin:0; background:radial-gradient(circle at 20% 0,#172442 0,#0b1020 42%); color:var(--text); font:14px/1.45 ui-sans-serif,system-ui,-apple-system,sans-serif; min-height:100vh; }
+    main { width:min(1180px,calc(100% - 32px)); margin:0 auto; padding:28px 0 56px; }
+    header { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:24px; }
+    h1 { margin:0; font-size:28px; letter-spacing:-.02em; } h2 { margin:0 0 14px; font-size:16px; } p { margin:5px 0; }
+    .subtitle,.muted { color:var(--muted); } .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
+    .status-pill { border:1px solid var(--line); background:#11192b; border-radius:999px; padding:7px 12px; color:var(--muted); white-space:nowrap; }
+    .status-pill.live { color:var(--green); border-color:#245b4a; }
+    .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:16px; }
+    .panel { background:linear-gradient(180deg,rgba(22,31,52,.96),rgba(15,23,40,.96)); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 14px 35px rgba(0,0,0,.2); }
+    .overview { grid-column:span 8; } .controls { grid-column:span 4; } .objects,.verify,.findings,.operation { grid-column:span 12; }
+    .phase-row { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:10px; }
+    .phase { font-size:22px; font-weight:750; text-transform:capitalize; } .phase-count { color:var(--muted); }
+    .bar { width:100%; height:10px; overflow:hidden; border-radius:999px; background:#08101f; border:1px solid #23304a; }
+    .bar > span { display:block; height:100%; width:0; border-radius:inherit; background:linear-gradient(90deg,var(--cyan),var(--green)); transition:width .35s ease; }
+    .stages { display:grid; grid-template-columns:repeat(10,1fr); gap:4px; margin-top:12px; }
+    .stage { height:5px; border-radius:99px; background:#253149; } .stage.done { background:var(--green); } .stage.current { background:var(--cyan); box-shadow:0 0 10px rgba(69,212,255,.6); }
+    .facts { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; margin-top:18px; }
+    .fact { border-left:2px solid var(--line); padding-left:10px; } .fact strong { display:block; font-size:18px; } .fact span { color:var(--muted); font-size:12px; }
+    .actions { display:grid; gap:9px; }
+    button,input { font:inherit; }
+    button { color:var(--text); background:#1a2740; border:1px solid #354568; border-radius:9px; padding:10px 12px; cursor:pointer; text-align:left; transition:.15s; }
+    button:hover:not(:disabled) { border-color:var(--cyan); transform:translateY(-1px); } button:disabled { opacity:.42; cursor:not-allowed; }
+    button.primary { background:#123c4d; border-color:#23708b; } button.stop { color:#ffd6db; background:#3a1720; border-color:#71303d; }
+    .token { width:100%; color:var(--text); background:#091120; border:1px solid var(--line); border-radius:9px; padding:9px 10px; margin-bottom:10px; }
+    .cards { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; }
+    .card { background:#0d1526; border:1px solid #222f49; border-radius:11px; padding:13px; } .card-head { display:flex; justify-content:space-between; margin-bottom:9px; text-transform:capitalize; } .card small { color:var(--muted); }
+    table { width:100%; border-collapse:collapse; } th,td { text-align:left; padding:10px 8px; border-bottom:1px solid #23304a; vertical-align:top; } th { color:var(--muted); font-weight:600; font-size:12px; } td .bar { min-width:150px; }
+    .empty { color:var(--muted); padding:12px 0; } .finding { border-left:3px solid var(--amber); padding:8px 12px; margin:8px 0; background:#251d10; border-radius:3px 9px 9px 3px; } .finding.error { border-color:var(--red); background:#28131a; }
+    pre { background:#080e1a; border:1px solid #202b42; border-radius:9px; padding:12px; max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-word; color:#c7d4ef; }
+    .alert { display:none; color:#ffd6db; border:1px solid #71303d; background:#31151d; border-radius:10px; padding:10px 12px; margin-bottom:16px; }
+    @media (max-width:850px) { .overview,.controls { grid-column:span 12; } .cards { grid-template-columns:repeat(2,1fr); } .facts { grid-template-columns:1fr; } header { flex-direction:column; } }
+  </style>
+</head>
+<body>
+<main>
+  <header><div><h1>pgmigrate controller</h1><p class="subtitle">Durable migration state, guarded controls, and honest progress.</p></div><div id="connection" class="status-pill">connecting</div></header>
+  <div id="alert" class="alert" role="alert"></div>
+  <div class="grid">
+    <section class="panel overview">
+      <div class="phase-row"><div><span class="muted">Lifecycle phase</span><div id="phase" class="phase">not started</div></div><div id="phaseCount" class="phase-count">0 / 10</div></div>
+      <div id="lifecycleProgress" class="bar" role="progressbar" aria-label="Migration lifecycle" aria-valuemin="0" aria-valuemax="10" aria-valuenow="0"><span id="lifecycleBar"></span></div><div id="stages" class="stages"></div>
+      <div class="facts"><div class="fact"><strong id="lag">—</strong><span>apply lag</span></div><div class="fact"><strong id="stale">—</strong><span>progress staleness</span></div><div class="fact"><strong id="findingsCount">0</strong><span>open findings</span></div></div>
+    </section>
+    <section class="panel controls"><h2>Controls</h2><input id="token" class="token mono" type="password" autocomplete="off" aria-label="Controller token" placeholder="controller token"><div class="actions"><button class="primary" data-action="preflight">Run preflight</button><button data-action="run">Start / resume migration</button><button data-action="verify">Run verification</button><button class="stop" data-action="stop-migration">Stop migration</button><button class="stop" data-action="stop-verification">Stop verification</button></div><p class="muted">Cutover and sequence advancement are intentionally CLI-only.</p></section>
+    <section class="panel objects"><h2>Object completion</h2><div id="objectCards" class="cards"></div></section>
+    <section class="panel verify"><h2>Verification progress</h2><div id="verification"></div></section>
+    <section class="panel findings"><h2>Findings and failures</h2><div id="findings"></div></section>
+    <section class="panel operation"><h2>Controller operations</h2><div id="migrationSummary" class="muted">migration · idle</div><pre id="migrationOutput">No migration action has run.</pre><div id="verificationSummary" class="muted">verification · idle</div><pre id="verificationOutput">No verification action has run.</pre></section>
+  </div>
+</main>
+<script>
+const phases=['preflight','setup','schema','copy','indexes','catchup','follow','drained','cutover','complete'];
+const token=document.getElementById('token'); token.value=sessionStorage.getItem('pgmigrate-token')||''; token.addEventListener('input',()=>sessionStorage.setItem('pgmigrate-token',token.value));
+const el=id=>document.getElementById(id); const pct=(done,total)=>total>0?Math.max(0,Math.min(100,100*done/total)):0;
+function fmtBytes(n){if(!n)return '0 B';const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`}
+function fmtDuration(ns){if(!ns)return '—';let s=Math.max(0,Math.round(ns/1e9));if(s<60)return `${s}s`;if(s<3600)return `${Math.floor(s/60)}m ${s%60}s`;return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`}
+function setText(id,value){el(id).textContent=value}
+function renderStages(phase){const at=phases.indexOf(phase);el('stages').replaceChildren(...phases.map((p,i)=>{const d=document.createElement('span');d.className='stage '+(i<at?'done':i===at?'current':'');d.title=p;return d}))}
+function renderObjects(objects={}){const names=['tables','parts','indexes','constraints','verify'];el('objectCards').replaceChildren(...names.map(name=>{const v=objects[name]||{done:0,total:0},card=document.createElement('div');card.className='card';const head=document.createElement('div');head.className='card-head';const title=document.createElement('strong');title.textContent=name;const count=document.createElement('small');count.textContent=`${v.done} / ${v.total}`;head.append(title,count);const bar=document.createElement('div');bar.className='bar';bar.setAttribute('role','progressbar');bar.setAttribute('aria-label',`${name} completion`);bar.setAttribute('aria-valuemin','0');bar.setAttribute('aria-valuemax',String(v.total));bar.setAttribute('aria-valuenow',String(v.done));const fill=document.createElement('span');fill.style.width=`${pct(v.done,v.total)}%`;bar.append(fill);card.append(head,bar);return card}))}
+function renderVerification(rows=[]){if(!rows.length){el('verification').innerHTML='<div class="empty">No verification data yet.</div>';return}const table=document.createElement('table'),head=document.createElement('thead');head.innerHTML='<tr><th>Table</th><th>Stage</th><th>Sample coverage</th><th>CDC rows</th><th>ETA</th><th>Result</th></tr>';const body=document.createElement('tbody');rows.forEach(v=>{const tr=document.createElement('tr');const coverage=Math.max(0,Math.min(1,v.coverage||0));const cells=[v.table,v.stage||'waiting'];cells.forEach(x=>{const td=document.createElement('td');td.textContent=x;tr.append(td)});const progress=document.createElement('td'),bar=document.createElement('div');bar.className='bar';const fill=document.createElement('span');fill.style.width=`${coverage*100}%`;bar.append(fill);const label=document.createElement('small');label.textContent=` ${(coverage*100).toFixed(2)}% · ${v.sampled_rows}/${v.estimated_rows}`;progress.append(bar,label);tr.append(progress);const cdc=document.createElement('td');cdc.textContent=v.cdc_observed?`${v.cdc_keys}/${v.cdc_observed}`:'—';tr.append(cdc);const eta=document.createElement('td');eta.textContent=fmtDuration(v.eta);tr.append(eta);const result=document.createElement('td');result.textContent=v.unresolved_rows?`${v.unresolved_rows} divergent`:v.complete?(v.converged?'converged':'incomplete'):'—';result.style.color=v.unresolved_rows?'var(--red)':v.converged?'var(--green)':'';tr.append(result);body.append(tr)});table.append(head,body);el('verification').replaceChildren(table)}
+function renderFindings(data){const root=el('findings'),items=[];(data.findings||[]).forEach(f=>{const div=document.createElement('div');div.className='finding '+(f.severity==='error'?'error':'');const title=document.createElement('strong');title.textContent=`${f.severity} · ${f.id}`;const text=document.createElement('div');text.textContent=f.message;div.append(title,text);items.push(div)});if(data.failure){const f=data.failure,div=document.createElement('div');div.className='finding error';const title=document.createElement('strong');title.textContent=`Last run failed in ${f.phase} (${f.consecutive}×)`;const text=document.createElement('div');text.textContent=f.detail||f.signature;div.append(title,text);items.push(div)}if(!items.length){const empty=document.createElement('div');empty.className='empty';empty.textContent='No open findings or recorded failure.';items.push(empty)}root.replaceChildren(...items)}
+function active(op){return ['running','stopping'].includes(op?.state)}
+function renderOperations(ops={}){const migration=ops.migration||{state:'idle'},verification=ops.verification||{state:'idle'};setText('migrationSummary',`${migration.name||'migration'} · ${migration.state}`+(migration.error?` · ${migration.error}`:''));setText('migrationOutput',migration.output||'No migration action has produced output.');setText('verificationSummary',`${verification.name||'verification'} · ${verification.state}`+(verification.error?` · ${verification.error}`:''));setText('verificationOutput',verification.output||'No verification action has produced output.')}
+function render(data){const snap=data.snapshot,phase=snap?.phase||'not started',at=phases.indexOf(phase),migration=data.operations?.migration||{state:'idle'},verification=data.operations?.verification||{state:'idle'};setText('phase',phase);setText('phaseCount',`${Math.max(0,at+1)} / ${phases.length}`);el('lifecycleBar').style.width=`${at<0?0:100*at/(phases.length-1)}%`;el('lifecycleProgress').setAttribute('aria-valuenow',String(Math.max(0,at+1)));renderStages(phase);renderObjects(snap?.objects);renderVerification(snap?.verification);setText('lag',snap?fmtBytes(snap.apply.lag_bytes):'—');setText('stale',snap?fmtDuration(snap.apply.stale_for):'—');setText('findingsCount',snap?.open_findings||0);renderFindings(data);renderOperations(data.operations);token.style.display=data.token_required?'block':'none';document.querySelector('[data-action="preflight"]').disabled=!data.connections_configured||active(migration)||active(verification);document.querySelector('[data-action="run"]').disabled=!data.connections_configured||active(migration)||active(verification);document.querySelector('[data-action="verify"]').disabled=!data.connections_configured||!snap||active(verification)||(active(migration)&&migration.name!=='run');document.querySelector('[data-action="stop-migration"]').disabled=!active(migration);document.querySelector('[data-action="stop-verification"]').disabled=!active(verification)}
+async function refresh(){try{const r=await fetch('/api/status',{headers:{'X-PGMigrate-Token':token.value}});if(!r.ok)throw new Error((await r.json()).error||r.statusText);render(await r.json());el('connection').textContent='live';el('connection').className='status-pill live';el('alert').style.display='none'}catch(e){el('connection').textContent='offline';el('connection').className='status-pill';el('alert').textContent=e.message;el('alert').style.display='block'}}
+async function act(name){if(name==='run'&&!confirm('Start or resume pgmigrate? This creates or reuses logical replication state on the source.'))return;if(name.startsWith('stop-')&&!confirm(`Stop the ${name.slice(5)} operation?`))return;try{const r=await fetch(`/api/actions/${name}`,{method:'POST',headers:{'X-PGMigrate-Token':token.value,'X-PGMigrate-Confirm':name}});if(!r.ok)throw new Error((await r.json()).error||r.statusText);await refresh()}catch(e){el('alert').textContent=e.message;el('alert').style.display='block'}}
+document.querySelectorAll('[data-action]').forEach(b=>b.addEventListener('click',()=>act(b.dataset.action)));renderStages('');renderObjects();refresh();setInterval(refresh,1000);
+</script>
+</body>
+</html>

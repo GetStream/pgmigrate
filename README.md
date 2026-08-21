@@ -76,20 +76,22 @@ explains why the mechanism is what it is and what each choice cost,
 [Limitations](#limitations) what the tool does not do. Test patterns and
 environment controls are in [test/README.md](test/README.md).
 
-There are six commands:
+There are seven commands:
 
 | command | what it does |
 |---|---|
 | `preflight` | checks whether a migration can succeed, and persists its findings |
 | `run` | starts or resumes the migration, and waits in `follow` until cutover completes |
 | `status` | reads local state only, so it is safe to run beside `run` |
+| `controller` | serves a guarded local dashboard for status, preflight, run, and verification |
 | `verify` | samples each table against the target and checks what replication wrote |
 | `sequences` | advances target sequences alone, so the target can take writes before the cutover |
 | `cutover` | performs the rerunnable, durably stepped cutover |
 
-Every command takes `--dir`. All but `status` also need source and target
-connection strings. `pgmigrate <command> --help` prints the defaults as resolved
-on the host, which for `--workers` and `--restore-jobs` depend on its CPU count.
+Every command takes `--dir`. Database actions need source and target connection
+strings; `status` and the controller's read-only dashboard do not. `pgmigrate
+<command> --help` prints the defaults as resolved on the host, which for
+`--workers` and `--restore-jobs` depend on its CPU count.
 
 ## Example
 
@@ -307,6 +309,46 @@ beside an active `run`. It needs no database connection and no DSNs.
 | `--dir <path>` | required | migration state directory to read |
 | `--json` | false | render the snapshot as JSON instead of text |
 | `--watch <duration>` | off | re-render at this interval until interrupted. Must be zero or at least `10ms` |
+
+### pgmigrate controller
+
+Serves an embedded web dashboard backed by the same durable state as `status`.
+It shows the lifecycle stage, exact object completion counts, apply lag and
+staleness, per-table verification coverage, findings, failures, and action
+output. The lifecycle bar is stage progress, not an elapsed-time estimate; the
+object and verification bars use the recorded completed and total work.
+
+The controller starts idle. It exposes guarded preflight, start/resume,
+verification, and stop controls, and permits verification while `run` is
+following. It deliberately does not expose `sequences` or `cutover`. Starting a
+migration still requires an explicit browser confirmation and creates or reuses
+logical-replication state on the source.
+
+```bash
+$ pgmigrate controller --dir ./migration
+pgmigrate controller listening on http://127.0.0.1:9188
+```
+
+The default listener is loopback-only. For a pod, bind to all interfaces and
+provide a token through a secret, then use a port-forward or another
+authenticated private path to reach it:
+
+```bash
+$ export PGMIGRATE_CONTROLLER_TOKEN="$(secret-tool-or-platform-command)"
+$ pgmigrate controller --dir /work/migration --listen :9188
+```
+
+The browser sends the token in `X-PGMigrate-Token`; it is kept in the tab's
+session storage, not written into migration state. A non-loopback listener is
+rejected when no token is configured.
+
+| flag | default | what it does |
+|---|---|---|
+| `--dir <path>` | required | migration state directory to display and control |
+| `--listen <address>` | `127.0.0.1:9188` | HTTP listen address |
+| `--token <value>` | `PGMIGRATE_CONTROLLER_TOKEN` | required for any non-loopback listener |
+| `--source <dsn>` | `PGMIGRATE_SOURCE` | source connection string required by actions, but not status |
+| `--target <dsn>` | `PGMIGRATE_TARGET` | target connection string required by actions, but not status |
 
 ### pgmigrate verify
 

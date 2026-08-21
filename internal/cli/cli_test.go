@@ -25,3 +25,18 @@ func TestSequencesIsItsOwnCommand(t *testing.T) {
 		t.Errorf("sequence-offset defaults to %s, want 1000000", offset.DefValue)
 	}
 }
+
+func TestControllerIsItsOwnCommand(t *testing.T) {
+	root := NewRootCommand()
+	command, _, err := root.Find([]string{"controller"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command == root || command.Name() != "controller" {
+		t.Fatalf("command = %q, want controller", command.Name())
+	}
+	listen := command.Flags().Lookup("listen")
+	if listen == nil || listen.DefValue != "127.0.0.1:9188" {
+		t.Fatalf("listen flag = %#v, want localhost default", listen)
+	}
+}

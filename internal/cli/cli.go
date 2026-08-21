@@ -4,6 +4,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/GetStream/pgmigrate/internal/app"
 	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/GetStream/pgmigrate/internal/controller"
 )
 
 // Execute runs the root command.
@@ -81,6 +83,7 @@ func NewRootCommand() *cobra.Command {
 		newStateCommand("verify", "Verify source and target data", &cfg, true, application.Verify),
 		newStateCommand("sequences", "Advance target sequences past the source", &cfg, true, application.Sequences),
 		newStateCommand("cutover", "Finalize a migration for cutover", &cfg, true, application.Cutover),
+		newControllerCommand(&cfg),
 	)
 
 	return root
@@ -92,26 +95,80 @@ func newDatabaseCommand(name, summary string, cfg *config.Config, run func(conte
 		Short: summary,
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := cfg.ValidateConnections(); err != nil {
-				return err
-			}
-			if cfg.TableFilter != "" {
-				if _, err := config.LoadFilter(cfg.TableFilter); err != nil {
-					return err
-				}
-			}
-			if cfg.Workers < 1 || cfg.RestoreJobs < 1 || cfg.SplitThreshold < 1 ||
-				cfg.WALSampleDuration <= 0 || cfg.SegmentPruneInterval <= 0 {
-				return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, and segment-prune-interval must be positive")
-			}
-			if _, err := cfg.TuningOverrides(); err != nil {
-				return err
-			}
-			if err := cfg.ValidateVerify(); err != nil {
+			if err := validateDatabaseConfig(*cfg); err != nil {
 				return err
 			}
 			return run(cmd.Context(), *cfg)
 		},
+	}
+}
+
+func validateDatabaseConfig(cfg config.Config) error {
+	if err := cfg.ValidateConnections(); err != nil {
+		return err
+	}
+	if cfg.TableFilter != "" {
+		if _, err := config.LoadFilter(cfg.TableFilter); err != nil {
+			return err
+		}
+	}
+	if cfg.Workers < 1 || cfg.RestoreJobs < 1 || cfg.SplitThreshold < 1 ||
+		cfg.WALSampleDuration <= 0 || cfg.SegmentPruneInterval <= 0 {
+		return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, and segment-prune-interval must be positive")
+	}
+	if _, err := cfg.TuningOverrides(); err != nil {
+		return err
+	}
+	return cfg.ValidateVerify()
+}
+
+func newControllerCommand(cfg *config.Config) *cobra.Command {
+	address := controller.DefaultAddress
+	token := os.Getenv(controller.TokenEnv)
+	command := &cobra.Command{
+		Use:   "controller",
+		Short: "Serve the migration controller UI",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := cfg.ValidateDir(); err != nil {
+				return err
+			}
+			server, err := controller.New(controller.Options{
+				Config:  *cfg,
+				Address: address,
+				Token:   token,
+				Out:     cmd.OutOrStdout(),
+				Actions: controller.Actions{
+					Preflight: controllerAction(validateDatabaseConfig, app.App.Preflight),
+					Run:       controllerAction(validateDatabaseConfig, app.App.Run),
+					Verify: controllerAction(func(actionCfg config.Config) error {
+						if err := actionCfg.ValidateConnections(); err != nil {
+							return err
+						}
+						return actionCfg.ValidateVerify()
+					}, app.App.Verify),
+				},
+			})
+			if err != nil {
+				return err
+			}
+			return server.Serve(cmd.Context())
+		},
+	}
+	command.Flags().StringVar(&address, "listen", address, "controller listen address")
+	command.Flags().StringVar(&token, "token", token, "controller token (or "+controller.TokenEnv+")")
+	return command
+}
+
+func controllerAction(
+	validate func(config.Config) error,
+	run func(app.App, context.Context, config.Config) error,
+) controller.Action {
+	return func(ctx context.Context, cfg config.Config, output io.Writer) error {
+		if err := validate(cfg); err != nil {
+			return err
+		}
+		return run(app.App{Out: output, Progress: output}, ctx, cfg)
 	}
 }
 
