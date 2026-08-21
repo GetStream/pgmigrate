@@ -6,7 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,6 +41,34 @@ func TestStatusBeforePreflight(t *testing.T) {
 	}
 	if response.Operations["migration"].State != "idle" || response.Operations["verification"].State != "idle" {
 		t.Fatalf("operations = %#v, want idle", response.Operations)
+	}
+}
+
+func TestControllerStartupLeavesMigrationDirectoryUntouched(t *testing.T) {
+	migrationDir := filepath.Join(t.TempDir(), "not-created")
+	var actionCalled atomic.Bool
+	action := func(context.Context, config.Config, io.Writer) error {
+		actionCalled.Store(true)
+		return nil
+	}
+	server, err := New(Options{
+		Config:  config.Config{Dir: migrationDir},
+		Actions: Actions{Preflight: action, Run: action, Verify: action},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(server.cancel)
+	for _, target := range []string{"/", "/api/config", "/api/status"} {
+		if got := request(t, server, http.MethodGet, target, "", ""); got.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, body = %s", target, got.Code, got.Body.String())
+		}
+	}
+	if actionCalled.Load() {
+		t.Fatal("controller startup invoked a database action")
+	}
+	if _, err := os.Stat(migrationDir); !os.IsNotExist(err) {
+		t.Fatalf("migration directory was touched on startup: stat error = %v", err)
 	}
 }
 

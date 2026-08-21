@@ -85,6 +85,70 @@ controller_action() {
         "$controller_url/api/actions/$action" >/dev/null
 }
 
+controller_configure() {
+    response=$(curl -fsS -X PUT \
+        -H "X-PGMigrate-Token: $controller_token" \
+        -H "Content-Type: application/json" \
+        --data-binary @- "$controller_url/api/config" <<EOF
+{
+  "source": "$source_url",
+  "target": "$target_url",
+  "table_filter": "",
+  "workers": 2,
+  "split_threshold": $split_threshold,
+  "restore_jobs": 2,
+  "ack_warnings": true,
+  "allow_collation_change": false,
+  "pg_dump_path": "$pg_dump_path",
+  "pg_restore_path": "$pg_restore_path",
+  "metrics": "",
+  "wal_sample_duration": "250ms",
+  "segment_prune_interval": "1m",
+  "retry_base_copy": false,
+  "skip_target_tuning": false,
+  "warn_on_tuning_errors": false,
+  "target_memory": "",
+  "maintenance_work_mem": "",
+  "max_parallel_maintenance_workers": 0,
+  "max_wal_size": "",
+  "checkpoint_timeout": "",
+  "verify_workers": 1,
+  "verify_sample_rows": 1000000,
+  "verify_sample_windows": 128,
+  "verify_batch_rows": 5000,
+  "verify_duty_cycle": 1,
+  "verify_table_timeout": "20m",
+  "verify_converge_timeout": "1m",
+  "verify_cdc_rows": 100000,
+  "cdc_sample_rows": 100000
+}
+EOF
+)
+    case "$response" in
+        *'"source_configured":true'*'"target_configured":true'*) ;;
+        *) echo "controller did not accept database configuration" >&2
+           printf '%s\n' "$response" >&2
+           exit 1 ;;
+    esac
+    case "$response" in
+        *"$source_url"*|*"$target_url"*)
+            echo "controller configuration response exposed a DSN" >&2
+            exit 1
+            ;;
+    esac
+    for response in \
+        "$(curl -fsS -H "X-PGMigrate-Token: $controller_token" "$controller_url/api/config")" \
+        "$(controller_status)"
+    do
+        case "$response" in
+            *"$source_url"*|*"$target_url"*)
+                echo "controller API response exposed a DSN" >&2
+                exit 1
+                ;;
+        esac
+    done
+}
+
 controller_operation_state() {
     slot=$1
     controller_status | sed -n "s/.*\"$slot\":{[^}]*\"state\":\"\([^\"]*\)\".*/\1/p"
@@ -130,15 +194,8 @@ PGMIGRATE_BIN="$binary" PGMIGRATE_SOURCE="$source_url" \
 
 echo "running preflight"
 if [ "$driver" = controller ]; then
-    "$binary" controller \
-        --source "$source_url" \
-        --target "$target_url" \
+    PGMIGRATE_SOURCE= PGMIGRATE_TARGET= "$binary" controller \
         --dir "$migration_dir" \
-        --pg-dump "$pg_dump_path" \
-        --pg-restore "$pg_restore_path" \
-        --wal-sample-duration 250ms \
-        --split-threshold "$split_threshold" \
-        --ack-warnings \
         --listen "$controller_listen" \
         --token "$controller_token" >"$migration_dir/controller.log" 2>&1 &
     controller_pid=$!
@@ -155,6 +212,14 @@ if [ "$driver" = controller ]; then
         fi
         sleep 1
     done
+    initial_config=$(curl -fsS -H "X-PGMigrate-Token: $controller_token" "$controller_url/api/config")
+    case "$initial_config" in
+        *'"source_configured":false'*'"target_configured":false'*) ;;
+        *) echo "controller unexpectedly started with database configuration" >&2
+           printf '%s\n' "$initial_config" >&2
+           exit 1 ;;
+    esac
+    controller_configure
     controller_action preflight
     wait_controller_operation migration preflight
 else
