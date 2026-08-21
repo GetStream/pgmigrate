@@ -287,12 +287,16 @@ func snapshotHolderConfig(dsn string) (*pgconn.Config, error) {
 	}
 	// CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT returns a snapshot that is
 	// valid only while this replication connection remains command-idle. A
-	// normal wal_sender_timeout therefore turns a long base copy into a delayed
-	// failure: existing importers keep running, but the next part cannot import
-	// the snapshot after PostgreSQL closes the exporter. Set the timeout in the
-	// startup packet because issuing SET after slot creation would itself
-	// invalidate the exported snapshot.
+	// normal sender or session timeout therefore turns a long base copy into a
+	// delayed failure: existing importers keep running, but the next part cannot
+	// import the snapshot after PostgreSQL closes the exporter. In particular,
+	// PostgreSQL reports the exporter as idle in transaction after it returns the
+	// snapshot, so idle_in_transaction_session_timeout applies to it. Set every
+	// relevant timeout in the startup packet because issuing SET after slot
+	// creation would itself invalidate the exported snapshot.
 	config.RuntimeParams["wal_sender_timeout"] = "0"
+	config.RuntimeParams["idle_in_transaction_session_timeout"] = "0"
+	config.RuntimeParams["idle_session_timeout"] = "0"
 	config.RuntimeParams["application_name"] = "pgmigrate_snapshot_holder"
 	dialer := &net.Dialer{
 		Timeout:   config.ConnectTimeout,

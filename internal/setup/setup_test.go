@@ -78,13 +78,19 @@ func TestWatchdogRejectsInvalidIntervalWithoutTouchingExporter(t *testing.T) {
 	}
 }
 
-func TestSnapshotHolderConnectionDisablesWALSenderTimeout(t *testing.T) {
+func TestSnapshotHolderConnectionDisablesServerTimeouts(t *testing.T) {
 	config, err := snapshotHolderConfig("postgres://user:pass@localhost:5432/chat?connect_timeout=7")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := config.RuntimeParams["wal_sender_timeout"]; got != "0" {
 		t.Fatalf("wal_sender_timeout = %q, want 0", got)
+	}
+	if got := config.RuntimeParams["idle_in_transaction_session_timeout"]; got != "0" {
+		t.Fatalf("idle_in_transaction_session_timeout = %q, want 0", got)
+	}
+	if got := config.RuntimeParams["idle_session_timeout"]; got != "0" {
+		t.Fatalf("idle_session_timeout = %q, want 0", got)
 	}
 	if got := config.RuntimeParams["application_name"]; got != "pgmigrate_snapshot_holder" {
 		t.Fatalf("application_name = %q", got)
