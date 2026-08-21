@@ -132,7 +132,7 @@ EOF
            printf '%s\n' "$response" >&2
            exit 1 ;;
     esac
-    controller_revision=$(printf '%s\n' "$response" | sed -n 's/.*"revision":\([0-9][0-9]*\).*/\1/p')
+    controller_revision=$(printf '%s\n' "$response" | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')
     if [ -z "$controller_revision" ]; then
         echo "controller configuration response did not include a revision" >&2
         printf '%s\n' "$response" >&2

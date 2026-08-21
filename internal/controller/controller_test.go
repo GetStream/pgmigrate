@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -198,6 +197,9 @@ func TestTokenAndConfirmationAreRequired(t *testing.T) {
 	if got := request(t, server, http.MethodPost, "/api/actions/preflight", "preflight", "secret"); got.Code != http.StatusPreconditionFailed {
 		t.Fatalf("action without configuration revision = %d, want precondition failed", got.Code)
 	}
+	if got := requestAction(t, server, "preflight", "not-a-revision", "secret"); got.Code != http.StatusPreconditionFailed {
+		t.Fatalf("action with invalid configuration revision = %d, want precondition failed", got.Code)
+	}
 }
 
 func TestConfigurationRequiresAuthenticationAndRedactsCredentials(t *testing.T) {
@@ -230,7 +232,7 @@ func TestConfigurationRequiresAuthenticationAndRedactsCredentials(t *testing.T) 
 	if !view.SourceConfigured || !view.TargetConfigured {
 		t.Fatalf("connection flags = source:%v target:%v, want true", view.SourceConfigured, view.TargetConfigured)
 	}
-	if view.Revision == 0 {
+	if view.Revision == "" {
 		t.Fatal("configuration revision is missing")
 	}
 }
@@ -455,8 +457,8 @@ func TestActionRejectsStaleConfigurationRevision(t *testing.T) {
 	}
 	var current configurationView
 	decode(t, updated, &current)
-	if current.Revision <= reviewedConfiguration.Revision {
-		t.Fatalf("updated revision = %d, want greater than %d", current.Revision, reviewedConfiguration.Revision)
+	if current.Revision == reviewedConfiguration.Revision {
+		t.Fatalf("updated revision = %q, want a new token", current.Revision)
 	}
 
 	stale := requestAction(t, server, "preflight", reviewedConfiguration.Revision, "")
@@ -477,6 +479,54 @@ func TestActionRejectsStaleConfigurationRevision(t *testing.T) {
 	waitForState(t, server, "migration", "succeeded")
 	if !called.Load() {
 		t.Fatal("current action did not invoke preflight")
+	}
+}
+
+func TestActionRejectsConfigurationRevisionFromPreviousController(t *testing.T) {
+	var called atomic.Bool
+	actions := noOpActions()
+	actions.Preflight = func(context.Context, config.Config, io.Writer) error {
+		called.Store(true)
+		return nil
+	}
+	serverA := newTestServer(t, validControllerConfig(t), "", noOpActions())
+	serverB := newTestServer(t, validControllerConfig(t), "", actions)
+
+	updatedA := requestJSON(t, serverA, http.MethodPut, "/api/config", `{"workers":2}`, "")
+	updatedB := requestJSON(t, serverB, http.MethodPut, "/api/config", `{"workers":2}`, "")
+	if updatedA.Code != http.StatusOK || updatedB.Code != http.StatusOK {
+		t.Fatalf("matching configuration saves returned %d and %d", updatedA.Code, updatedB.Code)
+	}
+	var viewA, viewB configurationView
+	decode(t, updatedA, &viewA)
+	decode(t, updatedB, &viewB)
+	generationA, sequenceA, okA := strings.Cut(viewA.Revision, ":")
+	generationB, sequenceB, okB := strings.Cut(viewB.Revision, ":")
+	if !okA || !okB || sequenceA != sequenceB {
+		t.Fatalf("matching save counts produced revisions %q and %q", viewA.Revision, viewB.Revision)
+	}
+	if generationA == generationB {
+		t.Fatalf("separate controllers reused configuration generation %q", generationA)
+	}
+
+	stale := requestAction(t, serverB, "preflight", viewA.Revision, "")
+	if stale.Code != http.StatusConflict || !strings.Contains(stale.Body.String(), "configuration revision") {
+		t.Fatalf("previous-controller action status = %d, body = %s", stale.Code, stale.Body.String())
+	}
+	if called.Load() {
+		t.Fatal("previous-controller revision invoked preflight")
+	}
+	if operation := serverB.operationSnapshots()["migration"]; operation.State != "idle" {
+		t.Fatalf("migration operation = %#v, want idle", operation)
+	}
+
+	accepted := requestAction(t, serverB, "preflight", viewB.Revision, "")
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("current-controller action status = %d, body = %s", accepted.Code, accepted.Body.String())
+	}
+	waitForState(t, serverB, "migration", "succeeded")
+	if !called.Load() {
+		t.Fatal("current-controller revision did not invoke preflight")
 	}
 }
 
@@ -588,11 +638,11 @@ func requestJSON(t *testing.T, server *Server, method, target, body, token strin
 	return recorder
 }
 
-func requestAction(t *testing.T, server *Server, action string, revision uint64, token string) *httptest.ResponseRecorder {
+func requestAction(t *testing.T, server *Server, action, revision, token string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/api/actions/"+action, nil)
 	req.Header.Set("X-PGMigrate-Confirm", action)
-	req.Header.Set("X-PGMigrate-Config-Revision", fmt.Sprint(revision))
+	req.Header.Set("X-PGMigrate-Config-Revision", revision)
 	if token != "" {
 		req.Header.Set("X-PGMigrate-Token", token)
 	}

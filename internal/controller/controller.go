@@ -3,8 +3,10 @@ package controller
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -64,10 +66,11 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu             sync.Mutex
-	operations     map[string]operation
-	nextID         int64
-	configRevision uint64
+	mu               sync.Mutex
+	operations       map[string]operation
+	nextID           int64
+	configGeneration string
+	configRevision   uint64
 }
 
 type operation struct {
@@ -117,7 +120,7 @@ type copyView struct {
 // dashboard. Database credentials are deliberately represented only by
 // configured flags; their values are write-only through configurationUpdate.
 type configurationView struct {
-	Revision               uint64  `json:"revision"`
+	Revision               string  `json:"revision"`
 	SourceConfigured       bool    `json:"source_configured"`
 	TargetConfigured       bool    `json:"target_configured"`
 	TableFilter            string  `json:"table_filter"`
@@ -211,6 +214,10 @@ func New(options Options) (*Server, error) {
 	if options.Actions.Preflight == nil || options.Actions.Run == nil || options.Actions.Verify == nil {
 		return nil, errors.New("preflight, run, and verify controller actions are required")
 	}
+	configGeneration, err := newConfigurationGeneration()
+	if err != nil {
+		return nil, err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	out := options.Out
 	if out == nil {
@@ -223,8 +230,17 @@ func New(options Options) (*Server, error) {
 			"migration":    {State: "idle"},
 			"verification": {State: "idle"},
 		},
-		configRevision: 1,
+		configGeneration: configGeneration,
+		configRevision:   1,
 	}, nil
+}
+
+func newConfigurationGeneration() (string, error) {
+	var generation [16]byte
+	if _, err := rand.Read(generation[:]); err != nil {
+		return "", fmt.Errorf("generate controller configuration generation: %w", err)
+	}
+	return hex.EncodeToString(generation[:]), nil
 }
 
 func validateAddress(address, token string) error {
@@ -469,7 +485,7 @@ func (s *Server) updateConfiguration(update configurationUpdate) (configurationV
 	}
 	s.cfg = candidate
 	s.configRevision++
-	return viewConfiguration(candidate, s.configRevision), nil
+	return viewConfiguration(candidate, s.configurationRevisionLocked()), nil
 }
 
 func applyConfigurationUpdate(candidate *config.Config, update configurationUpdate) error {
@@ -560,7 +576,7 @@ func validateConfiguration(cfg config.Config) error {
 	return cfg.ValidateVerify()
 }
 
-func viewConfiguration(cfg config.Config, revision uint64) configurationView {
+func viewConfiguration(cfg config.Config, revision string) configurationView {
 	return configurationView{
 		Revision:         revision,
 		SourceConfigured: strings.TrimSpace(cfg.Source) != "", TargetConfigured: strings.TrimSpace(cfg.Target) != "",
@@ -589,7 +605,23 @@ func (s *Server) configurationSnapshot() config.Config {
 func (s *Server) configurationViewSnapshot() configurationView {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return viewConfiguration(s.cfg, s.configRevision)
+	return viewConfiguration(s.cfg, s.configurationRevisionLocked())
+}
+
+func (s *Server) configurationRevisionLocked() string {
+	return s.configGeneration + ":" + strconv.FormatUint(s.configRevision, 10)
+}
+
+func validConfigurationRevision(revision string) bool {
+	generation, sequence, ok := strings.Cut(revision, ":")
+	if !ok || len(generation) != 32 {
+		return false
+	}
+	if _, err := hex.DecodeString(generation); err != nil {
+		return false
+	}
+	value, err := strconv.ParseUint(sequence, 10, 64)
+	return err == nil && value > 0
 }
 
 func (s *Server) action(w http.ResponseWriter, r *http.Request) {
@@ -615,8 +647,8 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown controller action")
 		return
 	}
-	revision, err := strconv.ParseUint(strings.TrimSpace(r.Header.Get("X-PGMigrate-Config-Revision")), 10, 64)
-	if err != nil {
+	revision := strings.TrimSpace(r.Header.Get("X-PGMigrate-Config-Revision"))
+	if !validConfigurationRevision(revision) {
 		writeError(w, http.StatusPreconditionFailed, "configuration revision header is missing or invalid")
 		return
 	}
@@ -676,11 +708,11 @@ func (s *Server) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) == 1
 }
 
-func (s *Server) start(name string, revision uint64, action Action) (operationView, error) {
+func (s *Server) start(name string, revision string, action Action) (operationView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if revision != s.configRevision {
-		return operationView{}, fmt.Errorf("configuration revision %d is stale; review current revision %d", revision, s.configRevision)
+	if revision != s.configurationRevisionLocked() {
+		return operationView{}, errors.New("configuration revision is stale; review current configuration")
 	}
 	slot := "migration"
 	if name == "verify" {
