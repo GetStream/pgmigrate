@@ -342,10 +342,14 @@ while `run` is following. If `run` stops or fails after durable state exists,
 the control becomes `Resume from <phase>` and explains which committed copy,
 CDC, and target apply state will be reused. A failed controller operation does
 not lock its action slot; the next confirmed `run` starts a fresh operation over
-the durable migration state. Each action has its own cancellable operation
-context. An action error or recovered panic ends that context and marks only its
-operation failed, leaving the HTTP controller available to show diagnostics and
-accept the resume.
+the durable migration state. Each preflight, run, and verification action runs
+in its own child process, supervised by the HTTP controller. Configuration and
+write-only DSNs reach the child through an anonymous stdin pipe, not argv. A
+normal error, panic, fatal runtime exit, or cancellation ends only that worker,
+marks its operation failed or stopped, and leaves the dashboard process
+available to show diagnostics and accept the resume. Stop first asks the worker
+to terminate cleanly, then forcibly reaps it if it does not exit within ten
+seconds.
 
 When a token is configured, its field is at the top of the dashboard. Until a
 valid token is entered, the dashboard reports itself as locked and does not
@@ -805,6 +809,9 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
   survive process failure, and never count a rolled-back replay batch.
 - Restarts from `indexes`, `catchup`, or `follow` retain the completed base copy
   and recover staged CDC.
+- Controller actions are isolated child processes. If the replay worker exits,
+  the controller remains available and a confirmed resume starts a fresh worker
+  from the last atomically committed target LSN and replay counters.
 - Restarts from `setup`, `schema`, or `copy` deliberately discard **all**
   base-copy progress and start with a fresh slot and snapshot. An exported
   snapshot cannot survive its holder connection, and mixing snapshots would be

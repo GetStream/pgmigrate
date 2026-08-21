@@ -2,10 +2,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -84,6 +88,7 @@ func NewRootCommand() *cobra.Command {
 		newStateCommand("sequences", "Advance target sequences past the source", &cfg, true, application.Sequences),
 		newStateCommand("cutover", "Finalize a migration for cutover", &cfg, true, application.Cutover),
 		newControllerCommand(&cfg),
+		newControllerWorkerCommand(),
 	)
 
 	return root
@@ -139,14 +144,9 @@ func newControllerCommand(cfg *config.Config) *cobra.Command {
 				Token:   token,
 				Out:     cmd.OutOrStdout(),
 				Actions: controller.Actions{
-					Preflight: controllerAction(validateDatabaseConfig, app.App.Preflight),
-					Run:       controllerAction(validateDatabaseConfig, app.App.Run),
-					Verify: controllerAction(func(actionCfg config.Config) error {
-						if err := actionCfg.ValidateConnections(); err != nil {
-							return err
-						}
-						return actionCfg.ValidateVerify()
-					}, app.App.Verify),
+					Preflight: controllerWorkerAction("preflight"),
+					Run:       controllerWorkerAction("run"),
+					Verify:    controllerWorkerAction("verify"),
 				},
 			})
 			if err != nil {
@@ -160,15 +160,86 @@ func newControllerCommand(cfg *config.Config) *cobra.Command {
 	return command
 }
 
-func controllerAction(
-	validate func(config.Config) error,
-	run func(app.App, context.Context, config.Config) error,
-) controller.Action {
+// controllerWorkerAction runs each controller action in a separate process.
+// Besides containing panics, this contains fatal runtime failures and ordinary
+// non-zero exits so the dashboard can report the error and start a fresh worker
+// against the durable migration state. Credentials travel only over the
+// child's anonymous stdin pipe; they are never command-line arguments.
+func controllerWorkerAction(action string) controller.Action {
 	return func(ctx context.Context, cfg config.Config, output io.Writer) error {
-		if err := validate(cfg); err != nil {
-			return err
+		payload, err := json.Marshal(cfg)
+		if err != nil {
+			return fmt.Errorf("encode %s worker configuration: %w", action, err)
 		}
-		return run(app.App{Out: output, Progress: output}, ctx, cfg)
+		executable, err := os.Executable()
+		if err != nil {
+			return fmt.Errorf("locate pgmigrate executable: %w", err)
+		}
+		command := exec.CommandContext(ctx, executable, "__controller-worker", action)
+		command.Stdin = bytes.NewReader(payload)
+		command.Stdout = output
+		command.Stderr = output
+		// Let the worker unwind database and filesystem resources on Stop before
+		// CommandContext escalates after WaitDelay.
+		command.Cancel = func() error { return command.Process.Signal(syscall.SIGTERM) }
+		command.WaitDelay = 10 * time.Second
+		if err := command.Run(); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("%s worker exited: %w", action, err)
+		}
+		return nil
+	}
+}
+
+// newControllerWorkerCommand is an internal process boundary, not an operator
+// command. It accepts one Config JSON document on stdin so secrets never appear
+// in argv or the process environment when they were entered through the UI.
+func newControllerWorkerCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:    "__controller-worker ACTION",
+		Hidden: true,
+		Args:   cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			decoder := json.NewDecoder(io.LimitReader(cmd.InOrStdin(), 1<<20))
+			decoder.DisallowUnknownFields()
+			var cfg config.Config
+			if err := decoder.Decode(&cfg); err != nil {
+				return fmt.Errorf("decode controller worker configuration: %w", err)
+			}
+			var extra any
+			if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+				if err == nil {
+					return errors.New("controller worker configuration must contain exactly one JSON object")
+				}
+				return fmt.Errorf("decode controller worker configuration: %w", err)
+			}
+
+			application := app.App{Out: cmd.OutOrStdout(), Progress: cmd.OutOrStdout()}
+			switch args[0] {
+			case "preflight":
+				if err := validateDatabaseConfig(cfg); err != nil {
+					return err
+				}
+				return application.Preflight(cmd.Context(), cfg)
+			case "run":
+				if err := validateDatabaseConfig(cfg); err != nil {
+					return err
+				}
+				return application.Run(cmd.Context(), cfg)
+			case "verify":
+				if err := cfg.ValidateConnections(); err != nil {
+					return err
+				}
+				if err := cfg.ValidateVerify(); err != nil {
+					return err
+				}
+				return application.Verify(cmd.Context(), cfg)
+			default:
+				return fmt.Errorf("unsupported controller worker action %q", args[0])
+			}
+		},
 	}
 }
 

@@ -332,6 +332,64 @@ if [ "$driver" = controller ]; then
 fi
 echo "replayed $replay_rows row changes in $replay_txns source transactions"
 
+# The production controller runs every action as a child process. Kill the
+# replay worker outright in follow, prove the HTTP controller survives, then
+# resume from the exact durable target LSN/counters. This exercises a failure
+# that panic recovery inside one process cannot contain.
+if [ "$driver" = controller ]; then
+    worker_pid=$(ps -axo pid=,ppid=,command= |
+        awk -v parent="$controller_pid" '$2 == parent && /__controller-worker run/ { print $1; exit }')
+    if [ -z "$worker_pid" ]; then
+        echo "controller run worker process was not found" >&2
+        ps -axo pid=,ppid=,command= >&2
+        exit 1
+    fi
+    kill -KILL "$worker_pid"
+    deadline=$(( $(date +%s) + timeout ))
+    while :; do
+        if ! kill -0 "$controller_pid" 2>/dev/null || ! controller_status >/dev/null 2>&1; then
+            echo "controller did not survive replay worker failure" >&2
+            awk '{print}' "$migration_dir/controller.log" >&2
+            exit 1
+        fi
+        state=$(controller_operation_state migration)
+        case "$state" in
+            failed) break ;;
+            stopped|succeeded)
+                echo "killed replay worker became $state, want failed" >&2
+                controller_status >&2 || true
+                exit 1
+                ;;
+        esac
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "timed out waiting for killed replay worker to fail" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+
+    controller_action run
+    sleep 1
+    state=$(controller_operation_state migration)
+    if [ "$state" != running ]; then
+        echo "resumed replay worker is $state, want running" >&2
+        controller_status >&2 || true
+        exit 1
+    fi
+    resumed_stats=$(target_sql -Atqc "
+        SELECT transactions_applied::text || '|' || rows_applied::text
+        FROM pgmigrate_internal.replication_progress
+        LIMIT 1
+    ")
+    resumed_txns=${resumed_stats%%|*}
+    resumed_rows=${resumed_stats#*|}
+    if [ "$resumed_txns" -lt "$replay_txns" ] || [ "$resumed_rows" -lt "$replay_rows" ]; then
+        echo "replay counters regressed across worker resume: $replay_stats -> $resumed_stats" >&2
+        exit 1
+    fi
+    echo "controller survived replay worker kill; resumed at $resumed_stats"
+fi
+
 # Verification while the source is still taking writes. A row read from a live
 # source and a target that is still applying is expected to differ, and this is
 # where the rule that tells that apart from a real divergence is exercised end to
