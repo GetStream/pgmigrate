@@ -490,11 +490,19 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		return monitorProgress(groupCtx, store, cfg.Target, holder.Snapshot.Slot, durable, cfg.Dir)
 	})
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, holder.Snapshot.Slot) })
+	watchCtx, stopSnapshotWatch := context.WithCancel(groupCtx)
+	defer stopSnapshotWatch()
 	group.Go(func() error {
-		watchCtx, stopWatch := context.WithCancel(groupCtx)
-		defer stopWatch()
-		watch := holder.Watchdog(watchCtx, time.Second)
-
+		err := <-holder.Watchdog(watchCtx, time.Second)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("source snapshot holder lost; base copy must restart from a fresh snapshot: %w", err)
+		}
+		return nil
+	})
+	group.Go(func() error {
 		if err := transition(groupCtx, cfg, store, state.PhaseSchema); err != nil {
 			return err
 		}
@@ -549,16 +557,9 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		if err := runner.Run(groupCtx, parts); err != nil {
 			return err
 		}
-		stopWatch()
+		stopSnapshotWatch()
 		if err := holder.Close(context.Background()); err != nil {
 			return err
-		}
-		select {
-		case watchErr := <-watch:
-			if watchErr != nil && !errors.Is(watchErr, context.Canceled) {
-				return watchErr
-			}
-		default:
 		}
 
 		if err := transition(groupCtx, cfg, store, state.PhaseIndexes); err != nil {

@@ -30,6 +30,26 @@ func TestPG17SnapshotLifecycleAndFailoverGate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	control := instance.Connect(t)
+	if _, err := control.Exec(ctx, "ALTER SYSTEM SET wal_sender_timeout = '1s'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.Exec(ctx, "SELECT pg_reload_conf()"); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		var timeout string
+		if err := control.QueryRow(ctx, "SHOW wal_sender_timeout").Scan(&timeout); err != nil {
+			t.Fatal(err)
+		}
+		if timeout == "1s" {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 
 	for _, failover := range []bool{false, true} {
 		t.Run(fmt.Sprintf("failover=%v", failover), func(t *testing.T) {
@@ -59,6 +79,10 @@ func TestPG17SnapshotLifecycleAndFailoverGate(t *testing.T) {
 				state.point != holder.Snapshot.ConsistentPoint {
 				t.Fatalf("state snapshot = %+v, holder = %+v", state, holder.Snapshot)
 			}
+			// The server-wide timeout is deliberately shorter than this wait. The
+			// snapshot holder overrides it in the startup packet, before exporting
+			// a snapshot that would be invalidated by any later SET command.
+			time.Sleep(1500 * time.Millisecond)
 			alive, err := holder.Alive(ctx)
 			if err != nil || !alive {
 				t.Fatalf("snapshot holder alive = %v, error = %v", alive, err)

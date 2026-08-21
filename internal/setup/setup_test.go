@@ -3,6 +3,8 @@ package setup
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,6 +75,36 @@ func TestWatchdogRejectsInvalidIntervalWithoutTouchingExporter(t *testing.T) {
 	err := <-holder.Watchdog(context.Background(), 0)
 	if err == nil || !strings.Contains(err.Error(), "interval") {
 		t.Fatalf("Watchdog() error = %v", err)
+	}
+}
+
+func TestSnapshotHolderConnectionDisablesWALSenderTimeout(t *testing.T) {
+	config, err := snapshotHolderConfig("postgres://user:pass@localhost:5432/chat?connect_timeout=7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := config.RuntimeParams["wal_sender_timeout"]; got != "0" {
+		t.Fatalf("wal_sender_timeout = %q, want 0", got)
+	}
+	if got := config.RuntimeParams["application_name"]; got != "pgmigrate_snapshot_holder" {
+		t.Fatalf("application_name = %q", got)
+	}
+	if config.ConnectTimeout != 7*time.Second {
+		t.Fatalf("connect timeout = %s", config.ConnectTimeout)
+	}
+
+	// DialFunc must still produce the normal network error for an unreachable
+	// local endpoint. This exercises the explicit keepalive dialer without
+	// depending on its unexported function identity.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	conn, dialErr := config.DialFunc(ctx, "tcp", "127.0.0.1:1")
+	if conn != nil {
+		_ = conn.Close()
+	}
+	var opErr *net.OpError
+	if dialErr == nil || !errors.As(dialErr, &opErr) {
+		t.Fatalf("DialFunc error = %v, want network error", dialErr)
 	}
 }
 
