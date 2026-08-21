@@ -322,6 +322,12 @@ first durable part completion. The lifecycle bar is stage progress, not an
 elapsed-time estimate; the object and verification bars use the recorded
 completed and total work.
 
+The lifecycle is also rendered as an ordered, numbered ten-step path from
+preflight through completion, with cutover marked CLI-only. Findings are
+collapsed by default and classified as blockers, accepted risks,
+performance-only notes, or conditions pgmigrate manages automatically; this
+keeps expected preflight warnings visible without presenting them as failures.
+
 The controller starts idle. After any required authentication, the dashboard loads all
 non-secret preflight, run, copy, tuning, and verification defaults. Save a valid
 configuration before using an action. Controls track the durable lifecycle and

@@ -592,6 +592,10 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		"rate_bytes_per_second",
 		"data streamed",
 		"rows streamed",
+		"Steps run in order.",
+		"accepted risk",
+		"performance only",
+		"managed automatically",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("configuration UI does not contain %q", want)
