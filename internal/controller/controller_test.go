@@ -161,6 +161,23 @@ func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
 	waitForState(t, server, "migration", "stopped")
 }
 
+func TestCopyRateUsesObservedByteDelta(t *testing.T) {
+	server := &Server{}
+	started := time.Date(2026, time.August, 21, 12, 0, 0, 0, time.UTC)
+	if rate := server.copyRate(1_000, started); rate != 0 {
+		t.Fatalf("initial rate = %v, want 0", rate)
+	}
+	if rate := server.copyRate(3_000, started.Add(2*time.Second)); rate != 1_000 {
+		t.Fatalf("second rate = %v, want 1000", rate)
+	}
+	if rate := server.copyRate(4_000, started.Add(4*time.Second)); rate != 750 {
+		t.Fatalf("smoothed rate = %v, want 750", rate)
+	}
+	if rate := server.copyRate(500, started.Add(5*time.Second)); rate != 0 {
+		t.Fatalf("reset rate = %v, want 0", rate)
+	}
+}
+
 func TestLifecycleGuardsControllerActions(t *testing.T) {
 	t.Run("verification before follow", func(t *testing.T) {
 		server := newTestServer(t, config.Config{Dir: t.TempDir()}, "", noOpActions())
@@ -569,6 +586,12 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		"Unlock this dashboard",
 		"Dashboard locked: controller token is missing or invalid.",
 		`id="token" class="token mono"`,
+		`id="authPanel" class="panel auth-panel"`,
+		"snap.apply.applied_lsn!=='0/0'",
+		"el('authPanel').style.display=data.token_required?'grid':'none'",
+		"rate_bytes_per_second",
+		"data streamed",
+		"rows streamed",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("configuration UI does not contain %q", want)

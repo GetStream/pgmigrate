@@ -20,6 +20,7 @@ import (
 
 	"github.com/GetStream/pgmigrate/internal/config"
 	"github.com/GetStream/pgmigrate/internal/observe"
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/state"
 )
 
@@ -71,6 +72,13 @@ type Server struct {
 	nextID           int64
 	configGeneration string
 	configRevision   uint64
+	copySample       copySample
+}
+
+type copySample struct {
+	Bytes int64
+	At    time.Time
+	Rate  float64
 }
 
 type operation struct {
@@ -111,9 +119,13 @@ type failureView struct {
 }
 
 type copyView struct {
-	Rows     int64         `json:"rows"`
-	Bytes    int64         `json:"bytes"`
-	Duration time.Duration `json:"duration"`
+	Rows               int64         `json:"rows"`
+	Bytes              int64         `json:"bytes"`
+	Duration           time.Duration `json:"duration"`
+	ActiveParts        int64         `json:"active_parts"`
+	InFlightRows       int64         `json:"in_flight_rows"`
+	InFlightBytes      int64         `json:"in_flight_bytes"`
+	RateBytesPerSecond float64       `json:"rate_bytes_per_second"`
 }
 
 // configurationView is the mutable controller configuration exposed to the
@@ -384,6 +396,15 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		response.Copy.Bytes += part.Bytes
 		response.Copy.Duration += part.Duration
 	}
+	if snapshot.Phase == state.PhaseCopy && response.ConnectionsConfigured {
+		active, rows, bytes, liveErr := liveCopyProgress(ctx, cfg.Target)
+		if liveErr == nil {
+			response.Copy.ActiveParts = active
+			response.Copy.InFlightRows = rows
+			response.Copy.InFlightBytes = bytes
+			response.Copy.RateBytesPerSecond = s.copyRate(response.Copy.Bytes+bytes, time.Now().UTC())
+		}
+	}
 	findings, err := store.PendingFindings(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -407,6 +428,43 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func liveCopyProgress(ctx context.Context, targetDSN string) (active, rows, bytes int64, err error) {
+	conn, err := postgres.Connect(ctx, targetDSN)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer conn.Close(context.Background())
+	err = conn.QueryRow(ctx, `
+		SELECT count(*), coalesce(sum(tuples_processed), 0)::bigint,
+			coalesce(sum(bytes_processed), 0)::bigint
+		FROM pg_stat_progress_copy
+		WHERE command = 'COPY FROM'
+	`).Scan(&active, &rows, &bytes)
+	return active, rows, bytes, err
+}
+
+func (s *Server) copyRate(bytes int64, at time.Time) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	previous := s.copySample
+	s.copySample.Bytes = bytes
+	s.copySample.At = at
+	if previous.At.IsZero() || bytes < previous.Bytes {
+		s.copySample.Rate = 0
+		return 0
+	}
+	seconds := at.Sub(previous.At).Seconds()
+	if seconds <= 0 {
+		return previous.Rate
+	}
+	rate := float64(bytes-previous.Bytes) / seconds
+	if previous.Rate > 0 {
+		rate = (previous.Rate + rate) / 2
+	}
+	s.copySample.Rate = rate
+	return rate
 }
 
 func (s *Server) getConfiguration(w http.ResponseWriter, r *http.Request) {

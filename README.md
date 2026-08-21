@@ -314,12 +314,15 @@ beside an active `run`. It needs no database connection and no DSNs.
 
 Serves an embedded web dashboard backed by the same durable state as `status`.
 It shows the lifecycle stage, exact object completion counts, copied rows and
-bytes, apply lag and staleness, per-table verification coverage and rates,
-findings, failures, and action output. The lifecycle bar is stage progress, not
-an elapsed-time estimate; the object and verification bars use the recorded
+bytes, live in-flight COPY rows/bytes and aggregate transfer rate, apply lag and
+staleness, per-table verification coverage and rates, findings, failures, and
+action output. In-flight COPY counters come from the target's
+`pg_stat_progress_copy`; they keep long-running parts visibly moving before the
+first durable part completion. The lifecycle bar is stage progress, not an
+elapsed-time estimate; the object and verification bars use the recorded
 completed and total work.
 
-The controller starts idle. After authentication, the dashboard loads all
+The controller starts idle. After any required authentication, the dashboard loads all
 non-secret preflight, run, copy, tuning, and verification defaults. Save a valid
 configuration before using an action. Controls track the durable lifecycle and
 remain disabled while configuration has unsaved changes, when an action is not
@@ -327,10 +330,13 @@ valid, or when the migration is complete. Configuration is locked while either
 a migration or verification operation is active. Verification is permitted only
 while `run` is following.
 
-The token field is at the top of the dashboard. Until a valid token is entered,
-the dashboard reports itself as locked and does not render empty configuration
-fields as though the controller were unconfigured. The token remains in browser
-session storage only, so each new tab or browser session must authenticate.
+When a token is configured, its field is at the top of the dashboard. Until a
+valid token is entered, the dashboard reports itself as locked and does not
+render empty configuration fields as though the controller were unconfigured.
+The token remains in browser session storage only. When the controller has no
+token (appropriate for a loopback-only listener reached through `kubectl
+port-forward`), the authentication panel is hidden and the dashboard loads
+immediately.
 
 Each successful save returns an opaque, controller-instance-bound configuration
 revision that the dashboard sends with preflight, run, and verification. The
@@ -351,11 +357,15 @@ $ pgmigrate controller --dir ./migration
 pgmigrate controller listening on http://127.0.0.1:9188
 ```
 
-The default listener is loopback-only. For a pod, bind to all interfaces and
-provide a token through a secret, then use a port-forward or another
-authenticated private path to reach it:
+The default listener is loopback-only. A pod intended solely for `kubectl
+port-forward` can keep that listener and omit the token; no Service or Ingress
+should expose it. If the controller must bind to the pod IP or any other
+non-loopback interface, it requires a token:
 
 ```bash
+$ pgmigrate controller --dir /work/migration --listen 127.0.0.1:9188
+
+# Only for a non-loopback listener:
 $ export PGMIGRATE_CONTROLLER_TOKEN="$(secret-tool-or-platform-command)"
 $ pgmigrate controller --dir /work/migration --listen :9188
 ```
