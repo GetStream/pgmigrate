@@ -30,6 +30,45 @@ func TestPG17SnapshotLifecycleAndFailoverGate(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	control := instance.Connect(t)
+	if _, err := control.Exec(ctx, "ALTER SYSTEM SET wal_sender_timeout = '1s'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.Exec(ctx, "ALTER SYSTEM SET idle_in_transaction_session_timeout = '1s'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.Exec(ctx, "ALTER SYSTEM SET idle_session_timeout = '1s'"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := control.Exec(ctx, "SELECT pg_reload_conf()"); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		var walSender, idleTransaction, idleSession string
+		if err := control.QueryRow(ctx, `
+			SELECT current_setting('wal_sender_timeout'),
+			       current_setting('idle_in_transaction_session_timeout'),
+			       current_setting('idle_session_timeout')
+		`).Scan(&walSender, &idleTransaction, &idleSession); err != nil {
+			t.Fatal(err)
+		}
+		if walSender == "1s" && idleTransaction == "1s" && idleSession == "1s" {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	// Keep the test's long-lived control connection out of the experiment. New
+	// connections still inherit the one-second server defaults, including the
+	// replication connection created by setup.Run below.
+	if _, err := control.Exec(ctx, `
+		SELECT set_config('idle_in_transaction_session_timeout', '0', false),
+		       set_config('idle_session_timeout', '0', false)
+	`); err != nil {
+		t.Fatal(err)
+	}
 
 	for _, failover := range []bool{false, true} {
 		t.Run(fmt.Sprintf("failover=%v", failover), func(t *testing.T) {
@@ -59,6 +98,11 @@ func TestPG17SnapshotLifecycleAndFailoverGate(t *testing.T) {
 				state.point != holder.Snapshot.ConsistentPoint {
 				t.Fatalf("state snapshot = %+v, holder = %+v", state, holder.Snapshot)
 			}
+			// All three server-wide timeouts are deliberately shorter than this
+			// wait. The snapshot holder overrides them in the startup packet,
+			// before exporting a snapshot that would be invalidated by any later
+			// SET command.
+			time.Sleep(1500 * time.Millisecond)
 			alive, err := holder.Alive(ctx)
 			if err != nil || !alive {
 				t.Fatalf("snapshot holder alive = %v, error = %v", alive, err)

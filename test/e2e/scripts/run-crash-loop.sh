@@ -94,11 +94,30 @@ crash_at copy
 crash_at indexes
 crash_at catchup
 crash_at follow
+replay_before_resume=$(target_sql -Atqc "
+    SELECT transactions_applied::text || '|' || rows_applied::text
+    FROM pgmigrate_internal.replication_progress
+    LIMIT 1
+")
+before_txns=${replay_before_resume%%|*}
+before_rows=${replay_before_resume#*|}
 
 # shellcheck disable=SC2086
 "$binary" run $common_args >>"$migration_dir/run.log" 2>&1 &
 run_pid=$!
 wait_phase follow
+replay_after_resume=$(target_sql -Atqc "
+    SELECT transactions_applied::text || '|' || rows_applied::text
+    FROM pgmigrate_internal.replication_progress
+    LIMIT 1
+")
+after_txns=${replay_after_resume%%|*}
+after_rows=${replay_after_resume#*|}
+if [ "$after_txns" -lt "$before_txns" ] || [ "$after_rows" -lt "$before_rows" ]; then
+    echo "replay counters regressed across resume: $replay_before_resume -> $replay_after_resume" >&2
+    exit 1
+fi
+echo "replay counters survived resume: $replay_before_resume -> $replay_after_resume"
 # Four kills and four resumes have each re-derived the tuning. The target must
 # still be tuned, and the recorded originals must still be the pre-migration
 # values rather than a bulk-load value recorded over them by a resume.

@@ -43,15 +43,20 @@ const streamProgressSQL = `
 		LEFT JOIN mark_started USING (stream_id)
 	),
 	progress AS (
-		INSERT INTO ` + cdcProgressTable + ` (stream_id, remote_lsn, stream_generation)
-		SELECT stream_id, $3::pg_lsn, $2
+		INSERT INTO ` + cdcProgressTable + ` AS existing (
+			stream_id, remote_lsn, stream_generation,
+			transactions_applied, rows_applied
+		)
+		SELECT stream_id, $3::pg_lsn, $2, $4::bigint, $5::bigint
 		FROM progress_source
 		ON CONFLICT (stream_id) DO UPDATE
 		SET remote_lsn = EXCLUDED.remote_lsn,
 		    stream_generation = EXCLUDED.stream_generation,
+		    transactions_applied = existing.transactions_applied + EXCLUDED.transactions_applied,
+		    rows_applied = existing.rows_applied + EXCLUDED.rows_applied,
 		    updated_at = clock_timestamp()
-		WHERE ` + cdcProgressTable + `.stream_generation IS NULL
-		   OR ` + cdcProgressTable + `.stream_generation = EXCLUDED.stream_generation
+		WHERE existing.stream_generation IS NULL
+		   OR existing.stream_generation = EXCLUDED.stream_generation
 		RETURNING 1
 	)
 	SELECT 1 / count(*)::integer
@@ -179,9 +184,11 @@ func updateStreamProgress(
 	streamID string,
 	generation string,
 	remoteLSN LSN,
+	transactions int64,
+	rows int64,
 ) error {
 	tag, err := tx.Exec(
-		ctx, streamProgressSQL, streamID, generation, pglogrepl.LSN(remoteLSN).String(),
+		ctx, streamProgressSQL, streamID, generation, pglogrepl.LSN(remoteLSN).String(), transactions, rows,
 	)
 	if isProgressGuardError(err) {
 		return ErrStreamGenerationMismatch
@@ -195,11 +202,17 @@ func updateStreamProgress(
 	return nil
 }
 
-func streamProgressParams(streamID, generation string, remoteLSN LSN) []rawParam {
+func streamProgressParams(
+	streamID, generation string,
+	remoteLSN LSN,
+	transactions, rows int64,
+) []rawParam {
 	return []rawParam{
 		{data: []byte(streamID), oid: pgtype.TextOID},
 		{data: []byte(generation), oid: pgtype.TextOID},
 		{data: []byte(pglogrepl.LSN(remoteLSN).String()), oid: pgtype.TextOID},
+		{data: []byte(fmt.Sprint(transactions)), oid: pgtype.Int8OID},
+		{data: []byte(fmt.Sprint(rows)), oid: pgtype.Int8OID},
 	}
 }
 

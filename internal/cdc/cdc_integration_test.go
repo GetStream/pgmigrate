@@ -273,6 +273,16 @@ func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {
 	if err := <-retryDone; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
+	replay, exists, err := postgres.ReadReplicationProgress(ctx, targetSQL, "pg17-live-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || replay.Transactions != int64(len(statements)) || replay.Rows < int64(len(statements)) {
+		t.Fatalf(
+			"replay counters after crash/retry = %+v exists=%t, want %d transactions and at least %d changes",
+			replay, exists, len(statements), len(statements),
+		)
+	}
 	segments, err := listSegments(directory)
 	if err != nil {
 		t.Fatal(err)
@@ -596,7 +606,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 10); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 10, 2, 20); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -620,7 +630,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 11); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 11, 3, 30); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -647,7 +657,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 12); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 12, 5, 50); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -661,6 +671,13 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if !exists || LSN(progress) != 12 {
 		t.Fatalf("restart progress=%x exists=%t, want 12", progress, exists)
 	}
+	replay, exists, err := postgres.ReadReplicationProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || replay.Transactions != 10 || replay.Rows != 100 || replay.UpdatedAt.IsZero() {
+		t.Fatalf("restart replay progress=%+v exists=%t, want 10 transactions/100 rows", replay, exists)
+	}
 
 	tx, err = restarted.Begin(ctx)
 	if err != nil {
@@ -670,7 +687,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, "wrong-generation", 13); !errors.Is(err, ErrStreamGenerationMismatch) {
+	if err := updateStreamProgress(ctx, tx, stream, "wrong-generation", 13, 7, 70); !errors.Is(err, ErrStreamGenerationMismatch) {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("generation mismatch error=%v", err)
 	}
@@ -691,12 +708,19 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if !exists || LSN(progress) != 12 {
 		t.Fatalf("generation mismatch changed progress to %x exists=%t", progress, exists)
 	}
+	replay, exists, err = postgres.ReadReplicationProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || replay.Transactions != 10 || replay.Rows != 100 {
+		t.Fatalf("generation mismatch changed replay counters: %+v exists=%t", replay, exists)
+	}
 
 	tx, err = restarted.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, "missing-identity", generation, 1); !errors.Is(err, ErrStreamGenerationMismatch) {
+	if err := updateStreamProgress(ctx, tx, "missing-identity", generation, 1, 11, 110); !errors.Is(err, ErrStreamGenerationMismatch) {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("missing identity error=%v", err)
 	}

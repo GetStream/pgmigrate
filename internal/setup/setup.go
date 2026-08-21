@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -268,16 +269,48 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 }
 
 func replicationConnect(ctx context.Context, dsn string) (*pgconn.PgConn, error) {
-	config, err := pgconn.ParseConfig(dsn)
+	config, err := snapshotHolderConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse source replication DSN: %w", err)
+		return nil, err
 	}
-	config.RuntimeParams["replication"] = "database"
 	conn, err := pgconn.ConnectConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("connect source replication protocol: %w", err)
 	}
 	return conn, nil
+}
+
+func snapshotHolderConfig(dsn string) (*pgconn.Config, error) {
+	config, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse source replication DSN: %w", err)
+	}
+	// CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT returns a snapshot that is
+	// valid only while this replication connection remains command-idle. A
+	// normal sender or session timeout therefore turns a long base copy into a
+	// delayed failure: existing importers keep running, but the next part cannot
+	// import the snapshot after PostgreSQL closes the exporter. In particular,
+	// PostgreSQL reports the exporter as idle in transaction after it returns the
+	// snapshot, so idle_in_transaction_session_timeout applies to it. Set every
+	// relevant timeout in the startup packet because issuing SET after slot
+	// creation would itself invalidate the exported snapshot.
+	config.RuntimeParams["wal_sender_timeout"] = "0"
+	config.RuntimeParams["idle_in_transaction_session_timeout"] = "0"
+	config.RuntimeParams["idle_session_timeout"] = "0"
+	config.RuntimeParams["application_name"] = "pgmigrate_snapshot_holder"
+	dialer := &net.Dialer{
+		Timeout:   config.ConnectTimeout,
+		KeepAlive: 30 * time.Second,
+		KeepAliveConfig: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     30 * time.Second,
+			Interval: 10 * time.Second,
+			Count:    3,
+		},
+	}
+	config.DialFunc = dialer.DialContext
+	config.RuntimeParams["replication"] = "database"
+	return config, nil
 }
 
 func createSlot(ctx context.Context, conn *pgconn.PgConn, name string, failover bool) (pglogrepl.CreateReplicationSlotResult, error) {

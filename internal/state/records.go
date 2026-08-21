@@ -485,6 +485,10 @@ func (s *Store) completed(ctx context.Context, table, key string, value any) (bo
 
 // UpdateApplyProgress replaces the status copy of target-origin progress.
 func (s *Store) UpdateApplyProgress(ctx context.Context, progress ApplyProgress) error {
+	updatedAt := progress.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
 	return s.write(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(
 			ctx, `
@@ -494,7 +498,7 @@ func (s *Store) UpdateApplyProgress(ctx context.Context, progress ApplyProgress)
 				applied_lsn=excluded.applied_lsn, txns=excluded.txns,
 				rows_applied=excluded.rows_applied, updated_at=excluded.updated_at`,
 			progress.StagedLSN, progress.AppliedLSN, progress.Txns, progress.Rows,
-			time.Now().UTC().UnixNano(),
+			updatedAt.UTC().UnixNano(),
 		)
 		if err != nil {
 			return fmt.Errorf("update apply progress: %w", err)

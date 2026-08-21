@@ -384,8 +384,9 @@ func TestPersistenceProgressAndIdempotency(t *testing.T) {
 			t.Errorf("%s completion = %t, %v; want true, nil", check.name, done, err)
 		}
 	}
+	applyUpdatedAt := time.Date(2026, time.August, 21, 12, 34, 56, 789, time.UTC)
 	if err := store.UpdateApplyProgress(ctx, ApplyProgress{
-		StagedLSN: "1/C", AppliedLSN: "1/B", Txns: 7, Rows: 23,
+		StagedLSN: "1/C", AppliedLSN: "1/B", Txns: 7, Rows: 23, UpdatedAt: applyUpdatedAt,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +432,7 @@ func TestPersistenceProgressAndIdempotency(t *testing.T) {
 		t.Errorf("unexpected persisted counts: %#v", status)
 	}
 	if status.Apply.AppliedLSN != "1/B" || status.Apply.StagedLSN != "1/C" ||
-		status.Apply.Txns != 7 || status.Apply.Rows != 23 {
+		status.Apply.Txns != 7 || status.Apply.Rows != 23 || !status.Apply.UpdatedAt.Equal(applyUpdatedAt) {
 		t.Errorf("unexpected persisted apply progress: %#v", status.Apply)
 	}
 	if status.OpenFindings != 0 || status.CompletedSteps != 1 {

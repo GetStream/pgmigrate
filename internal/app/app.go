@@ -490,11 +490,19 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		return monitorProgress(groupCtx, store, cfg.Target, holder.Snapshot.Slot, durable, cfg.Dir)
 	})
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, holder.Snapshot.Slot) })
+	watchCtx, stopSnapshotWatch := context.WithCancel(groupCtx)
+	defer stopSnapshotWatch()
 	group.Go(func() error {
-		watchCtx, stopWatch := context.WithCancel(groupCtx)
-		defer stopWatch()
-		watch := holder.Watchdog(watchCtx, time.Second)
-
+		err := <-holder.Watchdog(watchCtx, time.Second)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("source snapshot holder lost; base copy must restart from a fresh snapshot: %w", err)
+		}
+		return nil
+	})
+	group.Go(func() error {
 		if err := transition(groupCtx, cfg, store, state.PhaseSchema); err != nil {
 			return err
 		}
@@ -549,16 +557,9 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		if err := runner.Run(groupCtx, parts); err != nil {
 			return err
 		}
-		stopWatch()
+		stopSnapshotWatch()
 		if err := holder.Close(context.Background()); err != nil {
 			return err
-		}
-		select {
-		case watchErr := <-watch:
-			if watchErr != nil && !errors.Is(watchErr, context.Canceled) {
-				return watchErr
-			}
-		default:
 		}
 
 		if err := transition(groupCtx, cfg, store, state.PhaseIndexes); err != nil {
@@ -1736,20 +1737,26 @@ func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamI
 		if err != nil {
 			return err
 		}
-		applied, _, readErr := postgres.ReadProgress(ctx, conn, streamID)
+		progress, _, readErr := postgres.ReadReplicationProgress(ctx, conn, streamID)
 		conn.Close(context.Background())
 		if readErr != nil {
 			return readErr
 		}
 		if err := store.UpdateApplyProgress(ctx, state.ApplyProgress{
-			StagedLSN: pglogrepl.LSN(durable.Load()).String(), AppliedLSN: applied.String(),
+			StagedLSN:  pglogrepl.LSN(durable.Load()).String(),
+			AppliedLSN: progress.RemoteLSN.String(),
+			Txns:       progress.Transactions,
+			Rows:       progress.Rows,
+			UpdatedAt:  progress.UpdatedAt,
 		}); err != nil {
 			return err
 		}
 		if !time.Now().Before(nextLog) {
 			logEvent(dir, "progress", map[string]any{
-				"staged_lsn":  pglogrepl.LSN(durable.Load()).String(),
-				"applied_lsn": applied.String(),
+				"staged_lsn":   pglogrepl.LSN(durable.Load()).String(),
+				"applied_lsn":  progress.RemoteLSN.String(),
+				"transactions": progress.Transactions,
+				"rows":         progress.Rows,
 			})
 			nextLog = time.Now().Add(5 * time.Second)
 		}

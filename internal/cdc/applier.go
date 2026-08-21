@@ -523,7 +523,13 @@ func (a *Applier) applyTransaction(
 		)
 	}
 	if replayErr == nil {
-		replay.queueProgress(a.config.StreamID, a.config.StreamGeneration, transaction.EndLSN)
+		replay.queueProgress(
+			a.config.StreamID,
+			a.config.StreamGeneration,
+			transaction.EndLSN,
+			1,
+			int64(transaction.ChangeCount()),
+		)
 		replay.commit()
 		replayErr = replay.sync()
 	}
@@ -605,7 +611,17 @@ func (a *Applier) applyTransactionBatch(
 	}
 	if replayErr == nil {
 		last := transactions[len(transactions)-1].EndLSN
-		replay.queueProgress(a.config.StreamID, a.config.StreamGeneration, last)
+		var rows int64
+		for i := range transactions {
+			rows += int64(transactions[i].ChangeCount())
+		}
+		replay.queueProgress(
+			a.config.StreamID,
+			a.config.StreamGeneration,
+			last,
+			int64(len(transactions)),
+			rows,
+		)
 		replay.commit()
 		replayErr = replay.sync()
 	}
@@ -1267,10 +1283,14 @@ func (p *applyPipeline) commit() {
 	})
 }
 
-func (p *applyPipeline) queueProgress(streamID, generation string, remoteLSN LSN) {
+func (p *applyPipeline) queueProgress(
+	streamID, generation string,
+	remoteLSN LSN,
+	transactions, rows int64,
+) {
 	p.queueUnprepared(
 		streamProgressSQL,
-		streamProgressParams(streamID, generation, remoteLSN),
+		streamProgressParams(streamID, generation, remoteLSN, transactions, rows),
 		applyExpectation{
 			description: "update transactional apply progress", expectedRows: 1,
 			progressGuard: true,
