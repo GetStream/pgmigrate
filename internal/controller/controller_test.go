@@ -566,6 +566,9 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		"sourceDsn.value='';targetDsn.value=''",
 		"configurationRevision=data.revision",
 		"X-PGMigrate-Config-Revision",
+		"Unlock this dashboard",
+		"Dashboard locked: controller token is missing or invalid.",
+		`id="token" class="token mono"`,
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("configuration UI does not contain %q", want)

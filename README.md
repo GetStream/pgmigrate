@@ -327,6 +327,11 @@ valid, or when the migration is complete. Configuration is locked while either
 a migration or verification operation is active. Verification is permitted only
 while `run` is following.
 
+The token field is at the top of the dashboard. Until a valid token is entered,
+the dashboard reports itself as locked and does not render empty configuration
+fields as though the controller were unconfigured. The token remains in browser
+session storage only, so each new tab or browser session must authenticate.
+
 Each successful save returns an opaque, controller-instance-bound configuration
 revision that the dashboard sends with preflight, run, and verification. The
 controller rejects the action if the reviewed configuration changed before it
