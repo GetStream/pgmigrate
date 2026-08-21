@@ -165,6 +165,237 @@ func TestTokenAndConfirmationAreRequired(t *testing.T) {
 	}
 }
 
+func TestConfigurationRequiresAuthenticationAndRedactsCredentials(t *testing.T) {
+	cfg := validControllerConfig(t)
+	cfg.Source = "postgres://source-user:source-password@source/database"
+	cfg.Target = "postgres://target-user:target-password@target/database"
+	server := newTestServer(t, cfg, "secret", noOpActions())
+
+	if got := request(t, server, http.MethodGet, "/api/config", "", ""); got.Code != http.StatusUnauthorized {
+		t.Fatalf("config without token = %d, want unauthorized", got.Code)
+	}
+	if got := requestJSON(t, server, http.MethodPut, "/api/config", `{"workers":2}`, ""); got.Code != http.StatusUnauthorized {
+		t.Fatalf("config update without token = %d, want unauthorized", got.Code)
+	}
+	for _, target := range []string{"/api/config", "/api/status"} {
+		got := request(t, server, http.MethodGet, target, "", "secret")
+		if got.Code != http.StatusOK {
+			t.Fatalf("GET %s status = %d, body = %s", target, got.Code, got.Body.String())
+		}
+		for _, secret := range []string{cfg.Source, cfg.Target, "source-password", "target-password"} {
+			if strings.Contains(got.Body.String(), secret) {
+				t.Errorf("GET %s exposed database credential %q", target, secret)
+			}
+		}
+	}
+
+	got := request(t, server, http.MethodGet, "/api/config", "", "secret")
+	var view configurationView
+	decode(t, got, &view)
+	if !view.SourceConfigured || !view.TargetConfigured {
+		t.Fatalf("connection flags = source:%v target:%v, want true", view.SourceConfigured, view.TargetConfigured)
+	}
+}
+
+func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
+	cfg := validControllerConfig(t)
+	cfg.Source = ""
+	cfg.Target = ""
+	cfg.NoCleanup = true
+	cfg.SequenceOffset = 1234
+	cfg.EndPosition = "0/123"
+	server := newTestServer(t, cfg, "secret", noOpActions())
+
+	body := `{
+		"source":"postgres://new-source/database",
+		"target":"postgres://new-target/database",
+		"table_filter":"",
+		"workers":7,
+		"split_threshold":2048,
+		"restore_jobs":3,
+		"ack_warnings":true,
+		"allow_collation_change":true,
+		"pg_dump_path":"/usr/local/bin/pg_dump",
+		"pg_restore_path":"/usr/local/bin/pg_restore",
+		"metrics":":9190",
+		"wal_sample_duration":"45s",
+		"segment_prune_interval":"2m",
+		"retry_base_copy":true,
+		"skip_target_tuning":true,
+		"warn_on_tuning_errors":true,
+		"target_memory":"64GB",
+		"maintenance_work_mem":"1GB",
+		"max_parallel_maintenance_workers":2,
+		"max_wal_size":"16GB",
+		"checkpoint_timeout":"20min",
+		"verify_workers":2,
+		"verify_sample_rows":500,
+		"verify_sample_windows":10,
+		"verify_batch_rows":50,
+		"verify_duty_cycle":0.5,
+		"verify_table_timeout":"1h30m",
+		"verify_converge_timeout":"90s",
+		"verify_cdc_rows":120,
+		"cdc_sample_rows":300
+	}`
+	got := requestJSON(t, server, http.MethodPut, "/api/config", body, "secret")
+	if got.Code != http.StatusOK {
+		t.Fatalf("PUT config status = %d, body = %s", got.Code, got.Body.String())
+	}
+	if strings.Contains(got.Body.String(), "postgres://") {
+		t.Fatalf("PUT config exposed credentials: %s", got.Body.String())
+	}
+	var view configurationView
+	decode(t, got, &view)
+	if view.Workers != 7 || view.SplitThreshold != 2048 || view.RestoreJobs != 3 ||
+		view.WALSampleDuration != "45s" || view.SegmentPruneInterval != "2m0s" ||
+		view.VerifyWorkers != 2 || view.VerifyTableTimeout != "1h30m0s" || view.VerifyConvergeTimeout != "1m30s" {
+		t.Fatalf("updated view = %#v", view)
+	}
+	expected := cfg
+	expected.Source = "postgres://new-source/database"
+	expected.Target = "postgres://new-target/database"
+	expected.AckWarnings = true
+	expected.AllowCollationChange = true
+	expected.Workers = 7
+	expected.SplitThreshold = 2048
+	expected.RestoreJobs = 3
+	expected.PGDumpPath = "/usr/local/bin/pg_dump"
+	expected.PGRestorePath = "/usr/local/bin/pg_restore"
+	expected.Metrics = ":9190"
+	expected.WALSampleDuration = 45 * time.Second
+	expected.SegmentPruneInterval = 2 * time.Minute
+	expected.RetryBaseCopy = true
+	expected.SkipTargetTuning = true
+	expected.WarnOnTuningErrors = true
+	expected.TargetMemory = "64GB"
+	expected.MaintenanceWorkMem = "1GB"
+	expected.MaxParallelMaintenance = 2
+	expected.MaxWALSize = "16GB"
+	expected.CheckpointTimeout = "20min"
+	expected.VerifyWorkers = 2
+	expected.VerifySampleRows = 500
+	expected.VerifySampleWindows = 10
+	expected.VerifyBatchRows = 50
+	expected.VerifyDutyCycle = 0.5
+	expected.VerifyTableTimeout = 90 * time.Minute
+	expected.VerifyConvergeTimeout = 90 * time.Second
+	expected.VerifyCDCRows = 120
+	expected.CDCSampleRows = 300
+	if updated := server.configurationSnapshot(); updated != expected {
+		t.Fatalf("complete update did not round trip\nwant: %#v\ngot:  %#v", expected, updated)
+	}
+
+	// Blank credentials are write-only no-ops, and omitted settings retain the
+	// current values instead of resetting process defaults.
+	got = requestJSON(t, server, http.MethodPut, "/api/config", `{"source":" ","target":"","ack_warnings":false}`, "secret")
+	if got.Code != http.StatusOK {
+		t.Fatalf("second PUT config status = %d, body = %s", got.Code, got.Body.String())
+	}
+	updated := server.configurationSnapshot()
+	if updated.Source != "postgres://new-source/database" || updated.Target != "postgres://new-target/database" {
+		t.Fatalf("credentials changed after blank update: source=%q target=%q", updated.Source, updated.Target)
+	}
+	if updated.Workers != 7 || updated.AckWarnings {
+		t.Fatalf("partial update lost values: workers=%d ack=%v", updated.Workers, updated.AckWarnings)
+	}
+	if updated.Dir != cfg.Dir || !updated.NoCleanup || updated.SequenceOffset != 1234 || updated.EndPosition != "0/123" {
+		t.Fatalf("startup/CLI-only configuration changed: %#v", updated)
+	}
+}
+
+func TestInvalidConfigurationDoesNotReplaceCurrentConfiguration(t *testing.T) {
+	server := newTestServer(t, validControllerConfig(t), "", noOpActions())
+	before := server.configurationSnapshot()
+	for _, body := range []string{
+		`{"workers":0}`,
+		`{"wal_sample_duration":"tomorrow"}`,
+		`{"verify_duty_cycle":2}`,
+		`{"unknown_setting":true}`,
+	} {
+		got := requestJSON(t, server, http.MethodPut, "/api/config", body, "")
+		if got.Code != http.StatusBadRequest {
+			t.Errorf("PUT %s status = %d, body = %s", body, got.Code, got.Body.String())
+		}
+		if after := server.configurationSnapshot(); after != before {
+			t.Fatalf("invalid update %s changed config\nbefore: %#v\nafter:  %#v", body, before, after)
+		}
+	}
+}
+
+func TestConfigurationUpdateIsLockedWhileOperationsAreActive(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		action string
+		slot   string
+		phase  state.Phase
+	}{
+		{name: "migration", action: "preflight", slot: "migration"},
+		{name: "verification", action: "verify", slot: "verification", phase: state.PhaseFollow},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cfg := validControllerConfig(t)
+			if test.phase != "" {
+				initializeStateAt(t, cfg.Dir, test.phase)
+			}
+			started := make(chan struct{})
+			action := func(ctx context.Context, _ config.Config, _ io.Writer) error {
+				close(started)
+				<-ctx.Done()
+				return ctx.Err()
+			}
+			actions := noOpActions()
+			if test.action == "preflight" {
+				actions.Preflight = action
+			} else {
+				actions.Verify = action
+			}
+			server := newTestServer(t, cfg, "", actions)
+			if got := request(t, server, http.MethodPost, "/api/actions/"+test.action, test.action, ""); got.Code != http.StatusAccepted {
+				t.Fatalf("start status = %d, body = %s", got.Code, got.Body.String())
+			}
+			waitChannel(t, started)
+			got := requestJSON(t, server, http.MethodPut, "/api/config", `{"workers":2}`, "")
+			if got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), test.slot+" is active") {
+				t.Fatalf("PUT config status = %d, body = %s", got.Code, got.Body.String())
+			}
+			if got := request(t, server, http.MethodPost, "/api/actions/stop-"+test.slot, "stop-"+test.slot, ""); got.Code != http.StatusAccepted {
+				t.Fatalf("stop status = %d, body = %s", got.Code, got.Body.String())
+			}
+			waitForState(t, server, test.slot, "stopped")
+		})
+	}
+}
+
+func TestActionUsesConfigurationSnapshot(t *testing.T) {
+	cfg := validControllerConfig(t)
+	cfg.Source = "original-source"
+	release := make(chan struct{})
+	received := make(chan config.Config, 1)
+	actions := noOpActions()
+	actions.Preflight = func(_ context.Context, cfg config.Config, _ io.Writer) error {
+		<-release
+		received <- cfg
+		return nil
+	}
+	server := newTestServer(t, cfg, "", actions)
+	if got := request(t, server, http.MethodPost, "/api/actions/preflight", "preflight", ""); got.Code != http.StatusAccepted {
+		t.Fatalf("preflight status = %d, body = %s", got.Code, got.Body.String())
+	}
+	server.mu.Lock()
+	server.cfg.Source = "later-source"
+	server.mu.Unlock()
+	close(release)
+	select {
+	case got := <-received:
+		if got.Source != "original-source" {
+			t.Fatalf("action source = %q, want snapshot", got.Source)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for action configuration")
+	}
+}
+
 func TestIndexContainsControllerProgressUI(t *testing.T) {
 	server := newTestServer(t, config.Config{Dir: t.TempDir()}, "", noOpActions())
 	recorder := request(t, server, http.MethodGet, "/", "", "")
@@ -212,6 +443,27 @@ func request(t *testing.T, server *Server, method, target, confirmation, token s
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, req)
 	return recorder
+}
+
+func requestJSON(t *testing.T, server *Server, method, target, body, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("X-PGMigrate-Token", token)
+	}
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	return recorder
+}
+
+func validControllerConfig(t *testing.T) config.Config {
+	t.Helper()
+	cfg := config.FromEnvironment()
+	cfg.Source = "source"
+	cfg.Target = "target"
+	cfg.Dir = t.TempDir()
+	return cfg
 }
 
 func decode(t *testing.T, recorder *httptest.ResponseRecorder, value any) {

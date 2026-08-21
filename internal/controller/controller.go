@@ -111,6 +111,78 @@ type copyView struct {
 	Duration time.Duration `json:"duration"`
 }
 
+// configurationView is the mutable controller configuration exposed to the
+// dashboard. Database credentials are deliberately represented only by
+// configured flags; their values are write-only through configurationUpdate.
+type configurationView struct {
+	SourceConfigured       bool    `json:"source_configured"`
+	TargetConfigured       bool    `json:"target_configured"`
+	TableFilter            string  `json:"table_filter"`
+	AckWarnings            bool    `json:"ack_warnings"`
+	AllowCollationChange   bool    `json:"allow_collation_change"`
+	Workers                int     `json:"workers"`
+	SplitThreshold         int64   `json:"split_threshold"`
+	RestoreJobs            int     `json:"restore_jobs"`
+	PGDumpPath             string  `json:"pg_dump_path"`
+	PGRestorePath          string  `json:"pg_restore_path"`
+	Metrics                string  `json:"metrics"`
+	WALSampleDuration      string  `json:"wal_sample_duration"`
+	SegmentPruneInterval   string  `json:"segment_prune_interval"`
+	RetryBaseCopy          bool    `json:"retry_base_copy"`
+	SkipTargetTuning       bool    `json:"skip_target_tuning"`
+	WarnOnTuningErrors     bool    `json:"warn_on_tuning_errors"`
+	TargetMemory           string  `json:"target_memory"`
+	MaintenanceWorkMem     string  `json:"maintenance_work_mem"`
+	MaxParallelMaintenance int     `json:"max_parallel_maintenance_workers"`
+	MaxWALSize             string  `json:"max_wal_size"`
+	CheckpointTimeout      string  `json:"checkpoint_timeout"`
+	VerifyWorkers          int     `json:"verify_workers"`
+	VerifySampleRows       int64   `json:"verify_sample_rows"`
+	VerifySampleWindows    int64   `json:"verify_sample_windows"`
+	VerifyBatchRows        int64   `json:"verify_batch_rows"`
+	VerifyDutyCycle        float64 `json:"verify_duty_cycle"`
+	VerifyTableTimeout     string  `json:"verify_table_timeout"`
+	VerifyConvergeTimeout  string  `json:"verify_converge_timeout"`
+	VerifyCDCRows          int64   `json:"verify_cdc_rows"`
+	CDCSampleRows          int64   `json:"cdc_sample_rows"`
+}
+
+// configurationUpdate uses pointers so callers can change a subset of the
+// non-secret settings without resetting process defaults. Blank credentials
+// intentionally retain the currently configured value.
+type configurationUpdate struct {
+	Source                 *string  `json:"source"`
+	Target                 *string  `json:"target"`
+	TableFilter            *string  `json:"table_filter"`
+	AckWarnings            *bool    `json:"ack_warnings"`
+	AllowCollationChange   *bool    `json:"allow_collation_change"`
+	Workers                *int     `json:"workers"`
+	SplitThreshold         *int64   `json:"split_threshold"`
+	RestoreJobs            *int     `json:"restore_jobs"`
+	PGDumpPath             *string  `json:"pg_dump_path"`
+	PGRestorePath          *string  `json:"pg_restore_path"`
+	Metrics                *string  `json:"metrics"`
+	WALSampleDuration      *string  `json:"wal_sample_duration"`
+	SegmentPruneInterval   *string  `json:"segment_prune_interval"`
+	RetryBaseCopy          *bool    `json:"retry_base_copy"`
+	SkipTargetTuning       *bool    `json:"skip_target_tuning"`
+	WarnOnTuningErrors     *bool    `json:"warn_on_tuning_errors"`
+	TargetMemory           *string  `json:"target_memory"`
+	MaintenanceWorkMem     *string  `json:"maintenance_work_mem"`
+	MaxParallelMaintenance *int     `json:"max_parallel_maintenance_workers"`
+	MaxWALSize             *string  `json:"max_wal_size"`
+	CheckpointTimeout      *string  `json:"checkpoint_timeout"`
+	VerifyWorkers          *int     `json:"verify_workers"`
+	VerifySampleRows       *int64   `json:"verify_sample_rows"`
+	VerifySampleWindows    *int64   `json:"verify_sample_windows"`
+	VerifyBatchRows        *int64   `json:"verify_batch_rows"`
+	VerifyDutyCycle        *float64 `json:"verify_duty_cycle"`
+	VerifyTableTimeout     *string  `json:"verify_table_timeout"`
+	VerifyConvergeTimeout  *string  `json:"verify_converge_timeout"`
+	VerifyCDCRows          *int64   `json:"verify_cdc_rows"`
+	CDCSampleRows          *int64   `json:"cdc_sample_rows"`
+}
+
 type statusResponse struct {
 	Snapshot              *observe.Snapshot        `json:"snapshot,omitempty"`
 	Copy                  copyView                 `json:"copy"`
@@ -176,6 +248,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.index)
 	mux.HandleFunc("GET /api/status", s.status)
+	mux.HandleFunc("GET /api/config", s.getConfiguration)
+	mux.HandleFunc("PUT /api/config", s.putConfiguration)
 	mux.HandleFunc("POST /api/actions/{action}", s.action)
 	return securityHeaders(mux)
 }
@@ -251,15 +325,16 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	cfg := s.configurationSnapshot()
 	response := statusResponse{
 		Operations:            s.operationSnapshots(),
-		ConnectionsConfigured: s.cfg.ValidateConnections() == nil,
+		ConnectionsConfigured: cfg.ValidateConnections() == nil,
 		TokenRequired:         s.token != "",
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	store, err := state.OpenReadOnly(ctx, s.cfg.Dir)
+	store, err := state.OpenReadOnly(ctx, cfg.Dir)
 	if errors.Is(err, state.ErrStateNotFound) {
 		writeJSON(w, http.StatusOK, response)
 		return
@@ -314,6 +389,197 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+func (s *Server) getConfiguration(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeError(w, http.StatusUnauthorized, "controller token is missing or invalid")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, viewConfiguration(s.configurationSnapshot()))
+}
+
+func (s *Server) putConfiguration(w http.ResponseWriter, r *http.Request) {
+	if !s.authorized(r) {
+		writeError(w, http.StatusUnauthorized, "controller token is missing or invalid")
+		return
+	}
+	defer r.Body.Close()
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	var update configurationUpdate
+	if err := decoder.Decode(&update); err != nil {
+		writeError(w, http.StatusBadRequest, "decode configuration: "+err.Error())
+		return
+	}
+	if err := ensureJSONEnd(decoder); err != nil {
+		writeError(w, http.StatusBadRequest, "decode configuration: "+err.Error())
+		return
+	}
+	view, err := s.updateConfiguration(update)
+	if err != nil {
+		var conflict *configurationConflictError
+		if errors.As(err, &conflict) {
+			writeError(w, http.StatusConflict, err.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, view)
+}
+
+type configurationConflictError struct {
+	operation string
+}
+
+func (e *configurationConflictError) Error() string {
+	return "configuration cannot be changed while " + e.operation + " is active"
+}
+
+func ensureJSONEnd(decoder *json.Decoder) error {
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request must contain exactly one JSON object")
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Server) updateConfiguration(update configurationUpdate) (configurationView, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, slot := range []string{"migration", "verification"} {
+		if operation := s.operations[slot]; operation.active() {
+			return configurationView{}, &configurationConflictError{operation: slot}
+		}
+	}
+	candidate := s.cfg
+	if err := applyConfigurationUpdate(&candidate, update); err != nil {
+		return configurationView{}, err
+	}
+	if err := validateConfiguration(candidate); err != nil {
+		return configurationView{}, err
+	}
+	s.cfg = candidate
+	return viewConfiguration(candidate), nil
+}
+
+func applyConfigurationUpdate(candidate *config.Config, update configurationUpdate) error {
+	if update.Source != nil && strings.TrimSpace(*update.Source) != "" {
+		candidate.Source = strings.TrimSpace(*update.Source)
+	}
+	if update.Target != nil && strings.TrimSpace(*update.Target) != "" {
+		candidate.Target = strings.TrimSpace(*update.Target)
+	}
+	setIfPresent(&candidate.TableFilter, update.TableFilter)
+	setIfPresent(&candidate.AckWarnings, update.AckWarnings)
+	setIfPresent(&candidate.AllowCollationChange, update.AllowCollationChange)
+	setIfPresent(&candidate.Workers, update.Workers)
+	setIfPresent(&candidate.SplitThreshold, update.SplitThreshold)
+	setIfPresent(&candidate.RestoreJobs, update.RestoreJobs)
+	setIfPresent(&candidate.PGDumpPath, update.PGDumpPath)
+	setIfPresent(&candidate.PGRestorePath, update.PGRestorePath)
+	setIfPresent(&candidate.Metrics, update.Metrics)
+	setIfPresent(&candidate.RetryBaseCopy, update.RetryBaseCopy)
+	setIfPresent(&candidate.SkipTargetTuning, update.SkipTargetTuning)
+	setIfPresent(&candidate.WarnOnTuningErrors, update.WarnOnTuningErrors)
+	setIfPresent(&candidate.TargetMemory, update.TargetMemory)
+	setIfPresent(&candidate.MaintenanceWorkMem, update.MaintenanceWorkMem)
+	setIfPresent(&candidate.MaxParallelMaintenance, update.MaxParallelMaintenance)
+	setIfPresent(&candidate.MaxWALSize, update.MaxWALSize)
+	setIfPresent(&candidate.CheckpointTimeout, update.CheckpointTimeout)
+	setIfPresent(&candidate.VerifyWorkers, update.VerifyWorkers)
+	setIfPresent(&candidate.VerifySampleRows, update.VerifySampleRows)
+	setIfPresent(&candidate.VerifySampleWindows, update.VerifySampleWindows)
+	setIfPresent(&candidate.VerifyBatchRows, update.VerifyBatchRows)
+	setIfPresent(&candidate.VerifyDutyCycle, update.VerifyDutyCycle)
+	setIfPresent(&candidate.VerifyCDCRows, update.VerifyCDCRows)
+	setIfPresent(&candidate.CDCSampleRows, update.CDCSampleRows)
+	if err := parseDurationUpdate("wal_sample_duration", update.WALSampleDuration, &candidate.WALSampleDuration); err != nil {
+		return err
+	}
+	if err := parseDurationUpdate("segment_prune_interval", update.SegmentPruneInterval, &candidate.SegmentPruneInterval); err != nil {
+		return err
+	}
+	if err := parseDurationUpdate("verify_table_timeout", update.VerifyTableTimeout, &candidate.VerifyTableTimeout); err != nil {
+		return err
+	}
+	return parseDurationUpdate("verify_converge_timeout", update.VerifyConvergeTimeout, &candidate.VerifyConvergeTimeout)
+}
+
+func setIfPresent[T any](destination *T, value *T) {
+	if value != nil {
+		*destination = *value
+	}
+}
+
+func parseDurationUpdate(name string, value *string, destination *time.Duration) error {
+	if value == nil {
+		return nil
+	}
+	duration, err := time.ParseDuration(strings.TrimSpace(*value))
+	if err != nil {
+		return fmt.Errorf("%s must be a duration such as 30s or 5m", name)
+	}
+	*destination = duration
+	return nil
+}
+
+func validateConfiguration(cfg config.Config) error {
+	if err := cfg.ValidateConnections(); err != nil {
+		return err
+	}
+	if cfg.TableFilter != "" {
+		if _, err := config.LoadFilter(cfg.TableFilter); err != nil {
+			return err
+		}
+	}
+	if cfg.Workers < 1 || cfg.RestoreJobs < 1 || cfg.SplitThreshold < 1 ||
+		cfg.WALSampleDuration <= 0 || cfg.SegmentPruneInterval <= 0 {
+		return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, and segment-prune-interval must be positive")
+	}
+	if cfg.CDCSampleRows < 0 {
+		return errors.New("cdc-sample-rows must not be negative")
+	}
+	if cfg.Metrics != "" {
+		if _, _, err := net.SplitHostPort(cfg.Metrics); err != nil {
+			return fmt.Errorf("parse metrics listen address: %w", err)
+		}
+	}
+	if _, err := cfg.TuningOverrides(); err != nil {
+		return err
+	}
+	return cfg.ValidateVerify()
+}
+
+func viewConfiguration(cfg config.Config) configurationView {
+	return configurationView{
+		SourceConfigured: strings.TrimSpace(cfg.Source) != "", TargetConfigured: strings.TrimSpace(cfg.Target) != "",
+		TableFilter: cfg.TableFilter, AckWarnings: cfg.AckWarnings, AllowCollationChange: cfg.AllowCollationChange,
+		Workers: cfg.Workers, SplitThreshold: cfg.SplitThreshold, RestoreJobs: cfg.RestoreJobs,
+		PGDumpPath: cfg.PGDumpPath, PGRestorePath: cfg.PGRestorePath, Metrics: cfg.Metrics,
+		WALSampleDuration: cfg.WALSampleDuration.String(), SegmentPruneInterval: cfg.SegmentPruneInterval.String(),
+		RetryBaseCopy: cfg.RetryBaseCopy, SkipTargetTuning: cfg.SkipTargetTuning,
+		WarnOnTuningErrors: cfg.WarnOnTuningErrors, TargetMemory: cfg.TargetMemory,
+		MaintenanceWorkMem: cfg.MaintenanceWorkMem, MaxParallelMaintenance: cfg.MaxParallelMaintenance,
+		MaxWALSize: cfg.MaxWALSize, CheckpointTimeout: cfg.CheckpointTimeout,
+		VerifyWorkers: cfg.VerifyWorkers, VerifySampleRows: cfg.VerifySampleRows,
+		VerifySampleWindows: cfg.VerifySampleWindows, VerifyBatchRows: cfg.VerifyBatchRows,
+		VerifyDutyCycle: cfg.VerifyDutyCycle, VerifyTableTimeout: cfg.VerifyTableTimeout.String(),
+		VerifyConvergeTimeout: cfg.VerifyConvergeTimeout.String(), VerifyCDCRows: cfg.VerifyCDCRows,
+		CDCSampleRows: cfg.CDCSampleRows,
+	}
+}
+
+func (s *Server) configurationSnapshot() config.Config {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg
+}
+
 func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 	if !s.authorized(r) {
 		writeError(w, http.StatusUnauthorized, "controller token is missing or invalid")
@@ -352,7 +618,8 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 func (s *Server) validateLifecycle(ctx context.Context, action string) error {
 	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	store, err := state.OpenReadOnly(readCtx, s.cfg.Dir)
+	cfg := s.configurationSnapshot()
+	store, err := state.OpenReadOnly(readCtx, cfg.Dir)
 	if errors.Is(err, state.ErrStateNotFound) {
 		if action == "verify" {
 			return errors.New("verification requires a migration in follow phase")
@@ -420,12 +687,13 @@ func (s *Server) start(name string, action Action) (operationView, error) {
 	}
 	s.operations[slot] = operation
 	view := operation.view()
-	go s.execute(ctx, slot, operation.ID, output, action)
+	cfg := s.cfg
+	go s.execute(ctx, slot, operation.ID, output, cfg, action)
 	return view, nil
 }
 
-func (s *Server) execute(ctx context.Context, slot string, id int64, output io.Writer, action Action) {
-	err := action(ctx, s.cfg, output)
+func (s *Server) execute(ctx context.Context, slot string, id int64, output io.Writer, cfg config.Config, action Action) {
+	err := action(ctx, cfg, output)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
