@@ -80,13 +80,13 @@ type operation struct {
 }
 
 type operationView struct {
-	ID         int64     `json:"id,omitempty"`
-	Name       string    `json:"name,omitempty"`
-	State      string    `json:"state"`
-	StartedAt  time.Time `json:"started_at,omitempty"`
-	FinishedAt time.Time `json:"finished_at,omitempty"`
-	Error      string    `json:"error,omitempty"`
-	Output     string    `json:"output,omitempty"`
+	ID         int64      `json:"id,omitempty"`
+	Name       string     `json:"name,omitempty"`
+	State      string     `json:"state"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	Output     string     `json:"output,omitempty"`
 }
 
 type findingView struct {
@@ -105,8 +105,15 @@ type failureView struct {
 	ObservedAt  time.Time   `json:"observed_at"`
 }
 
+type copyView struct {
+	Rows     int64         `json:"rows"`
+	Bytes    int64         `json:"bytes"`
+	Duration time.Duration `json:"duration"`
+}
+
 type statusResponse struct {
 	Snapshot              *observe.Snapshot        `json:"snapshot,omitempty"`
+	Copy                  copyView                 `json:"copy"`
 	Findings              []findingView            `json:"findings,omitempty"`
 	Failure               *failureView             `json:"failure,omitempty"`
 	Operations            map[string]operationView `json:"operations"`
@@ -269,6 +276,19 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.Snapshot = &snapshot
+	parts, err := store.ListParts(ctx)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	for _, part := range parts {
+		if !part.Completed {
+			continue
+		}
+		response.Copy.Rows += part.Rows
+		response.Copy.Bytes += part.Bytes
+		response.Copy.Duration += part.Duration
+	}
 	findings, err := store.PendingFindings(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -317,12 +337,51 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown controller action")
 		return
 	}
+	if err := s.validateLifecycle(r.Context(), name); err != nil {
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
 	view, err := s.start(name, action)
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
 	writeJSON(w, http.StatusAccepted, view)
+}
+
+func (s *Server) validateLifecycle(ctx context.Context, action string) error {
+	readCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	store, err := state.OpenReadOnly(readCtx, s.cfg.Dir)
+	if errors.Is(err, state.ErrStateNotFound) {
+		if action == "verify" {
+			return errors.New("verification requires a migration in follow phase")
+		}
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read migration phase: %w", err)
+	}
+	defer store.Close()
+	migration, err := store.Migration(readCtx)
+	if err != nil {
+		return fmt.Errorf("read migration phase: %w", err)
+	}
+	switch action {
+	case "preflight":
+		if migration.Phase != state.PhasePreflight {
+			return fmt.Errorf("preflight is unavailable in %s phase", migration.Phase)
+		}
+	case "run":
+		if migration.Phase == state.PhaseComplete {
+			return errors.New("migration is already complete")
+		}
+	case "verify":
+		if migration.Phase != state.PhaseFollow {
+			return fmt.Errorf("verification requires follow phase; migration is in %s", migration.Phase)
+		}
+	}
+	return nil
 }
 
 func (s *Server) authorized(r *http.Request) bool {
@@ -426,8 +485,15 @@ func (o operation) active() bool {
 
 func (o operation) view() operationView {
 	view := operationView{
-		ID: o.ID, Name: o.Name, State: o.State, StartedAt: o.StartedAt,
-		FinishedAt: o.FinishedAt, Error: o.Error,
+		ID: o.ID, Name: o.Name, State: o.State, Error: o.Error,
+	}
+	if !o.StartedAt.IsZero() {
+		started := o.StartedAt
+		view.StartedAt = &started
+	}
+	if !o.FinishedAt.IsZero() {
+		finished := o.FinishedAt
+		view.FinishedAt = &finished
 	}
 	if o.Output != nil {
 		view.Output = o.Output.String()

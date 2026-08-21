@@ -8,8 +8,18 @@ binary=${PGMIGRATE_BIN:-"$repo_root/pgmigrate"}
 source_url=${PGMIGRATE_SOURCE:-"postgres://app:app@localhost:${SOURCE_PORT:-55432}/app?sslmode=disable"}
 target_url=${PGMIGRATE_TARGET:-"postgres://app:app@localhost:${TARGET_PORT:-55433}/app?sslmode=disable"}
 timeout=${MIGRATION_TIMEOUT:-300}
+driver=${PGMIGRATE_DRIVER:-cli}
 created_migration_dir=0
 run_pid=
+controller_pid=
+controller_url=${PGMIGRATE_CONTROLLER_URL:-http://127.0.0.1:19188}
+controller_listen=${PGMIGRATE_CONTROLLER_LISTEN:-127.0.0.1:19188}
+controller_token=${PGMIGRATE_CONTROLLER_TOKEN:-pgmigrate-e2e-token}
+
+case "$driver" in
+    cli|controller) ;;
+    *) echo "unknown PGMIGRATE_DRIVER: $driver (want cli or controller)" >&2; exit 1 ;;
+esac
 
 if [ ! -x "$binary" ]; then
     echo "pgmigrate binary is not executable: $binary" >&2
@@ -51,6 +61,10 @@ cleanup() {
         kill "$run_pid" 2>/dev/null || true
         wait "$run_pid" 2>/dev/null || true
     fi
+    if [ -n "$controller_pid" ] && kill -0 "$controller_pid" 2>/dev/null; then
+        kill "$controller_pid" 2>/dev/null || true
+        wait "$controller_pid" 2>/dev/null || true
+    fi
     if [ "$created_migration_dir" -eq 1 ] && [ "${KEEP_MIGRATION_DIR:-0}" != "1" ]; then
         rm -rf "$migration_dir"
     else
@@ -58,6 +72,50 @@ cleanup() {
     fi
 }
 trap cleanup EXIT INT TERM
+
+controller_status() {
+    curl -fsS -H "X-PGMigrate-Token: $controller_token" "$controller_url/api/status"
+}
+
+controller_action() {
+    action=$1
+    curl -fsS -X POST \
+        -H "X-PGMigrate-Token: $controller_token" \
+        -H "X-PGMigrate-Confirm: $action" \
+        "$controller_url/api/actions/$action" >/dev/null
+}
+
+controller_operation_state() {
+    slot=$1
+    controller_status | sed -n "s/.*\"$slot\":{[^}]*\"state\":\"\([^\"]*\)\".*/\1/p"
+}
+
+wait_controller_operation() {
+    slot=$1
+    action=$2
+    deadline=$(( $(date +%s) + timeout ))
+    while :; do
+        state=$(controller_operation_state "$slot")
+        case "$state" in
+            succeeded) return ;;
+            failed|stopped)
+                echo "controller $action $state" >&2
+                controller_status >&2 || true
+                exit 1
+                ;;
+        esac
+        if ! kill -0 "$controller_pid" 2>/dev/null; then
+            echo "controller exited while waiting for $action" >&2
+            awk '{print}' "$migration_dir/controller.log" >&2
+            exit 1
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "timed out waiting for controller $action after ${timeout}s" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+}
 
 "$E2E_DIR/scripts/start.sh"
 
@@ -71,35 +129,78 @@ PGMIGRATE_BIN="$binary" PGMIGRATE_SOURCE="$source_url" \
     "$E2E_DIR/scripts/assert-collation.sh"
 
 echo "running preflight"
-"$binary" preflight \
-    --source "$source_url" \
-    --target "$target_url" \
-    --dir "$migration_dir" \
-    --pg-dump "$pg_dump_path" \
-    --pg-restore "$pg_restore_path" \
-    --wal-sample-duration 250ms \
-    --ack-warnings
+if [ "$driver" = controller ]; then
+    "$binary" controller \
+        --source "$source_url" \
+        --target "$target_url" \
+        --dir "$migration_dir" \
+        --pg-dump "$pg_dump_path" \
+        --pg-restore "$pg_restore_path" \
+        --wal-sample-duration 250ms \
+        --split-threshold "$split_threshold" \
+        --ack-warnings \
+        --listen "$controller_listen" \
+        --token "$controller_token" >"$migration_dir/controller.log" 2>&1 &
+    controller_pid=$!
+    deadline=$(( $(date +%s) + timeout ))
+    until controller_status >/dev/null 2>&1; do
+        if ! kill -0 "$controller_pid" 2>/dev/null; then
+            echo "controller exited during startup" >&2
+            awk '{print}' "$migration_dir/controller.log" >&2
+            exit 1
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "timed out waiting for controller startup" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    controller_action preflight
+    wait_controller_operation migration preflight
+else
+    "$binary" preflight \
+        --source "$source_url" \
+        --target "$target_url" \
+        --dir "$migration_dir" \
+        --pg-dump "$pg_dump_path" \
+        --pg-restore "$pg_restore_path" \
+        --wal-sample-duration 250ms \
+        --ack-warnings
+fi
 
 echo "starting migration"
-"$binary" run \
-    --source "$source_url" \
-    --target "$target_url" \
-    --dir "$migration_dir" \
-    --pg-dump "$pg_dump_path" \
-    --pg-restore "$pg_restore_path" \
-    --wal-sample-duration 250ms \
-    --split-threshold "$split_threshold" \
-    --ack-warnings >"$migration_dir/run.log" 2>&1 &
-run_pid=$!
+if [ "$driver" = controller ]; then
+    controller_action run
+else
+    "$binary" run \
+        --source "$source_url" \
+        --target "$target_url" \
+        --dir "$migration_dir" \
+        --pg-dump "$pg_dump_path" \
+        --pg-restore "$pg_restore_path" \
+        --wal-sample-duration 250ms \
+        --split-threshold "$split_threshold" \
+        --ack-warnings >"$migration_dir/run.log" 2>&1 &
+    run_pid=$!
+fi
 
 deadline=$(( $(date +%s) + timeout ))
 while :; do
-    if ! kill -0 "$run_pid" 2>/dev/null; then
-        wait "$run_pid" || true
-        echo "pgmigrate run exited before follow phase" >&2
-        printf '%s\n' "--- pgmigrate run log ---" >&2
-        awk '{print}' "$migration_dir/run.log" >&2
-        exit 1
+    if [ "$driver" = controller ]; then
+        state=$(controller_operation_state migration)
+        case "$state" in
+            failed|stopped|succeeded)
+                echo "controller run became $state before follow phase" >&2
+                controller_status >&2 || true
+                exit 1
+                ;;
+        esac
+    elif ! kill -0 "$run_pid" 2>/dev/null; then
+            wait "$run_pid" || true
+            echo "pgmigrate run exited before follow phase" >&2
+            printf '%s\n' "--- pgmigrate run log ---" >&2
+            awk '{print}' "$migration_dir/run.log" >&2
+            exit 1
     fi
 
     status=$("$binary" status --dir "$migration_dir" --json 2>/dev/null || true)
@@ -138,30 +239,45 @@ echo "copied $copied_parts part(s) across $copied_tables table(s)"
 # flakiness.
 echo "verifying against live traffic"
 applied_before=$(target_sql -Atqc "SELECT remote_lsn FROM pgmigrate_internal.replication_progress LIMIT 1")
-if ! "$binary" verify \
-    --source "$source_url" \
-    --target "$target_url" \
-    --dir "$migration_dir" >"$migration_dir/verify-live.json" 2>"$migration_dir/verify-live.log"; then
-    echo "verification under live traffic failed" >&2
-    awk '{print}' "$migration_dir/verify-live.json" >&2
-    awk '{print}' "$migration_dir/verify-live.log" >&2
-    exit 1
+if [ "$driver" = controller ]; then
+    controller_action verify
+    wait_controller_operation verification verify
+    controller_status >"$migration_dir/controller-verify-live.json"
+else
+    if ! "$binary" verify \
+        --source "$source_url" \
+        --target "$target_url" \
+        --dir "$migration_dir" >"$migration_dir/verify-live.json" 2>"$migration_dir/verify-live.log"; then
+        echo "verification under live traffic failed" >&2
+        awk '{print}' "$migration_dir/verify-live.json" >&2
+        awk '{print}' "$migration_dir/verify-live.log" >&2
+        exit 1
+    fi
 fi
 applied_after=$(target_sql -Atqc "SELECT remote_lsn FROM pgmigrate_internal.replication_progress LIMIT 1")
-case $(cat "$migration_dir/verify-live.json") in
+verify_result=$migration_dir/verify-live.json
+if [ "$driver" = controller ]; then
+    verify_result=$migration_dir/controller-verify-live.json
+fi
+case $(cat "$verify_result") in
     *'"converged":true'*) ;;
     *) echo "live verification did not report convergence" >&2
-       awk '{print}' "$migration_dir/verify-live.json" >&2
+       awk '{print}' "$verify_result" >&2
        exit 1 ;;
 esac
 # Rows have to have been read and looked up. Verification samples, so it cannot
 # claim to have compared everything, but a result that reported convergence without
 # reading anything would pass a bare "converged" check and prove nothing.
-for claim in '"source":{"pages"' '"estimated_rows"' '"target":{"batches"'; do
-    case $(cat "$migration_dir/verify-live.json") in
+if [ "$driver" = controller ]; then
+    claims='"sampled_rows" "estimated_rows" "cdc_observed"'
+else
+    claims='"source":{"pages" "estimated_rows" "target":{"batches"'
+fi
+for claim in $claims; do
+    case $(cat "$verify_result") in
         *"$claim"*) ;;
         *) echo "live verification result is missing $claim" >&2
-           awk '{print}' "$migration_dir/verify-live.json" >&2
+           awk '{print}' "$verify_result" >&2
            exit 1 ;;
     esac
 done
@@ -171,21 +287,25 @@ done
 # the whole chain end to end — the running applier recorded keys, they reached
 # state.db, and verify read them — because every part of it is silent when it
 # fails, and a run that checked nothing still reports convergence.
-case $(cat "$migration_dir/verify-live.log") in
-    *'applied rows checked'*) ;;
-    *) echo "verification did not check the replication path: no applier-recorded keys reached it" >&2
-       awk '{print}' "$migration_dir/verify-live.log" >&2
-       exit 1 ;;
-esac
+if [ "$driver" = cli ]; then
+    case $(cat "$migration_dir/verify-live.log") in
+        *'applied rows checked'*) ;;
+        *) echo "verification did not check the replication path: no applier-recorded keys reached it" >&2
+           awk '{print}' "$migration_dir/verify-live.log" >&2
+           exit 1 ;;
+    esac
+fi
 # The fixture's keyless table cannot be checked at all: a sampled row is found on
 # the target by key. That has to be said out loud and must not fail the run, or a
 # cutover would be blocked for good by a table nothing can verify.
-case $(cat "$migration_dir/verify-live.json") in
-    *'was not compared'*) ;;
-    *) echo "the keyless fixture table was not reported as skipped" >&2
-       awk '{print}' "$migration_dir/verify-live.json" >&2
-       exit 1 ;;
-esac
+if [ "$driver" = cli ]; then
+    case $(cat "$migration_dir/verify-live.json") in
+        *'was not compared'*) ;;
+        *) echo "the keyless fixture table was not reported as skipped" >&2
+           awk '{print}' "$migration_dir/verify-live.json" >&2
+           exit 1 ;;
+    esac
+fi
 # Verification must never hold apply. Traffic is running throughout, so apply has to
 # have advanced across the comparison rather than only after it.
 if [ "$applied_before" = "$applied_after" ]; then
@@ -200,22 +320,31 @@ echo "apply advanced during verification: $applied_before -> $applied_after"
 # where the fixture makes it: cutover itself checks nothing, so a divergence found
 # here is the only thing standing between a bad copy and production.
 echo "running verification before cutover"
-"$binary" verify \
-    --source "$source_url" \
-    --target "$target_url" \
-    --dir "$migration_dir" >/dev/null
+if [ "$driver" = controller ]; then
+    controller_action verify
+    wait_controller_operation verification verify
+else
+    "$binary" verify \
+        --source "$source_url" \
+        --target "$target_url" \
+        --dir "$migration_dir" >/dev/null
+fi
 
 "$binary" cutover \
     --source "$source_url" \
     --target "$target_url" \
     --dir "$migration_dir"
 
-if ! wait "$run_pid"; then
-    echo "pgmigrate run did not exit cleanly after cutover" >&2
-    awk '{print}' "$migration_dir/run.log" >&2
-    exit 1
+if [ "$driver" = controller ]; then
+    wait_controller_operation migration run
+else
+    if ! wait "$run_pid"; then
+        echo "pgmigrate run did not exit cleanly after cutover" >&2
+        awk '{print}' "$migration_dir/run.log" >&2
+        exit 1
+    fi
+    run_pid=
 fi
-run_pid=
 if [ "$(source_sql -Atqc "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgmigrate_slot_%'")" -ne 0 ]; then
     echo "migration replication slot was not cleaned up" >&2
     exit 1

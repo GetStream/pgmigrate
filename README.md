@@ -313,16 +313,19 @@ beside an active `run`. It needs no database connection and no DSNs.
 ### pgmigrate controller
 
 Serves an embedded web dashboard backed by the same durable state as `status`.
-It shows the lifecycle stage, exact object completion counts, apply lag and
-staleness, per-table verification coverage, findings, failures, and action
-output. The lifecycle bar is stage progress, not an elapsed-time estimate; the
-object and verification bars use the recorded completed and total work.
+It shows the lifecycle stage, exact object completion counts, copied rows and
+bytes, apply lag and staleness, per-table verification coverage and rates,
+findings, failures, and action output. The lifecycle bar is stage progress, not
+an elapsed-time estimate; the object and verification bars use the recorded
+completed and total work.
 
 The controller starts idle. It exposes guarded preflight, start/resume,
-verification, and stop controls, and permits verification while `run` is
-following. It deliberately does not expose `sequences` or `cutover`. Starting a
-migration still requires an explicit browser confirmation and creates or reuses
-logical-replication state on the source.
+verification, and stop controls, and permits verification only while `run` is
+following. Controls track the durable lifecycle and remain disabled when an
+action is not valid or the migration is complete. It deliberately does not
+expose `sequences` or `cutover`. Starting a migration still requires an explicit
+in-page browser confirmation and creates or reuses logical-replication state on
+the source.
 
 ```bash
 $ pgmigrate controller --dir ./migration
@@ -349,6 +352,11 @@ rejected when no token is configured.
 | `--token <value>` | `PGMIGRATE_CONTROLLER_TOKEN` | required for any non-loopback listener |
 | `--source <dsn>` | `PGMIGRATE_SOURCE` | source connection string required by actions, but not status |
 | `--target <dsn>` | `PGMIGRATE_TARGET` | target connection string required by actions, but not status |
+
+Run the isolated authenticated-controller migration test with
+`make controller-e2e`. It drives preflight, run, live and final verification
+through the API, keeps cutover CLI-only, and independently compares source and
+target contents.
 
 ### pgmigrate verify
 

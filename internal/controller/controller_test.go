@@ -53,13 +53,19 @@ func TestStatusReportsDurableProgress(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.UpsertTable(ctx, state.Table{OID: 1, Schema: "public", Name: "done"}); err != nil {
+	if err := store.UpsertTable(ctx, state.Table{OID: 1, Schema: "public", Name: "done", PartsTotal: 1}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpsertTable(ctx, state.Table{OID: 2, Schema: "public", Name: "pending"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.CompleteTable(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertPart(ctx, state.Part{TableOID: 1, ID: "all"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompletePart(ctx, 1, "all", 1234, 5678, 2*time.Second); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Close(); err != nil {
@@ -80,9 +86,14 @@ func TestStatusReportsDurableProgress(t *testing.T) {
 	if tables.Done != 1 || tables.Total != 2 {
 		t.Fatalf("table progress = %#v, want 1/2", tables)
 	}
+	if response.Copy.Rows != 1234 || response.Copy.Bytes != 5678 || response.Copy.Duration != 2*time.Second {
+		t.Fatalf("copy progress = %#v", response.Copy)
+	}
 }
 
 func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
+	dir := t.TempDir()
+	initializeStateAt(t, dir, state.PhaseFollow)
 	runStarted := make(chan struct{})
 	verifyStarted := make(chan struct{})
 	blocking := func(started chan<- struct{}) Action {
@@ -92,7 +103,7 @@ func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
 			return ctx.Err()
 		}
 	}
-	server := newTestServer(t, config.Config{Dir: t.TempDir()}, "", Actions{
+	server := newTestServer(t, config.Config{Dir: dir}, "", Actions{
 		Preflight: func(context.Context, config.Config, io.Writer) error { return nil },
 		Run:       blocking(runStarted),
 		Verify:    blocking(verifyStarted),
@@ -119,6 +130,28 @@ func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
 	waitForState(t, server, "migration", "stopped")
 }
 
+func TestLifecycleGuardsControllerActions(t *testing.T) {
+	t.Run("verification before follow", func(t *testing.T) {
+		server := newTestServer(t, config.Config{Dir: t.TempDir()}, "", noOpActions())
+		got := request(t, server, http.MethodPost, "/api/actions/verify", "verify", "")
+		if got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "requires a migration in follow phase") {
+			t.Fatalf("verify status = %d, body = %s", got.Code, got.Body.String())
+		}
+	})
+
+	t.Run("completed migration", func(t *testing.T) {
+		dir := t.TempDir()
+		initializeStateAt(t, dir, state.PhaseComplete)
+		server := newTestServer(t, config.Config{Dir: dir}, "", noOpActions())
+		for _, action := range []string{"preflight", "run", "verify"} {
+			got := request(t, server, http.MethodPost, "/api/actions/"+action, action, "")
+			if got.Code != http.StatusConflict {
+				t.Errorf("%s status = %d, body = %s", action, got.Code, got.Body.String())
+			}
+		}
+	})
+}
+
 func TestTokenAndConfirmationAreRequired(t *testing.T) {
 	server := newTestServer(t, config.Config{Dir: t.TempDir()}, "secret", noOpActions())
 	if got := request(t, server, http.MethodGet, "/api/status", "", ""); got.Code != http.StatusUnauthorized {
@@ -139,7 +172,10 @@ func TestIndexContainsControllerProgressUI(t *testing.T) {
 		t.Fatalf("index status = %d", recorder.Code)
 	}
 	body := recorder.Body.String()
-	for _, want := range []string{"pgmigrate controller", "Object completion", "lifecycleBar", "Stop migration"} {
+	for _, want := range []string{
+		"pgmigrate controller", "Object completion", "lifecycleBar", "Stop migration",
+		"confirmDialog", "data-action=\"run\" disabled", "no rows compared",
+	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("index does not contain %q", want)
 		}
@@ -204,4 +240,29 @@ func waitForState(t *testing.T, server *Server, slot, want string) {
 		time.Sleep(time.Millisecond)
 	}
 	t.Fatalf("%s operation state = %s, want %s", slot, server.operationSnapshots()[slot].State, want)
+}
+
+func initializeStateAt(t *testing.T, dir string, wanted state.Phase) {
+	t.Helper()
+	store, err := state.Open(context.Background(), dir, state.Fingerprints{Source: "source", Filter: "filter"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, phase := range []state.Phase{
+		state.PhaseSetup, state.PhaseSchema, state.PhaseCopy, state.PhaseIndexes,
+		state.PhaseCatchup, state.PhaseFollow, state.PhaseDrained, state.PhaseCutover,
+		state.PhaseComplete,
+	} {
+		if wanted == state.PhasePreflight {
+			return
+		}
+		if err := store.TransitionPhase(context.Background(), phase); err != nil {
+			t.Fatal(err)
+		}
+		if phase == wanted {
+			return
+		}
+	}
+	t.Fatalf("unsupported test phase %q", wanted)
 }
