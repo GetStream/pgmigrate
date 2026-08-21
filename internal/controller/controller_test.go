@@ -416,6 +416,51 @@ func TestIndexContainsControllerProgressUI(t *testing.T) {
 	}
 }
 
+func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
+	server := newTestServer(t, config.Config{Dir: t.TempDir()}, "", noOpActions())
+	recorder := request(t, server, http.MethodGet, "/", "", "")
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("index status = %d", recorder.Code)
+	}
+	body := recorder.Body.String()
+	for _, want := range []string{
+		"Migration configuration", "Database connections", "Migration", "Copy",
+		"Target tuning", "Verification", "Advanced copy and runtime settings",
+		"Advanced tuning overrides", "Advanced verification settings", "saveConfiguration",
+		`data-secret-config="source" type="password"`,
+		`data-secret-config="target" type="password"`,
+		"sourceDsn.value='';targetDsn.value=''",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("configuration UI does not contain %q", want)
+		}
+	}
+	for _, field := range []string{
+		"table_filter", "ack_warnings", "allow_collation_change", "workers",
+		"split_threshold", "restore_jobs", "pg_dump_path", "pg_restore_path",
+		"metrics", "wal_sample_duration", "segment_prune_interval", "retry_base_copy",
+		"skip_target_tuning", "warn_on_tuning_errors", "target_memory",
+		"maintenance_work_mem", "max_parallel_maintenance_workers", "max_wal_size",
+		"checkpoint_timeout", "verify_workers", "verify_sample_rows",
+		"verify_sample_windows", "verify_batch_rows", "verify_duty_cycle",
+		"verify_table_timeout", "verify_converge_timeout", "verify_cdc_rows",
+		"cdc_sample_rows",
+	} {
+		if !strings.Contains(body, `data-config="`+field+`"`) {
+			t.Errorf("configuration UI is missing %q", field)
+		}
+	}
+	for _, forbidden := range []string{
+		`data-config="dir"`, `data-config="listen"`, `data-config="token"`,
+		`data-config="no_cleanup"`, `data-config="end_position"`,
+		`data-config="sequence_offset"`, "localStorage", "pgmigrate-source", "pgmigrate-target",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("configuration UI unexpectedly contains %q", forbidden)
+		}
+	}
+}
+
 func newTestServer(t *testing.T, cfg config.Config, token string, actions Actions) *Server {
 	t.Helper()
 	server, err := New(Options{Config: cfg, Address: DefaultAddress, Token: token, Actions: actions})

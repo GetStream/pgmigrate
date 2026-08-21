@@ -16,7 +16,7 @@
     .status-pill.live { color:var(--green); border-color:#245b4a; }
     .grid { display:grid; grid-template-columns:repeat(12,1fr); gap:16px; }
     .panel { background:linear-gradient(180deg,rgba(22,31,52,.96),rgba(15,23,40,.96)); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 14px 35px rgba(0,0,0,.2); }
-    .overview { grid-column:span 8; } .controls { grid-column:span 4; } .objects,.verify,.findings,.operation { grid-column:span 12; }
+    .configuration,.objects,.verify,.findings,.operation { grid-column:span 12; } .overview { grid-column:span 8; } .controls { grid-column:span 4; }
     .phase-row { display:flex; justify-content:space-between; align-items:baseline; gap:12px; margin-bottom:10px; }
     .phase { font-size:22px; font-weight:750; text-transform:capitalize; } .phase-count { color:var(--muted); }
     .bar { width:100%; height:10px; overflow:hidden; border-radius:999px; background:#08101f; border:1px solid #23304a; }
@@ -31,7 +31,26 @@
     button { color:var(--text); background:#1a2740; border:1px solid #354568; border-radius:9px; padding:10px 12px; cursor:pointer; text-align:left; transition:.15s; }
     button:hover:not(:disabled) { border-color:var(--cyan); transform:translateY(-1px); } button:disabled { opacity:.42; cursor:not-allowed; }
     button.primary { background:#123c4d; border-color:#23708b; } button.stop { color:#ffd6db; background:#3a1720; border-color:#71303d; }
-    .token { width:100%; color:var(--text); background:#091120; border:1px solid var(--line); border-radius:9px; padding:9px 10px; margin-bottom:10px; }
+    .token,.config-field input[type="text"],.config-field input[type="password"],.config-field input[type="number"] { width:100%; color:var(--text); background:#091120; border:1px solid var(--line); border-radius:9px; padding:9px 10px; }
+    .token { margin-bottom:10px; }
+    .config-sections { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:14px; }
+    .config-section { min-width:0; margin:0; border:1px solid #273451; border-radius:11px; padding:14px; }
+    .config-section legend { padding:0 7px; font-weight:700; }
+    .config-section.connections { grid-column:span 2; }
+    .config-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:11px; }
+    .config-field { display:grid; gap:5px; min-width:0; color:var(--muted); font-size:12px; }
+    .config-field input { color:var(--text); }
+    .config-field input:disabled { opacity:.55; }
+    .config-check { display:flex; gap:8px; align-items:flex-start; color:var(--text); font-size:13px; }
+    .config-check input { margin-top:3px; }
+    .config-section details { grid-column:1/-1; margin:2px 0 0; border-top:1px solid #273451; padding-top:9px; }
+    .config-section details .config-fields { margin-top:11px; }
+    .connection-state { color:var(--amber); font-size:12px; }
+    .connection-state.configured { color:var(--green); }
+    .config-footer { display:flex; align-items:center; gap:12px; margin-top:14px; }
+    .config-footer button { min-width:170px; text-align:center; }
+    .config-message { color:var(--muted); }
+    .config-message.success { color:var(--green); } .config-message.error { color:var(--red); }
     .cards { display:grid; grid-template-columns:repeat(5,1fr); gap:12px; }
     .card { background:#0d1526; border:1px solid #222f49; border-radius:11px; padding:13px; } .card-head { display:flex; justify-content:space-between; margin-bottom:9px; text-transform:capitalize; } .card small { color:var(--muted); }
     .table-scroll { overflow-x:auto; } table { width:100%; border-collapse:collapse; } th,td { text-align:left; padding:10px 8px; border-bottom:1px solid #23304a; vertical-align:top; } th { color:var(--muted); font-weight:600; font-size:12px; } td .bar { min-width:150px; }
@@ -41,7 +60,8 @@
     .alert { display:none; color:#ffd6db; border:1px solid #71303d; background:#31151d; border-radius:10px; padding:10px 12px; margin-bottom:16px; }
     dialog { width:min(480px,calc(100% - 32px)); color:var(--text); background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:20px; box-shadow:0 24px 80px rgba(0,0,0,.55); }
     dialog::backdrop { background:rgba(3,7,15,.72); } dialog h2 { font-size:19px; } .dialog-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:20px; } .dialog-actions button { min-width:100px; text-align:center; }
-    @media (max-width:850px) { .overview,.controls { grid-column:span 12; } .cards { grid-template-columns:repeat(2,1fr); } .facts { grid-template-columns:repeat(2,1fr); } header { flex-direction:column; } }
+    @media (max-width:850px) { .overview,.controls { grid-column:span 12; } .config-sections { grid-template-columns:1fr; } .config-section.connections { grid-column:span 1; } .cards { grid-template-columns:repeat(2,1fr); } .facts { grid-template-columns:repeat(2,1fr); } header { flex-direction:column; } }
+    @media (max-width:560px) { .config-fields { grid-template-columns:1fr; } }
   </style>
 </head>
 <body>
@@ -49,6 +69,76 @@
   <header><div><h1>pgmigrate controller</h1><p class="subtitle">Durable migration state, guarded controls, and honest progress.</p></div><div id="connection" class="status-pill">connecting</div></header>
   <div id="alert" class="alert" role="alert"></div>
   <div class="grid">
+    <section class="panel configuration">
+      <h2>Migration configuration</h2>
+      <p class="muted">Save a valid configuration before running an action. Database URLs are write-only and are cleared after every save or reload.</p>
+      <form id="configurationForm">
+        <div class="config-sections">
+          <fieldset class="config-section connections">
+            <legend>Database connections</legend>
+            <div class="config-fields">
+              <label class="config-field">Source PostgreSQL URL <input id="sourceDsn" data-secret-config="source" type="password" autocomplete="new-password" spellcheck="false" placeholder="postgres://…"><span id="sourceState" class="connection-state">not configured</span></label>
+              <label class="config-field">Target PostgreSQL URL <input id="targetDsn" data-secret-config="target" type="password" autocomplete="new-password" spellcheck="false" placeholder="postgres://…"><span id="targetState" class="connection-state">not configured</span></label>
+            </div>
+          </fieldset>
+          <fieldset class="config-section">
+            <legend>Migration</legend>
+            <div class="config-fields">
+              <label class="config-field">Table filter file <input data-config="table_filter" type="text" placeholder="optional path"></label>
+              <label class="config-check"><input data-config="ack_warnings" type="checkbox"> Acknowledge preflight warnings</label>
+              <label class="config-check"><input data-config="allow_collation_change" type="checkbox"> Allow collation changes</label>
+            </div>
+          </fieldset>
+          <fieldset class="config-section">
+            <legend>Copy</legend>
+            <div class="config-fields">
+              <label class="config-field">Copy workers <input data-config="workers" type="number" min="1" step="1" required></label>
+              <label class="config-field">Part split threshold (bytes) <input data-config="split_threshold" type="number" min="1" step="1" required></label>
+              <label class="config-field">Schema restore jobs <input data-config="restore_jobs" type="number" min="1" step="1" required></label>
+            </div>
+            <details><summary>Advanced copy and runtime settings</summary><div class="config-fields">
+              <label class="config-field">pg_dump path <input data-config="pg_dump_path" type="text" placeholder="use PATH"></label>
+              <label class="config-field">pg_restore path <input data-config="pg_restore_path" type="text" placeholder="use PATH"></label>
+              <label class="config-field">Metrics listen address <input data-config="metrics" type="text" placeholder=":9187"></label>
+              <label class="config-field">WAL sample duration <input data-config="wal_sample_duration" type="text" placeholder="1m" required></label>
+              <label class="config-field">Segment prune interval <input data-config="segment_prune_interval" type="text" placeholder="1m" required></label>
+              <label class="config-field">CDC sample rows <input data-config="cdc_sample_rows" type="number" min="0" step="1" required></label>
+              <label class="config-check"><input data-config="retry_base_copy" type="checkbox"> Retry failed base-copy parts</label>
+            </div></details>
+          </fieldset>
+          <fieldset class="config-section">
+            <legend>Target tuning</legend>
+            <div class="config-fields">
+              <label class="config-check"><input data-config="skip_target_tuning" type="checkbox"> Skip target tuning</label>
+              <label class="config-check"><input data-config="warn_on_tuning_errors" type="checkbox"> Warn instead of failing on tuning errors</label>
+            </div>
+            <details><summary>Advanced tuning overrides</summary><div class="config-fields">
+              <label class="config-field">Target memory <input data-config="target_memory" type="text" placeholder="derived, e.g. 64GB"></label>
+              <label class="config-field">maintenance_work_mem <input data-config="maintenance_work_mem" type="text" placeholder="derived, e.g. 1GB"></label>
+              <label class="config-field">Parallel maintenance workers <input data-config="max_parallel_maintenance_workers" type="number" min="0" step="1"></label>
+              <label class="config-field">max_wal_size <input data-config="max_wal_size" type="text" placeholder="derived, e.g. 16GB"></label>
+              <label class="config-field">checkpoint_timeout <input data-config="checkpoint_timeout" type="text" placeholder="derived, e.g. 20min"></label>
+            </div></details>
+          </fieldset>
+          <fieldset class="config-section">
+            <legend>Verification</legend>
+            <div class="config-fields">
+              <label class="config-field">Verification workers <input data-config="verify_workers" type="number" min="1" step="1" required></label>
+              <label class="config-field">Sample rows per table <input data-config="verify_sample_rows" type="number" min="1" step="1" required></label>
+            </div>
+            <details><summary>Advanced verification settings</summary><div class="config-fields">
+              <label class="config-field">Sample windows <input data-config="verify_sample_windows" type="number" min="1" step="1" required></label>
+              <label class="config-field">Batch rows <input data-config="verify_batch_rows" type="number" min="1" step="1" required></label>
+              <label class="config-field">Duty cycle (0–1) <input data-config="verify_duty_cycle" type="number" min="0.01" max="1" step="0.01" required></label>
+              <label class="config-field">Table timeout <input data-config="verify_table_timeout" type="text" placeholder="20m" required></label>
+              <label class="config-field">Convergence timeout <input data-config="verify_converge_timeout" type="text" placeholder="1m" required></label>
+              <label class="config-field">CDC rows to verify <input data-config="verify_cdc_rows" type="number" min="0" step="1" required></label>
+            </div></details>
+          </fieldset>
+        </div>
+        <div class="config-footer"><button id="saveConfiguration" class="primary" type="submit" disabled>Save configuration</button><span id="configurationMessage" class="config-message" role="status">Authenticate to load configuration.</span></div>
+      </form>
+    </section>
     <section class="panel overview">
       <div class="phase-row"><div><span class="muted">Lifecycle phase</span><div id="phase" class="phase">not started</div></div><div id="phaseCount" class="phase-count">0 / 10</div></div>
       <div id="lifecycleProgress" class="bar" role="progressbar" aria-label="Migration lifecycle" aria-valuemin="0" aria-valuemax="10" aria-valuenow="0"><span id="lifecycleBar"></span></div><div id="stages" class="stages"></div><div id="phaseDetail" class="phase-detail">Waiting for preflight.</div>
@@ -67,9 +157,15 @@ const phases=['preflight','setup','schema','copy','indexes','catchup','follow','
 const el=id=>document.getElementById(id);
 const token=el('token');
 const actionButtons=[...document.querySelectorAll('[data-action]')];
+const configurationForm=el('configurationForm');
+const saveConfiguration=el('saveConfiguration');
+const configurationInputs=[...document.querySelectorAll('[data-config]')];
+const sourceDsn=el('sourceDsn'),targetDsn=el('targetDsn');
+const secretInputs=[sourceDsn,targetDsn];
+let configurationLoaded=false,configurationSaved=false,configurationLoading=false,configurationSaving=false,configurationToken=null,lastStatus=null;
 const pct=(done,total)=>total>0?Math.max(0,Math.min(100,100*done/total)):0;
 token.value=sessionStorage.getItem('pgmigrate-token')||'';
-token.addEventListener('input',()=>sessionStorage.setItem('pgmigrate-token',token.value));
+token.addEventListener('input',()=>{sessionStorage.setItem('pgmigrate-token',token.value);sourceDsn.value='';targetDsn.value='';configurationLoaded=false;configurationSaved=false;configurationToken=null;setConfigurationEnabled(false);setConfigurationMessage('Authenticate to load configuration.');disableControls();refresh()});
 function fmtCount(n){return Number(n||0).toLocaleString('en-US')}
 function fmtBytes(n){if(!n)return '0 B';const u=['B','KiB','MiB','GiB','TiB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return `${n.toFixed(i?1:0)} ${u[i]}`}
 function fmtDuration(ns){if(!ns)return '—';let s=Math.max(0,Math.round(ns/1e9));if(s<60)return `${s}s`;if(s<3600)return `${Math.floor(s/60)}m ${s%60}s`;return `${Math.floor(s/3600)}h ${Math.floor((s%3600)/60)}m`}
@@ -77,6 +173,13 @@ function fmtElapsed(op){if(!op?.started_at)return '';const start=Date.parse(op.s
 function setText(id,value){el(id).textContent=value}
 function showError(message){el('alert').textContent=message;el('alert').style.display='block'}
 function disableControls(){actionButtons.forEach(button=>{button.disabled=true})}
+function setConfigurationMessage(message,kind=''){const messageEl=el('configurationMessage');messageEl.textContent=message;messageEl.className=`config-message ${kind}`.trim()}
+function setConnectionState(id,configured){const state=el(id);state.textContent=configured?'configured':'not configured';state.className=`connection-state${configured?' configured':''}`}
+function setConfigurationEnabled(enabled){[...configurationInputs,...secretInputs].forEach(input=>{input.disabled=!enabled});saveConfiguration.disabled=!enabled||configurationLoading||configurationSaving}
+function populateConfiguration(data,saved=false){configurationInputs.forEach(input=>{const value=data[input.dataset.config];if(input.type==='checkbox')input.checked=Boolean(value);else input.value=value??''});sourceDsn.value='';targetDsn.value='';setConnectionState('sourceState',data.source_configured);setConnectionState('targetState',data.target_configured);const operationOwnsConfiguration=data.source_configured&&data.target_configured&&Object.values(lastStatus?.operations||{}).some(active);configurationLoaded=true;configurationSaved=saved||operationOwnsConfiguration;configurationToken=token.value;if(saved)setConfigurationMessage('Configuration saved. Database URLs were cleared from the form.','success');else if(operationOwnsConfiguration)setConfigurationMessage('Configuration is locked while an operation is active.');else setConfigurationMessage('Defaults loaded. Review and save before running an action.');if(lastStatus)render(lastStatus)}
+async function responseError(response){try{return(await response.json()).error||response.statusText}catch{return response.statusText}}
+async function loadConfiguration(){if(configurationLoading)return;configurationLoading=true;setConfigurationEnabled(false);setConfigurationMessage('Loading configuration…');try{const response=await fetch('/api/config',{headers:{'X-PGMigrate-Token':token.value}});if(!response.ok)throw new Error(await responseError(response));populateConfiguration(await response.json())}catch(error){configurationLoaded=false;configurationSaved=false;configurationToken=null;setConfigurationMessage(error.message,'error');throw error}finally{configurationLoading=false;if(lastStatus)render(lastStatus)}}
+function configurationPayload(){const payload={};configurationInputs.forEach(input=>{const key=input.dataset.config;if(input.type==='checkbox')payload[key]=input.checked;else if(input.type==='number')payload[key]=Number(input.value);else payload[key]=input.value});if(sourceDsn.value.trim())payload.source=sourceDsn.value;if(targetDsn.value.trim())payload.target=targetDsn.value;return payload}
 function renderStages(phase){const at=phases.indexOf(phase),complete=phase==='complete';el('stages').replaceChildren(...phases.map((p,i)=>{const d=document.createElement('span');d.className='stage '+(complete&&i<=at?'done':i<at?'done':i===at?'current':'');d.title=p;return d}))}
 function phaseDetail(phase,snap){const objects=snap?.objects||{},count=name=>objects[name]||{done:0,total:0};switch(phase){case'preflight':return count('tables').total?`${fmtCount(count('tables').total)} tables inventoried`:'Checking source and target readiness';case'setup':return'Creating durable replication state';case'schema':return'Restoring the selected schema';case'copy':return`Copying parts · ${fmtCount(count('parts').done)} / ${fmtCount(count('parts').total)} (${pct(count('parts').done,count('parts').total).toFixed(1)}%)`;case'indexes':return`Indexes ${fmtCount(count('indexes').done)} / ${fmtCount(count('indexes').total)} · constraints ${fmtCount(count('constraints').done)} / ${fmtCount(count('constraints').total)}`;case'catchup':return`Catching up to the source · ${fmtBytes(snap.apply.lag_bytes)} behind`;case'follow':return`Following live writes · ${fmtBytes(snap.apply.lag_bytes)} behind`;case'drained':return'Replication drained through the cutover boundary';case'cutover':return'Finalizing sequences and cleanup';case'complete':return'Migration complete';default:return'Waiting for preflight.'}}
 function renderObjects(objects={}){const names=['tables','parts','indexes','constraints','verify'];el('objectCards').replaceChildren(...names.map(name=>{const v=objects[name]||{done:0,total:0},card=document.createElement('div');card.className='card';const head=document.createElement('div');head.className='card-head';const title=document.createElement('strong');title.textContent=name;const count=document.createElement('small');count.textContent=`${fmtCount(v.done)} / ${fmtCount(v.total)}`;head.append(title,count);const bar=document.createElement('div');bar.className='bar';bar.setAttribute('role','progressbar');bar.setAttribute('aria-label',`${name} completion`);bar.setAttribute('aria-valuemin','0');bar.setAttribute('aria-valuemax',String(Math.max(1,v.total)));bar.setAttribute('aria-valuenow',String(v.done));const fill=document.createElement('span');fill.style.width=`${pct(v.done,v.total)}%`;bar.append(fill);card.append(head,bar);return card}))}
@@ -85,16 +188,18 @@ function renderFindings(data){const root=el('findings'),items=[];(data.findings|
 function active(op){return ['running','stopping'].includes(op?.state)}
 function operationSummary(op,fallback){const elapsed=fmtElapsed(op);return`${op?.name||fallback} · ${op?.state||'idle'}${elapsed?` · ${elapsed}`:''}${op?.error?` · ${op.error}`:''}`}
 function renderOperations(ops={}){const migration=ops.migration||{state:'idle'},verification=ops.verification||{state:'idle'};setText('migrationSummary',operationSummary(migration,'migration'));setText('migrationOutput',migration.output||'No migration action has produced output.');setText('verificationSummary',operationSummary(verification,'verification'));setText('verificationOutput',verification.output||'No verification action has produced output.')}
-function render(data){const snap=data.snapshot,phase=snap?.phase||'not started',at=phases.indexOf(phase),stage=at<0?0:at+1,migration=data.operations?.migration||{state:'idle'},verification=data.operations?.verification||{state:'idle'},applyStarted=Boolean(snap?.apply?.staged_lsn||snap?.apply?.applied_lsn),migrationBusy=active(migration),verificationBusy=active(verification);setText('phase',phase);setText('phaseCount',`Stage ${stage} / ${phases.length}`);el('lifecycleBar').style.width=`${100*stage/phases.length}%`;el('lifecycleProgress').setAttribute('aria-valuenow',String(stage));setText('phaseDetail',phaseDetail(phase,snap));renderStages(phase);renderObjects(snap?.objects);renderVerification(snap?.verification);setText('lag',applyStarted?fmtBytes(snap.apply.lag_bytes):'—');setText('stale',phase==='complete'?'complete':applyStarted?fmtDuration(snap.apply.stale_for):'—');setText('copiedData',fmtBytes(data.copy?.bytes));setText('copiedRows',fmtCount(data.copy?.rows));setText('findingsCount',snap?.open_findings||0);renderFindings(data);renderOperations(data.operations);token.style.display=data.token_required?'block':'none';document.querySelector('[data-action="preflight"]').disabled=!data.connections_configured||migrationBusy||verificationBusy||(snap&&phase!=='preflight');document.querySelector('[data-action="run"]').disabled=!data.connections_configured||migrationBusy||verificationBusy||phase==='complete';document.querySelector('[data-action="verify"]').disabled=!data.connections_configured||phase!=='follow'||verificationBusy||(migrationBusy&&migration.name!=='run');document.querySelector('[data-action="stop-migration"]').disabled=!migrationBusy;document.querySelector('[data-action="stop-verification"]').disabled=!verificationBusy;el('stopMigration').textContent=migrationBusy&&migration.name==='preflight'?'Stop preflight':'Stop migration'}
+function render(data){lastStatus=data;const snap=data.snapshot,phase=snap?.phase||'not started',at=phases.indexOf(phase),stage=at<0?0:at+1,migration=data.operations?.migration||{state:'idle'},verification=data.operations?.verification||{state:'idle'},applyStarted=Boolean(snap?.apply?.staged_lsn||snap?.apply?.applied_lsn),migrationBusy=active(migration),verificationBusy=active(verification),operationBusy=migrationBusy||verificationBusy,configurationReady=configurationSaved&&data.connections_configured;setText('phase',phase);setText('phaseCount',`Stage ${stage} / ${phases.length}`);el('lifecycleBar').style.width=`${100*stage/phases.length}%`;el('lifecycleProgress').setAttribute('aria-valuenow',String(stage));setText('phaseDetail',phaseDetail(phase,snap));renderStages(phase);renderObjects(snap?.objects);renderVerification(snap?.verification);setText('lag',applyStarted?fmtBytes(snap.apply.lag_bytes):'—');setText('stale',phase==='complete'?'complete':applyStarted?fmtDuration(snap.apply.stale_for):'—');setText('copiedData',fmtBytes(data.copy?.bytes));setText('copiedRows',fmtCount(data.copy?.rows));setText('findingsCount',snap?.open_findings||0);renderFindings(data);renderOperations(data.operations);token.style.display=data.token_required?'block':'none';setConfigurationEnabled(configurationLoaded&&!operationBusy);document.querySelector('[data-action="preflight"]').disabled=!configurationReady||migrationBusy||verificationBusy||(snap&&phase!=='preflight');document.querySelector('[data-action="run"]').disabled=!configurationReady||migrationBusy||verificationBusy||phase==='complete';document.querySelector('[data-action="verify"]').disabled=!configurationReady||phase!=='follow'||verificationBusy||(migrationBusy&&migration.name!=='run');document.querySelector('[data-action="stop-migration"]').disabled=!migrationBusy;document.querySelector('[data-action="stop-verification"]').disabled=!verificationBusy;el('stopMigration').textContent=migrationBusy&&migration.name==='preflight'?'Stop preflight':'Stop migration'}
 let refreshing=false;
-async function refresh(){if(refreshing)return;refreshing=true;try{const r=await fetch('/api/status',{headers:{'X-PGMigrate-Token':token.value}});if(!r.ok)throw new Error((await r.json()).error||r.statusText);render(await r.json());el('connection').textContent='live';el('connection').className='status-pill live';el('alert').style.display='none'}catch(e){disableControls();el('connection').textContent='offline';el('connection').className='status-pill';showError(e.message)}finally{refreshing=false}}
-async function act(name){disableControls();try{const r=await fetch(`/api/actions/${name}`,{method:'POST',headers:{'X-PGMigrate-Token':token.value,'X-PGMigrate-Confirm':name}});if(!r.ok)throw new Error((await r.json()).error||r.statusText);await refresh()}catch(e){const message=e.message;await refresh();showError(message)}}
+async function refresh(){if(refreshing)return;refreshing=true;try{const response=await fetch('/api/status',{headers:{'X-PGMigrate-Token':token.value}});if(!response.ok)throw new Error(await responseError(response));const data=await response.json();lastStatus=data;if(configurationToken!==token.value)await loadConfiguration();render(data);el('connection').textContent='live';el('connection').className='status-pill live';el('alert').style.display='none'}catch(error){disableControls();setConfigurationEnabled(false);el('connection').textContent='offline';el('connection').className='status-pill';showError(error.message)}finally{refreshing=false}}
+async function act(name){disableControls();setConfigurationEnabled(false);try{const r=await fetch(`/api/actions/${name}`,{method:'POST',headers:{'X-PGMigrate-Token':token.value,'X-PGMigrate-Confirm':name}});if(!r.ok)throw new Error(await responseError(r));await refresh()}catch(e){const message=e.message;await refresh();showError(message)}}
 const confirmDialog=el('confirmDialog'),confirmTitle=el('confirmTitle'),confirmMessage=el('confirmMessage'),confirmAction=el('confirmAction');let pendingAction='';
 function requestAction(name){if(name!=='run'&&!name.startsWith('stop-')){act(name);return}pendingAction=name;if(name==='run'){confirmTitle.textContent='Start or resume migration?';confirmMessage.textContent='This creates or reuses logical replication state on the source and keeps following writes until cutover.';confirmAction.textContent='Start migration'}else{const target=name==='stop-verification'?'verification':'migration';confirmTitle.textContent=`Stop ${target}?`;confirmMessage.textContent=`The ${target} operation will be canceled. Durable migration state is retained for a later resume.`;confirmAction.textContent=`Stop ${target}`}confirmDialog.showModal()}
 el('confirmCancel').addEventListener('click',()=>{pendingAction='';confirmDialog.close()});
 confirmAction.addEventListener('click',()=>{const name=pendingAction;pendingAction='';confirmDialog.close();if(name)act(name)});
 confirmDialog.addEventListener('cancel',()=>{pendingAction=''});
 actionButtons.forEach(button=>button.addEventListener('click',()=>requestAction(button.dataset.action)));
+configurationForm.addEventListener('input',()=>{if(!configurationLoaded)return;configurationSaved=false;setConfigurationMessage('Unsaved changes. Save before running an action.');disableControls()});
+configurationForm.addEventListener('submit',async event=>{event.preventDefault();if(!configurationLoaded||configurationSaving||!configurationForm.reportValidity())return;configurationSaving=true;setConfigurationEnabled(false);setConfigurationMessage('Saving configuration…');try{const response=await fetch('/api/config',{method:'PUT',headers:{'Content-Type':'application/json','X-PGMigrate-Token':token.value},body:JSON.stringify(configurationPayload())});if(!response.ok)throw new Error(await responseError(response));populateConfiguration(await response.json(),true);await refresh()}catch(error){configurationSaved=false;sourceDsn.value='';targetDsn.value='';setConfigurationMessage(error.message,'error');if(lastStatus)render(lastStatus)}finally{configurationSaving=false;if(lastStatus)render(lastStatus)}});
 renderStages('');renderObjects();disableControls();refresh();setInterval(refresh,1000);
 </script>
 </body>

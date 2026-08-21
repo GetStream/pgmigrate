@@ -319,13 +319,22 @@ findings, failures, and action output. The lifecycle bar is stage progress, not
 an elapsed-time estimate; the object and verification bars use the recorded
 completed and total work.
 
-The controller starts idle. It exposes guarded preflight, start/resume,
-verification, and stop controls, and permits verification only while `run` is
-following. Controls track the durable lifecycle and remain disabled when an
-action is not valid or the migration is complete. It deliberately does not
-expose `sequences` or `cutover`. Starting a migration still requires an explicit
-in-page browser confirmation and creates or reuses logical-replication state on
-the source.
+The controller starts idle. After authentication, the dashboard loads all
+non-secret preflight, run, copy, tuning, and verification defaults. Save a valid
+configuration before using an action. Controls track the durable lifecycle and
+remain disabled while configuration has unsaved changes, when an action is not
+valid, or when the migration is complete. Configuration is locked while either
+a migration or verification operation is active. Verification is permitted only
+while `run` is following.
+
+Source and target DSNs can be supplied through the dashboard, but are
+write-only: config and status API responses contain only configured/not-configured
+flags. The password inputs are cleared after every save or reload, and DSNs are
+never placed in browser storage, migration state, or logs. Controller token,
+listener, and migration directory remain startup-only. The dashboard deliberately
+does not expose `sequences` or `cutover`; starting a migration still requires an
+explicit in-page browser confirmation and creates or reuses logical-replication
+state on the source.
 
 ```bash
 $ pgmigrate controller --dir ./migration
@@ -341,17 +350,17 @@ $ export PGMIGRATE_CONTROLLER_TOKEN="$(secret-tool-or-platform-command)"
 $ pgmigrate controller --dir /work/migration --listen :9188
 ```
 
-The browser sends the token in `X-PGMigrate-Token`; it is kept in the tab's
-session storage, not written into migration state. A non-loopback listener is
-rejected when no token is configured.
+The browser sends the token in `X-PGMigrate-Token`; only this controller token is
+kept in the tab's session storage, and it is not written into migration state. A
+non-loopback listener is rejected when no token is configured.
 
 | flag | default | what it does |
 |---|---|---|
 | `--dir <path>` | required | migration state directory to display and control |
 | `--listen <address>` | `127.0.0.1:9188` | HTTP listen address |
 | `--token <value>` | `PGMIGRATE_CONTROLLER_TOKEN` | required for any non-loopback listener |
-| `--source <dsn>` | `PGMIGRATE_SOURCE` | source connection string required by actions, but not status |
-| `--target <dsn>` | `PGMIGRATE_TARGET` | target connection string required by actions, but not status |
+| `--source <dsn>` | `PGMIGRATE_SOURCE` | optional initial source connection string; it can instead be entered write-only in the dashboard |
+| `--target <dsn>` | `PGMIGRATE_TARGET` | optional initial target connection string; it can instead be entered write-only in the dashboard |
 
 Run the isolated authenticated-controller migration test with
 `make controller-e2e`. It drives preflight, run, live and final verification
