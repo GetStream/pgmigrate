@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -63,9 +64,10 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu         sync.Mutex
-	operations map[string]operation
-	nextID     int64
+	mu             sync.Mutex
+	operations     map[string]operation
+	nextID         int64
+	configRevision uint64
 }
 
 type operation struct {
@@ -115,6 +117,7 @@ type copyView struct {
 // dashboard. Database credentials are deliberately represented only by
 // configured flags; their values are write-only through configurationUpdate.
 type configurationView struct {
+	Revision               uint64  `json:"revision"`
 	SourceConfigured       bool    `json:"source_configured"`
 	TargetConfigured       bool    `json:"target_configured"`
 	TableFilter            string  `json:"table_filter"`
@@ -220,6 +223,7 @@ func New(options Options) (*Server, error) {
 			"migration":    {State: "idle"},
 			"verification": {State: "idle"},
 		},
+		configRevision: 1,
 	}, nil
 }
 
@@ -395,7 +399,7 @@ func (s *Server) getConfiguration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, viewConfiguration(s.configurationSnapshot()))
+	writeJSON(w, http.StatusOK, s.configurationViewSnapshot())
 }
 
 func (s *Server) putConfiguration(w http.ResponseWriter, r *http.Request) {
@@ -464,7 +468,8 @@ func (s *Server) updateConfiguration(update configurationUpdate) (configurationV
 		return configurationView{}, err
 	}
 	s.cfg = candidate
-	return viewConfiguration(candidate), nil
+	s.configRevision++
+	return viewConfiguration(candidate, s.configRevision), nil
 }
 
 func applyConfigurationUpdate(candidate *config.Config, update configurationUpdate) error {
@@ -555,8 +560,9 @@ func validateConfiguration(cfg config.Config) error {
 	return cfg.ValidateVerify()
 }
 
-func viewConfiguration(cfg config.Config) configurationView {
+func viewConfiguration(cfg config.Config, revision uint64) configurationView {
 	return configurationView{
+		Revision:         revision,
 		SourceConfigured: strings.TrimSpace(cfg.Source) != "", TargetConfigured: strings.TrimSpace(cfg.Target) != "",
 		TableFilter: cfg.TableFilter, AckWarnings: cfg.AckWarnings, AllowCollationChange: cfg.AllowCollationChange,
 		Workers: cfg.Workers, SplitThreshold: cfg.SplitThreshold, RestoreJobs: cfg.RestoreJobs,
@@ -578,6 +584,12 @@ func (s *Server) configurationSnapshot() config.Config {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.cfg
+}
+
+func (s *Server) configurationViewSnapshot() configurationView {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return viewConfiguration(s.cfg, s.configRevision)
 }
 
 func (s *Server) action(w http.ResponseWriter, r *http.Request) {
@@ -603,11 +615,16 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "unknown controller action")
 		return
 	}
+	revision, err := strconv.ParseUint(strings.TrimSpace(r.Header.Get("X-PGMigrate-Config-Revision")), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusPreconditionFailed, "configuration revision header is missing or invalid")
+		return
+	}
 	if err := s.validateLifecycle(r.Context(), name); err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
 	}
-	view, err := s.start(name, action)
+	view, err := s.start(name, revision, action)
 	if err != nil {
 		writeError(w, http.StatusConflict, err.Error())
 		return
@@ -659,9 +676,12 @@ func (s *Server) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(provided), []byte(s.token)) == 1
 }
 
-func (s *Server) start(name string, action Action) (operationView, error) {
+func (s *Server) start(name string, revision uint64, action Action) (operationView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if revision != s.configRevision {
+		return operationView{}, fmt.Errorf("configuration revision %d is stale; review current revision %d", revision, s.configRevision)
+	}
 	slot := "migration"
 	if name == "verify" {
 		slot = "verification"

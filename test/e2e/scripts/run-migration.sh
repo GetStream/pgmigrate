@@ -15,6 +15,7 @@ controller_pid=
 controller_url=${PGMIGRATE_CONTROLLER_URL:-http://127.0.0.1:19188}
 controller_listen=${PGMIGRATE_CONTROLLER_LISTEN:-127.0.0.1:19188}
 controller_token=${PGMIGRATE_CONTROLLER_TOKEN:-pgmigrate-e2e-token}
+controller_revision=
 
 case "$driver" in
     cli|controller) ;;
@@ -82,6 +83,7 @@ controller_action() {
     curl -fsS -X POST \
         -H "X-PGMigrate-Token: $controller_token" \
         -H "X-PGMigrate-Confirm: $action" \
+        -H "X-PGMigrate-Config-Revision: $controller_revision" \
         "$controller_url/api/actions/$action" >/dev/null
 }
 
@@ -130,6 +132,12 @@ EOF
            printf '%s\n' "$response" >&2
            exit 1 ;;
     esac
+    controller_revision=$(printf '%s\n' "$response" | sed -n 's/.*"revision":\([0-9][0-9]*\).*/\1/p')
+    if [ -z "$controller_revision" ]; then
+        echo "controller configuration response did not include a revision" >&2
+        printf '%s\n' "$response" >&2
+        exit 1
+    fi
     case "$response" in
         *"$source_url"*|*"$target_url"*)
             echo "controller configuration response exposed a DSN" >&2

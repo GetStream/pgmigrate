@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -140,15 +141,15 @@ func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
 		Verify:    blocking(verifyStarted),
 	})
 
-	if got := request(t, server, http.MethodPost, "/api/actions/run", "run", ""); got.Code != http.StatusAccepted {
+	if got := requestAction(t, server, "run", server.configurationViewSnapshot().Revision, ""); got.Code != http.StatusAccepted {
 		t.Fatalf("run status = %d, body = %s", got.Code, got.Body.String())
 	}
 	waitChannel(t, runStarted)
-	if got := request(t, server, http.MethodPost, "/api/actions/verify", "verify", ""); got.Code != http.StatusAccepted {
+	if got := requestAction(t, server, "verify", server.configurationViewSnapshot().Revision, ""); got.Code != http.StatusAccepted {
 		t.Fatalf("verify status = %d, body = %s", got.Code, got.Body.String())
 	}
 	waitChannel(t, verifyStarted)
-	if got := request(t, server, http.MethodPost, "/api/actions/preflight", "preflight", ""); got.Code != http.StatusConflict {
+	if got := requestAction(t, server, "preflight", server.configurationViewSnapshot().Revision, ""); got.Code != http.StatusConflict {
 		t.Fatalf("preflight status = %d, want conflict", got.Code)
 	}
 	if got := request(t, server, http.MethodPost, "/api/actions/stop-verification", "stop-verification", ""); got.Code != http.StatusAccepted {
@@ -164,7 +165,7 @@ func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
 func TestLifecycleGuardsControllerActions(t *testing.T) {
 	t.Run("verification before follow", func(t *testing.T) {
 		server := newTestServer(t, config.Config{Dir: t.TempDir()}, "", noOpActions())
-		got := request(t, server, http.MethodPost, "/api/actions/verify", "verify", "")
+		got := requestAction(t, server, "verify", server.configurationViewSnapshot().Revision, "")
 		if got.Code != http.StatusConflict || !strings.Contains(got.Body.String(), "requires a migration in follow phase") {
 			t.Fatalf("verify status = %d, body = %s", got.Code, got.Body.String())
 		}
@@ -175,7 +176,7 @@ func TestLifecycleGuardsControllerActions(t *testing.T) {
 		initializeStateAt(t, dir, state.PhaseComplete)
 		server := newTestServer(t, config.Config{Dir: dir}, "", noOpActions())
 		for _, action := range []string{"preflight", "run", "verify"} {
-			got := request(t, server, http.MethodPost, "/api/actions/"+action, action, "")
+			got := requestAction(t, server, action, server.configurationViewSnapshot().Revision, "")
 			if got.Code != http.StatusConflict {
 				t.Errorf("%s status = %d, body = %s", action, got.Code, got.Body.String())
 			}
@@ -193,6 +194,9 @@ func TestTokenAndConfirmationAreRequired(t *testing.T) {
 	}
 	if got := request(t, server, http.MethodPost, "/api/actions/preflight", "", "secret"); got.Code != http.StatusPreconditionFailed {
 		t.Fatalf("action without confirmation = %d, want precondition failed", got.Code)
+	}
+	if got := request(t, server, http.MethodPost, "/api/actions/preflight", "preflight", "secret"); got.Code != http.StatusPreconditionFailed {
+		t.Fatalf("action without configuration revision = %d, want precondition failed", got.Code)
 	}
 }
 
@@ -225,6 +229,9 @@ func TestConfigurationRequiresAuthenticationAndRedactsCredentials(t *testing.T) 
 	decode(t, got, &view)
 	if !view.SourceConfigured || !view.TargetConfigured {
 		t.Fatalf("connection flags = source:%v target:%v, want true", view.SourceConfigured, view.TargetConfigured)
+	}
+	if view.Revision == 0 {
+		t.Fatal("configuration revision is missing")
 	}
 }
 
@@ -382,7 +389,7 @@ func TestConfigurationUpdateIsLockedWhileOperationsAreActive(t *testing.T) {
 				actions.Verify = action
 			}
 			server := newTestServer(t, cfg, "", actions)
-			if got := request(t, server, http.MethodPost, "/api/actions/"+test.action, test.action, ""); got.Code != http.StatusAccepted {
+			if got := requestAction(t, server, test.action, server.configurationViewSnapshot().Revision, ""); got.Code != http.StatusAccepted {
 				t.Fatalf("start status = %d, body = %s", got.Code, got.Body.String())
 			}
 			waitChannel(t, started)
@@ -410,7 +417,7 @@ func TestActionUsesConfigurationSnapshot(t *testing.T) {
 		return nil
 	}
 	server := newTestServer(t, cfg, "", actions)
-	if got := request(t, server, http.MethodPost, "/api/actions/preflight", "preflight", ""); got.Code != http.StatusAccepted {
+	if got := requestAction(t, server, "preflight", server.configurationViewSnapshot().Revision, ""); got.Code != http.StatusAccepted {
 		t.Fatalf("preflight status = %d, body = %s", got.Code, got.Body.String())
 	}
 	server.mu.Lock()
@@ -424,6 +431,52 @@ func TestActionUsesConfigurationSnapshot(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for action configuration")
+	}
+}
+
+func TestActionRejectsStaleConfigurationRevision(t *testing.T) {
+	var called atomic.Bool
+	actions := noOpActions()
+	actions.Preflight = func(context.Context, config.Config, io.Writer) error {
+		called.Store(true)
+		return nil
+	}
+	server := newTestServer(t, validControllerConfig(t), "", actions)
+	reviewed := request(t, server, http.MethodGet, "/api/config", "", "")
+	if reviewed.Code != http.StatusOK {
+		t.Fatalf("GET config status = %d, body = %s", reviewed.Code, reviewed.Body.String())
+	}
+	var reviewedConfiguration configurationView
+	decode(t, reviewed, &reviewedConfiguration)
+
+	updated := requestJSON(t, server, http.MethodPut, "/api/config", `{"workers":2}`, "")
+	if updated.Code != http.StatusOK {
+		t.Fatalf("PUT config status = %d, body = %s", updated.Code, updated.Body.String())
+	}
+	var current configurationView
+	decode(t, updated, &current)
+	if current.Revision <= reviewedConfiguration.Revision {
+		t.Fatalf("updated revision = %d, want greater than %d", current.Revision, reviewedConfiguration.Revision)
+	}
+
+	stale := requestAction(t, server, "preflight", reviewedConfiguration.Revision, "")
+	if stale.Code != http.StatusConflict || !strings.Contains(stale.Body.String(), "configuration revision") {
+		t.Fatalf("stale action status = %d, body = %s", stale.Code, stale.Body.String())
+	}
+	if called.Load() {
+		t.Fatal("stale action invoked preflight")
+	}
+	if operation := server.operationSnapshots()["migration"]; operation.State != "idle" {
+		t.Fatalf("migration operation = %#v, want idle", operation)
+	}
+
+	accepted := requestAction(t, server, "preflight", current.Revision, "")
+	if accepted.Code != http.StatusAccepted {
+		t.Fatalf("current action status = %d, body = %s", accepted.Code, accepted.Body.String())
+	}
+	waitForState(t, server, "migration", "succeeded")
+	if !called.Load() {
+		t.Fatal("current action did not invoke preflight")
 	}
 }
 
@@ -461,6 +514,8 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		`data-secret-config="source" type="password"`,
 		`data-secret-config="target" type="password"`,
 		"sourceDsn.value='';targetDsn.value=''",
+		"configurationRevision=data.revision",
+		"X-PGMigrate-Config-Revision",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("configuration UI does not contain %q", want)
@@ -525,6 +580,19 @@ func requestJSON(t *testing.T, server *Server, method, target, body, token strin
 	t.Helper()
 	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("X-PGMigrate-Token", token)
+	}
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, req)
+	return recorder
+}
+
+func requestAction(t *testing.T, server *Server, action string, revision uint64, token string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/actions/"+action, nil)
+	req.Header.Set("X-PGMigrate-Confirm", action)
+	req.Header.Set("X-PGMigrate-Config-Revision", fmt.Sprint(revision))
 	if token != "" {
 		req.Header.Set("X-PGMigrate-Token", token)
 	}

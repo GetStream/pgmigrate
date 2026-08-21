@@ -327,6 +327,10 @@ valid, or when the migration is complete. Configuration is locked while either
 a migration or verification operation is active. Verification is permitted only
 while `run` is following.
 
+Each successful save returns a configuration revision that the dashboard sends
+with preflight, run, and verification. The controller rejects the action if the
+reviewed configuration changed before it started.
+
 Source and target DSNs can be supplied through the dashboard, but are
 write-only: config and status API responses contain only configured/not-configured
 flags. The password inputs are cleared after every save or reload, and DSNs are
