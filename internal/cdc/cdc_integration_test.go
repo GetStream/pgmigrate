@@ -750,6 +750,20 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			id integer PRIMARY KEY,
 			value text CHECK (value <> 'bad')
 		);
+		CREATE TABLE public.pipeline_nonunique_indexed (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE INDEX pipeline_nonunique_indexed_partial
+			ON public.pipeline_nonunique_indexed (value) WHERE value <> '';
+		CREATE INDEX pipeline_nonunique_indexed_expression
+			ON public.pipeline_nonunique_indexed ((lower(value)));
+		CREATE TABLE public.pipeline_unique_indexed (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE UNIQUE INDEX pipeline_unique_indexed_partial
+			ON public.pipeline_unique_indexed (value) WHERE value <> '';
 		CREATE TABLE public.pipeline_batch_deferred (
 			id integer PRIMARY KEY,
 			value text,
@@ -869,6 +883,22 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}
 		if checked.capabilities.relationLane {
 			t.Fatal("checked relation was eligible for relation-lane replay")
+		}
+		indexedSource := relation(1193, "pipeline_nonunique_indexed", 25)
+		indexed, err := relationCache.resolve(ctx, conn, &indexedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !indexed.capabilities.relationLane || !indexed.capabilities.keyedSetDML {
+			t.Fatalf("non-unique indexed relation capabilities=%+v", indexed.capabilities)
+		}
+		uniqueIndexedSource := relation(1194, "pipeline_unique_indexed", 25)
+		uniqueIndexed, err := relationCache.resolve(ctx, conn, &uniqueIndexedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uniqueIndexed.capabilities.relationLane || uniqueIndexed.capabilities.keyedSetDML {
+			t.Fatalf("unique partial indexed relation capabilities=%+v", uniqueIndexed.capabilities)
 		}
 		customSource := stageRelation(1192, "pipeline_stage")
 		custom, err := relationCache.resolve(ctx, conn, &customSource, loadTargetRelation)
