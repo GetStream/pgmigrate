@@ -948,6 +948,13 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 
 	t.Run("selective replay preserves values and HOT-updates unindexed columns", func(t *testing.T) {
 		source := selectiveRelation(1195)
+		targetRelation, err := relationCache.resolve(ctx, conn, &source, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Force the scalar VALUES inspection transport used when a real target
+		// column has no usable array parameter representation.
+		targetRelation.columns[2].arrayOID = 0
 		if _, err := conn.Exec(ctx, `
 			INSERT INTO public.pipeline_selective_update
 				(id, indexed_value, other_value, unique_a, unique_b)

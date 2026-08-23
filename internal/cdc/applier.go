@@ -2162,6 +2162,9 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 			continue
 		}
 		chunkRows := applyArrayChunkRows
+		if relation.capabilities.selectiveUpdates {
+			chunkRows = updateChunkRows(len(setColumns) + len(identityColumns))
+		}
 		seen := map[string]struct{}{firstKey: {}}
 		end := start + 1
 		for end < len(changes) && end-start < chunkRows {
@@ -2326,7 +2329,9 @@ func inspectSelectiveUpdateMasks(
 			return nil, err
 		}
 		if !supported {
-			return nil, divergenceFor(relation, ChangeUpdate, "selective update value arrays unsupported")
+			return inspectSelectiveUpdateMasksValues(
+				replay, relation, identityColumns, setColumns, changes,
+			)
 		}
 		params = append(params, param)
 	}
@@ -2335,7 +2340,9 @@ func inspectSelectiveUpdateMasks(
 		return nil, err
 	}
 	if !supported {
-		return nil, divergenceFor(relation, ChangeUpdate, "selective update identity arrays unsupported")
+		return inspectSelectiveUpdateMasksValues(
+			replay, relation, identityColumns, setColumns, changes,
+		)
 	}
 	params = append(params, identityParams...)
 	var sql strings.Builder
@@ -2372,6 +2379,127 @@ func inspectSelectiveUpdateMasks(
 	masks := make([][]int, len(changes))
 	seen := make([]bool, len(changes))
 	replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description:  "inspect selective update " + relation.quoted,
+		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
+		consumeRows: func(reader *pgconn.ResultReader) error {
+			for reader.NextRow() {
+				values := reader.Values()
+				if len(values) != len(setColumns)+1 {
+					return divergenceFor(relation, ChangeUpdate, fmt.Sprintf(
+						"selective inspection returned %d columns, expected %d", len(values), len(setColumns)+1,
+					))
+				}
+				ordinal, err := strconv.Atoi(string(values[0]))
+				if err != nil || ordinal < 0 || ordinal >= len(changes) || seen[ordinal] {
+					return divergenceFor(relation, ChangeUpdate, fmt.Sprintf(
+						"selective inspection returned invalid ordinal %q", values[0],
+					))
+				}
+				seen[ordinal] = true
+				for i, value := range values[1:] {
+					switch string(value) {
+					case "t":
+						masks[ordinal] = append(masks[ordinal], setColumns[i])
+					case "f":
+					default:
+						return divergenceFor(relation, ChangeUpdate, fmt.Sprintf(
+							"selective inspection returned invalid difference flag %q", value,
+						))
+					}
+				}
+			}
+			for ordinal, found := range seen {
+				if !found {
+					return divergenceFor(relation, ChangeUpdate, fmt.Sprintf(
+						"selective inspection did not match source row %d", ordinal,
+					))
+				}
+			}
+			return nil
+		},
+	})
+	if err := replay.sync(); err != nil {
+		return nil, err
+	}
+	return masks, nil
+}
+
+func inspectSelectiveUpdateMasksValues(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+	changes []Change,
+) ([][]int, error) {
+	params := make([]rawParam, 0, len(changes)*(len(setColumns)+len(identityColumns)))
+	var sql strings.Builder
+	sql.WriteString("SELECT pgmigrate_batch.ordinal")
+	for i, columnIndex := range setColumns {
+		sql.WriteString(",(pgmigrate_target.")
+		sql.WriteString(relation.columns[columnIndex].quoted)
+		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
+	}
+	sql.WriteString(" FROM (VALUES ")
+	for row := range changes {
+		if row != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "(%d", row)
+		for _, columnIndex := range setColumns {
+			column := relation.columns[columnIndex]
+			param, err := datumParam(
+				relation, columnIndex, (*changes[row].New)[column.sourceIndex], ChangeUpdate,
+			)
+			if err != nil {
+				return nil, err
+			}
+			params = append(params, param)
+			fmt.Fprintf(&sql, ",$%d", len(params))
+		}
+		predicate := changes[row].Old
+		if predicate == nil {
+			predicate = changes[row].New
+		}
+		for _, column := range identityColumns {
+			param, err := datumParamForColumn(
+				relation, column, (*predicate)[column.sourceIndex], ChangeUpdate,
+			)
+			if err != nil {
+				return nil, err
+			}
+			params = append(params, param)
+			fmt.Fprintf(&sql, ",$%d", len(params))
+		}
+		sql.WriteByte(')')
+	}
+	sql.WriteString(") AS pgmigrate_batch(ordinal")
+	for i := range setColumns {
+		fmt.Fprintf(&sql, ",set_%d", i)
+	}
+	for i := range identityColumns {
+		fmt.Fprintf(&sql, ",identity_%d", i)
+	}
+	sql.WriteString(") JOIN ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_target ON ")
+	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	return queueSelectiveUpdateInspection(
+		replay, relation, setColumns, changes, sql.String(), params,
+	)
+}
+
+func queueSelectiveUpdateInspection(
+	replay *applyPipeline,
+	relation *targetRelation,
+	setColumns []int,
+	changes []Change,
+	sql string,
+	params []rawParam,
+) ([][]int, error) {
+	masks := make([][]int, len(changes))
+	seen := make([]bool, len(changes))
+	replay.queue(sql, params, applyExpectation{
 		relation: relation, kind: ChangeUpdate,
 		description:  "inspect selective update " + relation.quoted,
 		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
