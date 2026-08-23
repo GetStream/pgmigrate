@@ -2389,45 +2389,17 @@ func writeSelectiveTargetRowsCTE(
 			sql.WriteString(" OR ")
 		}
 		sql.WriteByte('(')
-		writeSelectiveIdentityBound(sql, identityColumns, positions, ">=")
-		sql.WriteString(" AND ")
-		writeSelectiveIdentityBound(sql, identityColumns, positions, "<=")
+		for i, column := range identityColumns {
+			if i != 0 {
+				sql.WriteString(" AND ")
+			}
+			sql.WriteString("pgmigrate_bitmap_target.")
+			sql.WriteString(column.quoted)
+			fmt.Fprintf(sql, "=$%d", positions[i])
+		}
 		sql.WriteByte(')')
 	}
 	sql.WriteString(") ")
-}
-
-func writeSelectiveIdentityBound(
-	sql *strings.Builder,
-	identityColumns []targetColumn,
-	paramPositions []int,
-	operator string,
-) {
-	if len(identityColumns) == 1 {
-		sql.WriteString("pgmigrate_bitmap_target.")
-		sql.WriteString(identityColumns[0].quoted)
-		sql.WriteString(operator)
-		fmt.Fprintf(sql, "$%d", paramPositions[0])
-		return
-	}
-	sql.WriteString("ROW(")
-	for i, column := range identityColumns {
-		if i != 0 {
-			sql.WriteByte(',')
-		}
-		sql.WriteString("pgmigrate_bitmap_target.")
-		sql.WriteString(column.quoted)
-	}
-	sql.WriteString(")")
-	sql.WriteString(operator)
-	sql.WriteString("ROW(")
-	for i, position := range paramPositions {
-		if i != 0 {
-			sql.WriteByte(',')
-		}
-		fmt.Fprintf(sql, "$%d", position)
-	}
-	sql.WriteByte(')')
 }
 
 func inspectSelectiveUpdateMasks(

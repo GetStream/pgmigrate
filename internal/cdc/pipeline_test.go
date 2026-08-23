@@ -154,6 +154,35 @@ func TestBatchIdentityPredicateUsesExactBTreeRowBounds(t *testing.T) {
 	}
 }
 
+func TestSelectiveTargetRowsCTEUsesExactIdentityEquality(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		quoted: `"shard_schema"."channels"`,
+		columns: []targetColumn{
+			{name: "app_pk", quoted: `"app_pk"`},
+			{name: "cid", quoted: `"cid"`},
+			{name: "custom", quoted: `"custom"`},
+		},
+	}
+	var sql strings.Builder
+	writeSelectiveTargetRowsCTE(
+		&sql,
+		relation,
+		relation.columns[:2],
+		[]int{2},
+		[][]int{{7, 8}, {9, 10}},
+	)
+	got := sql.String()
+	want := `WHERE (pgmigrate_bitmap_target."app_pk"=$7 AND pgmigrate_bitmap_target."cid"=$8) OR ` +
+		`(pgmigrate_bitmap_target."app_pk"=$9 AND pgmigrate_bitmap_target."cid"=$10)`
+	if !strings.Contains(got, want) {
+		t.Fatalf("bitmap predicate = %q, want exact composite identities %q", got, want)
+	}
+	if strings.Contains(got, ">=") || strings.Contains(got, "<=") {
+		t.Fatalf("bitmap predicate contains a range bound: %q", got)
+	}
+}
+
 func TestBatchIdentityPredicateKeepsSingleColumnEquality(t *testing.T) {
 	t.Parallel()
 	var sql strings.Builder
