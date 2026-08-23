@@ -381,11 +381,6 @@ func cdcReplayFixtureSQL(accountCount, sessionCount int) string {
 		);
 		CREATE INDEX accounts_tenant_revision_idx
 			ON cdc_benchmark.accounts (tenant_id, revision);
-		CREATE INDEX accounts_active_revision_idx
-			ON cdc_benchmark.accounts (tenant_id, revision)
-			WHERE revision >= 0;
-		CREATE INDEX accounts_segment_idx
-			ON cdc_benchmark.accounts ((metadata ->> 'segment'));
 
 		CREATE TABLE cdc_benchmark.events (
 			id bigint PRIMARY KEY,

@@ -963,7 +963,6 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		         AND NOT EXISTS (
 		           SELECT 1 FROM pg_catalog.pg_index index_row
 		           WHERE index_row.indrelid = c.oid
-		             AND (index_row.indisunique OR index_row.indisexclusion)
 		             AND (index_row.indexprs IS NOT NULL OR index_row.indpred IS NOT NULL)
 		         ) AS set_dml_safe,
 		       t.oid < 16384 AS built_in_type
