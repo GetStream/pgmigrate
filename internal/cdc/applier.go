@@ -2352,14 +2352,14 @@ func inspectSelectiveUpdateMasks(
 		sql.WriteString(relation.columns[columnIndex].quoted)
 		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
 	}
-	sql.WriteString(" FROM unnest(")
+	sql.WriteString(" FROM (SELECT * FROM unnest(")
 	for i := range params {
 		if i != 0 {
 			sql.WriteByte(',')
 		}
 		fmt.Fprintf(&sql, "$%d", i+1)
 	}
-	sql.WriteString(") WITH ORDINALITY AS pgmigrate_batch(")
+	sql.WriteString(") WITH ORDINALITY AS pgmigrate_unsorted(")
 	for i := range setColumns {
 		if i != 0 {
 			sql.WriteByte(',')
@@ -2372,7 +2372,10 @@ func inspectSelectiveUpdateMasks(
 		}
 		fmt.Fprintf(&sql, "identity_%d", i)
 	}
-	sql.WriteString(",ordinal) JOIN ")
+	sql.WriteString(",ordinal) ORDER BY ")
+	writeBatchIdentityOrder(&sql, identityColumns, "identity_", 0)
+	sql.WriteString(" OFFSET 0")
+	sql.WriteString(") AS pgmigrate_batch JOIN ")
 	sql.WriteString(relation.quoted)
 	sql.WriteString(" AS pgmigrate_target ON ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
@@ -2425,6 +2428,25 @@ func inspectSelectiveUpdateMasks(
 	return masks, nil
 }
 
+// writeBatchIdentityOrder makes target lookups follow replica-identity order.
+// A restored table is substantially clustered by the COPY part key, while WAL
+// arrival order is effectively random. Sorting the small in-memory batch avoids
+// turning one comparison chunk into thousands of serial random heap reads. The
+// ordinal still carries source order into the result and subsequent DML.
+func writeBatchIdentityOrder(
+	sql *strings.Builder,
+	identityColumns []targetColumn,
+	batchColumnPrefix string,
+	batchColumnOffset int,
+) {
+	for i := range identityColumns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(sql, "pgmigrate_unsorted.%s%d", batchColumnPrefix, batchColumnOffset+i)
+	}
+}
+
 func inspectSelectiveUpdateMasksValues(
 	replay *applyPipeline,
 	relation *targetRelation,
@@ -2440,7 +2462,7 @@ func inspectSelectiveUpdateMasksValues(
 		sql.WriteString(relation.columns[columnIndex].quoted)
 		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
 	}
-	sql.WriteString(" FROM (VALUES ")
+	sql.WriteString(" FROM (SELECT * FROM (VALUES ")
 	for row := range changes {
 		if row != 0 {
 			sql.WriteByte(',')
@@ -2473,14 +2495,17 @@ func inspectSelectiveUpdateMasksValues(
 		}
 		sql.WriteByte(')')
 	}
-	sql.WriteString(") AS pgmigrate_batch(ordinal")
+	sql.WriteString(") AS pgmigrate_unsorted(ordinal")
 	for i := range setColumns {
 		fmt.Fprintf(&sql, ",set_%d", i)
 	}
 	for i := range identityColumns {
 		fmt.Fprintf(&sql, ",identity_%d", i)
 	}
-	sql.WriteString(") JOIN ")
+	sql.WriteString(") ORDER BY ")
+	writeBatchIdentityOrder(&sql, identityColumns, "identity_", 0)
+	sql.WriteString(" OFFSET 0")
+	sql.WriteString(") AS pgmigrate_batch JOIN ")
 	sql.WriteString(relation.quoted)
 	sql.WriteString(" AS pgmigrate_target ON ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
