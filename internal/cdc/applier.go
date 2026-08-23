@@ -2101,7 +2101,6 @@ func applyInsertArrayChunk(
 		}
 		params = append(params, param)
 	}
-
 	var sql strings.Builder
 	sql.WriteString("INSERT INTO ")
 	sql.WriteString(relation.quoted)
@@ -2384,6 +2383,18 @@ func writeSelectiveTargetRowsCTE(
 	sql.WriteString(" FROM ")
 	sql.WriteString(relation.quoted)
 	sql.WriteString(" AS pgmigrate_bitmap_target WHERE ")
+	writeExactIdentityDisjunction(
+		sql, "pgmigrate_bitmap_target", identityColumns, identityParamPositions,
+	)
+	sql.WriteString(") ")
+}
+
+func writeExactIdentityDisjunction(
+	sql *strings.Builder,
+	targetAlias string,
+	identityColumns []targetColumn,
+	identityParamPositions [][]int,
+) {
 	for row, positions := range identityParamPositions {
 		if row != 0 {
 			sql.WriteString(" OR ")
@@ -2393,13 +2404,13 @@ func writeSelectiveTargetRowsCTE(
 			if i != 0 {
 				sql.WriteString(" AND ")
 			}
-			sql.WriteString("pgmigrate_bitmap_target.")
+			sql.WriteString(targetAlias)
+			sql.WriteByte('.')
 			sql.WriteString(column.quoted)
 			fmt.Fprintf(sql, "=$%d", positions[i])
 		}
 		sql.WriteByte(')')
 	}
-	sql.WriteString(") ")
 }
 
 func inspectSelectiveUpdateMasks(
@@ -2944,6 +2955,7 @@ func applyUpdateValueChunk(
 	}
 	sql.WriteString(" FROM (VALUES ")
 	params := make([]rawParam, 0, len(changes)*(len(setColumns)+len(identityColumns)))
+	identityParamPositions := make([][]int, len(changes))
 	for row := range changes {
 		if row != 0 {
 			sql.WriteByte(',')
@@ -2962,7 +2974,8 @@ func applyUpdateValueChunk(
 		if predicate == nil {
 			predicate = changes[row].New
 		}
-		for _, column := range identityColumns {
+		identityParamPositions[row] = make([]int, len(identityColumns))
+		for i, column := range identityColumns {
 			param, err := datumParamForColumn(
 				relation, column, (*predicate)[column.sourceIndex], ChangeUpdate,
 			)
@@ -2970,6 +2983,7 @@ func applyUpdateValueChunk(
 				return err
 			}
 			params = append(params, param)
+			identityParamPositions[row][i] = len(params)
 			fmt.Fprintf(&sql, ",$%d", len(params))
 		}
 		sql.WriteByte(')')
@@ -2983,6 +2997,13 @@ func applyUpdateValueChunk(
 	}
 	sql.WriteString(") WHERE ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+		sql.WriteString(" AND (")
+		writeExactIdentityDisjunction(
+			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
+		)
+		sql.WriteByte(')')
+	}
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
 	return replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeUpdate,
@@ -3032,6 +3053,17 @@ func applyUpdateArrayChunk(
 		}
 		params = append(params, param)
 	}
+	batchParamCount := len(params)
+	var identityParamPositions [][]int
+	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+		var err error
+		params, identityParamPositions, err = appendSelectiveIdentityScalarParams(
+			params, relation, identityColumns, changes,
+		)
+		if err != nil {
+			return true, err
+		}
+	}
 
 	var sql strings.Builder
 	sql.WriteString("UPDATE ")
@@ -3051,7 +3083,7 @@ func applyUpdateArrayChunk(
 		}
 	}
 	sql.WriteString(" FROM unnest(")
-	for i := range params {
+	for i := 0; i < batchParamCount; i++ {
 		if i != 0 {
 			sql.WriteByte(',')
 		}
@@ -3075,6 +3107,13 @@ func applyUpdateArrayChunk(
 	}
 	sql.WriteString("ordinal) WHERE ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	if len(identityParamPositions) != 0 {
+		sql.WriteString(" AND (")
+		writeExactIdentityDisjunction(
+			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
+		)
+		sql.WriteByte(')')
+	}
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal - 1")
 	return true, replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeUpdate,
