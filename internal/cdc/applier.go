@@ -230,9 +230,16 @@ func (a *Applier) runConnection(ctx context.Context) error {
 func configureApplySession(ctx context.Context, conn *pgx.Conn) error {
 	// This connection is dedicated to logical replay. Set replica role once so
 	// every source transaction suppresses target triggers and referential
-	// actions without paying an extra target round trip per transaction.
+	// actions without paying an extra target round trip per transaction. Force
+	// synchronous durability here as well: target bulk-load tuning may have set
+	// the database default to off, but CDC pruning advances from committed apply
+	// progress and must never discard a segment before its target commit is
+	// crash-durable.
 	if _, err := conn.Exec(ctx, "SET session_replication_role = replica"); err != nil {
 		return classifyApplyError(nil, 0, fmt.Errorf("cdc: disable target replication triggers: %w", err))
+	}
+	if _, err := conn.Exec(ctx, "SET synchronous_commit = on"); err != nil {
+		return classifyApplyError(nil, 0, fmt.Errorf("cdc: require durable target commits: %w", err))
 	}
 	return nil
 }
@@ -431,10 +438,11 @@ type targetRelation struct {
 // Keeping these decisions independent prevents one slow relation from forcing
 // every otherwise-independent relation in a catch-up batch onto the scalar path.
 type targetRelationCapabilities struct {
-	relationLane  bool
-	keyedSetDML   bool
-	binaryCopy    bool
-	textCopyStage bool
+	relationLane     bool
+	keyedSetDML      bool
+	binaryCopy       bool
+	textCopyStage    bool
+	selectiveUpdates bool
 }
 
 type targetColumn struct {
@@ -942,6 +950,12 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		           AND (conflict_index.indisunique OR conflict_index.indisexclusion)
 		           AND a.attnum = ANY(conflict_index.indkey)
 		       ) AS conflict_sensitive,
+		       EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_index selective_index
+		         WHERE selective_index.indrelid = c.oid
+		           AND NOT (selective_index.indisunique OR selective_index.indisexclusion)
+		           AND (selective_index.indexprs IS NOT NULL OR selective_index.indpred IS NOT NULL)
+		       ) AS selective_updates,
 		       c.relkind = 'r'
 		         AND NOT c.relrowsecurity
 		         AND NOT c.relforcerowsecurity
@@ -963,6 +977,7 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		         AND NOT EXISTS (
 		           SELECT 1 FROM pg_catalog.pg_index index_row
 		           WHERE index_row.indrelid = c.oid
+		             AND (index_row.indisunique OR index_row.indisexclusion)
 		             AND (index_row.indexprs IS NOT NULL OR index_row.indpred IS NOT NULL)
 		         ) AS set_dml_safe,
 		       t.oid < 16384 AS built_in_type
@@ -988,13 +1003,14 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 			textCopyStage: true,
 		},
 	}
+	hasSelectiveUpdates := false
 	for rows.Next() {
 		var column targetColumn
-		var setDMLSafe, builtIn bool
+		var setDMLSafe, builtIn, selectiveUpdates bool
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
 			&column.generated, &column.notNull, &column.conflicting,
-			&setDMLSafe, &builtIn,
+			&selectiveUpdates, &setDMLSafe, &builtIn,
 		); err != nil {
 			return nil, err
 		}
@@ -1002,6 +1018,7 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		result.capabilities.keyedSetDML = result.capabilities.keyedSetDML && setDMLSafe
 		result.capabilities.binaryCopy = result.capabilities.binaryCopy && setDMLSafe && builtIn
 		result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe
+		hasSelectiveUpdates = hasSelectiveUpdates || selectiveUpdates
 		if column.identity == "a" {
 			result.overrideIdentity = true
 		}
@@ -1015,6 +1032,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	result.capabilities.selectiveUpdates =
+		hasSelectiveUpdates && result.capabilities.relationLane
 	if len(result.columns) == 0 && len(result.generatedColumns) == 0 {
 		// Naming the absent relation matters most for a partition: publishing a
 		// partitioned table streams changes identified by the partition, so a
@@ -1244,6 +1263,7 @@ type applyExpectation struct {
 	progressGuard    bool
 	statement        string
 	paramOIDs        []uint32
+	consumeRows      func(*pgconn.ResultReader) error
 }
 
 type applyPipeline struct {
@@ -1423,7 +1443,12 @@ func (p *applyPipeline) sync() error {
 				}
 				continue
 			}
-			ordinalErr := expectation.validateOrdinals(reader)
+			var ordinalErr error
+			if expectation.consumeRows != nil {
+				ordinalErr = expectation.consumeRows(reader)
+			} else {
+				ordinalErr = expectation.validateOrdinals(reader)
+			}
 			tag, closeErr := reader.Close()
 			if closeErr != nil {
 				if firstErr == nil {
@@ -2128,7 +2153,8 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 			return err
 		}
 		setColumns := updateSetColumnIndexes(relation, &changes[start])
-		if !updateSetColumnsBatchSafe(relation, setColumns) {
+		if !relation.capabilities.selectiveUpdates &&
+			!updateSetColumnsBatchSafe(relation, setColumns) {
 			if err := applyUpdate(replay, relation, &changes[start]); err != nil {
 				return err
 			}
@@ -2145,7 +2171,8 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 			}
 			candidateSetColumns := updateSetColumnIndexes(relation, &changes[end])
 			if !slices.Equal(setColumns, candidateSetColumns) ||
-				!updateSetColumnsBatchSafe(relation, candidateSetColumns) {
+				(!relation.capabilities.selectiveUpdates &&
+					!updateSetColumnsBatchSafe(relation, candidateSetColumns)) {
 				break
 			}
 			if _, duplicate := seen[key]; duplicate {
@@ -2154,7 +2181,13 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 			seen[key] = struct{}{}
 			end++
 		}
-		if end-start == 1 {
+		if relation.capabilities.selectiveUpdates {
+			if err := applySelectiveUpdateChunk(
+				replay, relation, identityColumns, setColumns, changes[start:end],
+			); err != nil {
+				return err
+			}
+		} else if end-start == 1 {
 			if err := applyUpdate(replay, relation, &changes[start]); err != nil {
 				return err
 			}
@@ -2166,6 +2199,223 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 		start = end
 	}
 	return nil
+}
+
+// applySelectiveUpdateChunk avoids the write amplification caused by pgoutput
+// update tuples containing the complete new row. It first compares those values
+// with the target inside the open replay transaction, then groups rows by their
+// exact changed-column mask. Each target row is still updated once, but indexes
+// that do not depend on a changed column are no longer needlessly maintained.
+func applySelectiveUpdateChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+	changes []Change,
+) error {
+	masks, err := inspectSelectiveUpdateMasks(
+		replay, relation, identityColumns, setColumns, changes,
+	)
+	if err != nil {
+		return err
+	}
+	for start := 0; start < len(changes); {
+		mask := masks[start]
+		if len(mask) == 0 {
+			start++
+			continue
+		}
+		if !updateSetColumnsBatchSafe(relation, mask) {
+			exact := selectiveChange(relation, &changes[start], mask)
+			if err := applyUpdate(replay, relation, &exact); err != nil {
+				return err
+			}
+			start++
+			continue
+		}
+		firstKey, err := batchUpdateIdentityKey(relation, identityColumns, &changes[start])
+		if err != nil {
+			return err
+		}
+		seen := map[string]struct{}{firstKey: {}}
+		end := start + 1
+		for end < len(changes) && end-start < applyArrayChunkRows && slices.Equal(mask, masks[end]) {
+			key, err := batchUpdateIdentityKey(relation, identityColumns, &changes[end])
+			if err != nil {
+				return err
+			}
+			if _, duplicate := seen[key]; duplicate {
+				break
+			}
+			seen[key] = struct{}{}
+			end++
+		}
+		exact := make([]Change, end-start)
+		for i := range exact {
+			exact[i] = selectiveChange(relation, &changes[start+i], mask)
+		}
+		if len(exact) == 1 {
+			if err := applyUpdate(replay, relation, &exact[0]); err != nil {
+				return err
+			}
+		} else if err := applyUpdateChunk(replay, relation, identityColumns, mask, exact); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
+}
+
+func selectiveChange(relation *targetRelation, change *Change, setColumns []int) Change {
+	exact := *change
+	if exact.Old == nil {
+		exact.Old = change.New
+	}
+	newTuple := make(Tuple, len(*change.New))
+	for i := range newTuple {
+		newTuple[i] = TupleDatum{Kind: DatumUnchangedToast}
+	}
+	for _, columnIndex := range setColumns {
+		sourceIndex := relation.columns[columnIndex].sourceIndex
+		newTuple[sourceIndex] = (*change.New)[sourceIndex]
+	}
+	exact.New = &newTuple
+	return exact
+}
+
+func selectiveIdentityParams(
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	changes []Change,
+) ([]rawParam, bool, error) {
+	params := make([]rawParam, 0, len(identityColumns))
+	for _, column := range identityColumns {
+		datums := make([]TupleDatum, len(changes))
+		for row := range changes {
+			predicate := changes[row].Old
+			if predicate == nil {
+				predicate = changes[row].New
+			}
+			datums[row] = (*predicate)[column.sourceIndex]
+		}
+		param, supported, err := arrayParamForColumn(relation, column, datums, ChangeUpdate)
+		if err != nil || !supported {
+			return nil, supported, err
+		}
+		params = append(params, param)
+	}
+	return params, true, nil
+}
+
+func inspectSelectiveUpdateMasks(
+	replay *applyPipeline,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+	changes []Change,
+) ([][]int, error) {
+	params := make([]rawParam, 0, len(setColumns)+len(identityColumns))
+	for _, columnIndex := range setColumns {
+		column := relation.columns[columnIndex]
+		datums := make([]TupleDatum, len(changes))
+		for row := range changes {
+			datums[row] = (*changes[row].New)[column.sourceIndex]
+		}
+		param, supported, err := arrayParamForColumn(relation, column, datums, ChangeUpdate)
+		if err != nil {
+			return nil, err
+		}
+		if !supported {
+			return nil, divergenceFor(relation, ChangeUpdate, "selective update value arrays unsupported")
+		}
+		params = append(params, param)
+	}
+	identityParams, supported, err := selectiveIdentityParams(relation, identityColumns, changes)
+	if err != nil {
+		return nil, err
+	}
+	if !supported {
+		return nil, divergenceFor(relation, ChangeUpdate, "selective update identity arrays unsupported")
+	}
+	params = append(params, identityParams...)
+	var sql strings.Builder
+	sql.WriteString("SELECT pgmigrate_batch.ordinal - 1")
+	for i, columnIndex := range setColumns {
+		sql.WriteString(",(pgmigrate_target.")
+		sql.WriteString(relation.columns[columnIndex].quoted)
+		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
+	}
+	sql.WriteString(" FROM unnest(")
+	for i := range params {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "$%d", i+1)
+	}
+	sql.WriteString(") WITH ORDINALITY AS pgmigrate_batch(")
+	for i := range setColumns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "set_%d", i)
+	}
+	for i := range identityColumns {
+		if len(setColumns) != 0 || i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "identity_%d", i)
+	}
+	sql.WriteString(",ordinal) JOIN ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_target ON ")
+	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	masks := make([][]int, len(changes))
+	seen := make([]bool, len(changes))
+	replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description:  "inspect selective update " + relation.quoted,
+		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
+		consumeRows: func(reader *pgconn.ResultReader) error {
+			for reader.NextRow() {
+				values := reader.Values()
+				if len(values) != len(setColumns)+1 {
+					return divergenceFor(relation, ChangeUpdate, fmt.Sprintf(
+						"selective inspection returned %d columns, expected %d", len(values), len(setColumns)+1,
+					))
+				}
+				ordinal, err := strconv.Atoi(string(values[0]))
+				if err != nil || ordinal < 0 || ordinal >= len(changes) || seen[ordinal] {
+					return divergenceFor(relation, ChangeUpdate, fmt.Sprintf(
+						"selective inspection returned invalid ordinal %q", values[0],
+					))
+				}
+				seen[ordinal] = true
+				for i, value := range values[1:] {
+					switch string(value) {
+					case "t":
+						masks[ordinal] = append(masks[ordinal], setColumns[i])
+					case "f":
+					default:
+						return divergenceFor(relation, ChangeUpdate, fmt.Sprintf(
+							"selective inspection returned invalid difference flag %q", value,
+						))
+					}
+				}
+			}
+			for ordinal, found := range seen {
+				if !found {
+					return divergenceFor(relation, ChangeUpdate, fmt.Sprintf(
+						"selective inspection did not match source row %d", ordinal,
+					))
+				}
+			}
+			return nil
+		},
+	})
+	if err := replay.sync(); err != nil {
+		return nil, err
+	}
+	return masks, nil
 }
 
 func batchUpdateIdentityColumns(relation *targetRelation) []targetColumn {

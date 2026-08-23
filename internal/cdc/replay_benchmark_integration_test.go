@@ -381,6 +381,47 @@ func cdcReplayFixtureSQL(accountCount, sessionCount int) string {
 		);
 		CREATE INDEX accounts_tenant_revision_idx
 			ON cdc_benchmark.accounts (tenant_id, revision);
+		CREATE INDEX accounts_active_revision_idx
+			ON cdc_benchmark.accounts (tenant_id, revision)
+			WHERE revision >= 0;
+		CREATE INDEX accounts_segment_idx
+			ON cdc_benchmark.accounts ((metadata ->> 'segment'));
+		CREATE INDEX accounts_updated_day_idx
+			ON cdc_benchmark.accounts ((date_trunc('day', updated_at AT TIME ZONE 'UTC')));
+		CREATE INDEX accounts_positive_balance_idx
+			ON cdc_benchmark.accounts (balance) WHERE balance > 0;
+		CREATE INDEX accounts_tenant_band_00_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 1 AND 32;
+		CREATE INDEX accounts_tenant_band_01_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 33 AND 64;
+		CREATE INDEX accounts_tenant_band_02_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 65 AND 96;
+		CREATE INDEX accounts_tenant_band_03_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 97 AND 128;
+		CREATE INDEX accounts_tenant_band_04_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 129 AND 160;
+		CREATE INDEX accounts_tenant_band_05_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 161 AND 192;
+		CREATE INDEX accounts_tenant_band_06_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 193 AND 224;
+		CREATE INDEX accounts_tenant_band_07_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 225 AND 256;
+		CREATE INDEX accounts_tenant_band_08_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 257 AND 288;
+		CREATE INDEX accounts_tenant_band_09_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 289 AND 320;
+		CREATE INDEX accounts_tenant_band_10_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 321 AND 352;
+		CREATE INDEX accounts_tenant_band_11_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 353 AND 384;
+		CREATE INDEX accounts_tenant_band_12_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 385 AND 416;
+		CREATE INDEX accounts_tenant_band_13_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 417 AND 448;
+		CREATE INDEX accounts_tenant_band_14_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 449 AND 476;
+		CREATE INDEX accounts_tenant_band_15_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 477 AND 500;
+		CREATE INDEX accounts_tenant_band_desc_00_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 1 AND 32;
+		CREATE INDEX accounts_tenant_band_desc_01_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 33 AND 64;
+		CREATE INDEX accounts_tenant_band_desc_02_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 65 AND 96;
+		CREATE INDEX accounts_tenant_band_desc_03_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 97 AND 128;
+		CREATE INDEX accounts_tenant_band_desc_04_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 129 AND 160;
+		CREATE INDEX accounts_tenant_band_desc_05_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 161 AND 192;
+		CREATE INDEX accounts_tenant_band_desc_06_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 193 AND 224;
+		CREATE INDEX accounts_tenant_band_desc_07_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 225 AND 256;
+		CREATE INDEX accounts_tenant_band_desc_08_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 257 AND 288;
+		CREATE INDEX accounts_tenant_band_desc_09_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 289 AND 320;
+		CREATE INDEX accounts_tenant_band_desc_10_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 321 AND 352;
+		CREATE INDEX accounts_tenant_band_desc_11_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 353 AND 384;
+		CREATE INDEX accounts_tenant_band_desc_12_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 385 AND 416;
+		CREATE INDEX accounts_tenant_band_desc_13_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 417 AND 448;
+		CREATE INDEX accounts_tenant_band_desc_14_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 449 AND 476;
+		CREATE INDEX accounts_tenant_band_desc_15_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 477 AND 500;
 
 		CREATE TABLE cdc_benchmark.events (
 			id bigint PRIMARY KEY,

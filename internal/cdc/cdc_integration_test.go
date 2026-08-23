@@ -511,6 +511,15 @@ func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
 	target := pgtest.Start(t, 17)
 	ctx := context.Background()
 	applyConn := target.Connect(t)
+	if _, err := applyConn.Exec(ctx, `
+		DO $$ BEGIN
+			EXECUTE format('ALTER DATABASE %I SET synchronous_commit = off', current_database());
+		END $$
+	`); err != nil {
+		t.Fatal(err)
+	}
+	applyConn.Close(ctx)
+	applyConn = target.Connect(t)
 	if err := configureApplySession(ctx, applyConn); err != nil {
 		t.Fatal(err)
 	}
@@ -519,8 +528,8 @@ func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var role string
-		if err := tx.QueryRow(ctx, "SHOW session_replication_role").Scan(&role); err != nil {
+		var role, synchronousCommit string
+		if err := tx.QueryRow(ctx, "SELECT current_setting('session_replication_role'), current_setting('synchronous_commit')").Scan(&role, &synchronousCommit); err != nil {
 			_ = tx.Rollback(ctx)
 			t.Fatal(err)
 		}
@@ -528,18 +537,25 @@ func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
 			_ = tx.Rollback(ctx)
 			t.Fatalf("apply transaction %d role=%q, want replica", i+1, role)
 		}
+		if synchronousCommit != "on" {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("apply transaction %d synchronous_commit=%q, want on", i+1, synchronousCommit)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	other := target.Connect(t)
-	var role string
-	if err := other.QueryRow(ctx, "SHOW session_replication_role").Scan(&role); err != nil {
+	var role, synchronousCommit string
+	if err := other.QueryRow(ctx, "SELECT current_setting('session_replication_role'), current_setting('synchronous_commit')").Scan(&role, &synchronousCommit); err != nil {
 		t.Fatal(err)
 	}
 	if role != "origin" {
 		t.Fatalf("unrelated target connection role=%q, want origin", role)
+	}
+	if synchronousCommit != "off" {
+		t.Fatalf("unrelated target connection synchronous_commit=%q, want off", synchronousCommit)
 	}
 }
 
@@ -750,6 +766,25 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			id integer PRIMARY KEY,
 			value text CHECK (value <> 'bad')
 		);
+		CREATE TABLE public.pipeline_selective_update (
+			id integer PRIMARY KEY,
+			indexed_value text NOT NULL,
+			other_value text NOT NULL,
+			unique_a text NOT NULL,
+			unique_b text NOT NULL,
+			UNIQUE (unique_a, unique_b)
+		);
+		CREATE INDEX pipeline_selective_update_partial
+			ON public.pipeline_selective_update (indexed_value)
+			WHERE indexed_value <> '';
+		CREATE INDEX pipeline_selective_update_expression
+			ON public.pipeline_selective_update ((lower(indexed_value)));
+		CREATE TABLE public.pipeline_unique_indexed (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE UNIQUE INDEX pipeline_unique_indexed_partial
+			ON public.pipeline_unique_indexed (value) WHERE value <> '';
 		CREATE TABLE public.pipeline_batch_deferred (
 			id integer PRIMARY KEY,
 			value text,
@@ -812,6 +847,18 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			},
 		}
 	}
+	selectiveRelation := func(oid uint32) Relation {
+		return Relation{
+			OID: oid, Namespace: "public", Name: "pipeline_selective_update", ReplicaIdentity: 'd',
+			Columns: []Column{
+				{Name: "id", Type: 23, Flags: 1},
+				{Name: "indexed_value", Type: 25},
+				{Name: "other_value", Type: 25},
+				{Name: "unique_a", Type: 25},
+				{Name: "unique_b", Type: 25},
+			},
+		}
+	}
 	relationCache := newTargetRelationCache()
 	statementCache := newApplyStatementCache(applyStatementCacheCapacity)
 	apply := func(stream string, transaction *Transaction) error {
@@ -870,6 +917,24 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if checked.capabilities.relationLane {
 			t.Fatal("checked relation was eligible for relation-lane replay")
 		}
+		selectiveSource := selectiveRelation(1193)
+		selective, err := relationCache.resolve(ctx, conn, &selectiveSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !selective.capabilities.relationLane || !selective.capabilities.keyedSetDML ||
+			!selective.capabilities.selectiveUpdates {
+			t.Fatalf("selective relation capabilities=%+v", selective.capabilities)
+		}
+		uniqueIndexedSource := relation(1194, "pipeline_unique_indexed", 25)
+		uniqueIndexed, err := relationCache.resolve(ctx, conn, &uniqueIndexedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uniqueIndexed.capabilities.relationLane || uniqueIndexed.capabilities.keyedSetDML ||
+			uniqueIndexed.capabilities.selectiveUpdates {
+			t.Fatalf("unique partial indexed relation capabilities=%+v", uniqueIndexed.capabilities)
+		}
 		customSource := stageRelation(1192, "pipeline_stage")
 		custom, err := relationCache.resolve(ctx, conn, &customSource, loadTargetRelation)
 		if err != nil {
@@ -878,6 +943,75 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if custom.capabilities.relationLane || !custom.capabilities.keyedSetDML ||
 			custom.capabilities.binaryCopy || !custom.capabilities.textCopyStage {
 			t.Fatalf("custom relation capabilities=%+v", custom.capabilities)
+		}
+	})
+
+	t.Run("selective replay preserves values and HOT-updates unindexed columns", func(t *testing.T) {
+		source := selectiveRelation(1195)
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO public.pipeline_selective_update
+				(id, indexed_value, other_value, unique_a, unique_b)
+			VALUES (1, 'indexed-old', 'other-old', 'a', 'b'),
+			       (2, 'indexed-two', 'other-two', 'c', 'd');
+			SELECT pg_stat_reset_single_table_counters('public.pipeline_selective_update'::regclass);
+		`); err != nil {
+			t.Fatal(err)
+		}
+		transaction := Transaction{
+			CommitLSN: 410, EndLSN: 411, Relations: []Relation{source},
+			Changes: []Change{
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("1"), text("indexed-old"), text("other-old"), text("a"), text("b")),
+					New: tuple(text("1"), text("indexed-old"), text("other-middle"), text("a"), text("b")),
+				},
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("1"), text("indexed-old"), text("other-middle"), text("a"), text("b")),
+					New: tuple(text("1"), text("indexed-old"), text("other-new"), text("a"), text("b")),
+				},
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("2"), text("indexed-two"), text("other-two"), text("c"), text("d")),
+					New: tuple(text("2"), text("indexed-new"), text("other-two"), text("c-new"), text("d-new")),
+				},
+			},
+		}
+		if err := apply("pipeline-selective-update", &transaction); err != nil {
+			t.Fatal(err)
+		}
+		var values string
+		if err := conn.QueryRow(ctx, `
+			SELECT string_agg(indexed_value || ':' || other_value, ',' ORDER BY id)
+			FROM public.pipeline_selective_update
+		`).Scan(&values); err != nil {
+			t.Fatal(err)
+		}
+		if values != "indexed-old:other-new,indexed-new:other-two" {
+			t.Fatalf("selective values=%q", values)
+		}
+		var uniqueValues string
+		if err := conn.QueryRow(ctx, `
+			SELECT unique_a || ':' || unique_b
+			FROM public.pipeline_selective_update WHERE id = 2
+		`).Scan(&uniqueValues); err != nil {
+			t.Fatal(err)
+		}
+		if uniqueValues != "c-new:d-new" {
+			t.Fatalf("selective unique values=%q", uniqueValues)
+		}
+		if _, err := conn.Exec(ctx, "SELECT pg_stat_force_next_flush()"); err != nil {
+			t.Fatal(err)
+		}
+		var hotUpdates int64
+		if err := conn.QueryRow(ctx, `
+			SELECT n_tup_hot_upd FROM pg_stat_user_tables
+			WHERE relid = 'public.pipeline_selective_update'::regclass
+		`).Scan(&hotUpdates); err != nil {
+			t.Fatal(err)
+		}
+		if hotUpdates < 1 {
+			t.Fatalf("selective replay produced %d HOT updates, want at least 1", hotUpdates)
 		}
 	})
 
