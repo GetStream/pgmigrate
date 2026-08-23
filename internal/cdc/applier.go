@@ -2273,6 +2273,54 @@ func updateChunkRows(parametersPerRow int) int {
 	return rows
 }
 
+// writeBatchIdentityPredicate renders an exact lookup through the replica
+// identity's B-tree column order. PostgreSQL can otherwise prefer a smaller
+// non-unique prefix index and filter the remaining identity columns, which is
+// catastrophic when that prefix matches many rows. The batch path admits only
+// NOT NULL replica-identity columns, so equal lower and upper row bounds are
+// equivalent to equality while keeping the full ordered key as one index qual.
+func writeBatchIdentityPredicate(
+	sql *strings.Builder,
+	identityColumns []targetColumn,
+	batchColumnPrefix string,
+	batchColumnOffset int,
+) {
+	writeTarget := func() {
+		sql.WriteString("ROW(")
+		for i, column := range identityColumns {
+			if i != 0 {
+				sql.WriteByte(',')
+			}
+			sql.WriteString("pgmigrate_target.")
+			sql.WriteString(column.quoted)
+		}
+		sql.WriteByte(')')
+	}
+	writeBatch := func() {
+		sql.WriteString("ROW(")
+		for i := range identityColumns {
+			if i != 0 {
+				sql.WriteByte(',')
+			}
+			fmt.Fprintf(sql, "pgmigrate_batch.%s%d", batchColumnPrefix, batchColumnOffset+i)
+		}
+		sql.WriteByte(')')
+	}
+	if len(identityColumns) == 1 {
+		sql.WriteString("pgmigrate_target.")
+		sql.WriteString(identityColumns[0].quoted)
+		fmt.Fprintf(sql, "=pgmigrate_batch.%s%d", batchColumnPrefix, batchColumnOffset)
+		return
+	}
+	writeTarget()
+	sql.WriteString(">=")
+	writeBatch()
+	sql.WriteString(" AND ")
+	writeTarget()
+	sql.WriteString("<=")
+	writeBatch()
+}
+
 func applyUpdateChunk(
 	replay *applyPipeline,
 	relation *targetRelation,
@@ -2364,14 +2412,7 @@ func applyUpdateTextStage(
 	sql.WriteString(" FROM ")
 	sql.WriteString(stage)
 	sql.WriteString(" AS pgmigrate_batch WHERE ")
-	for i, column := range identityColumns {
-		if i != 0 {
-			sql.WriteString(" AND ")
-		}
-		sql.WriteString("pgmigrate_target.")
-		sql.WriteString(column.quoted)
-		fmt.Fprintf(&sql, "=pgmigrate_batch.column_%d", len(setColumns)+i)
-	}
+	writeBatchIdentityPredicate(&sql, identityColumns, "column_", len(setColumns))
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
 	return true, replay.queue(sql.String(), nil, applyExpectation{
 		relation: relation, kind: ChangeUpdate,
@@ -2444,14 +2485,7 @@ func applyUpdateValueChunk(
 		fmt.Fprintf(&sql, ",identity_%d", i)
 	}
 	sql.WriteString(") WHERE ")
-	for i, column := range identityColumns {
-		if i != 0 {
-			sql.WriteString(" AND ")
-		}
-		sql.WriteString("pgmigrate_target.")
-		sql.WriteString(column.quoted)
-		fmt.Fprintf(&sql, "=pgmigrate_batch.identity_%d", i)
-	}
+	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
 	return replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeUpdate,
@@ -2543,14 +2577,7 @@ func applyUpdateArrayChunk(
 		sql.WriteByte(',')
 	}
 	sql.WriteString("ordinal) WHERE ")
-	for i, column := range identityColumns {
-		if i != 0 {
-			sql.WriteString(" AND ")
-		}
-		sql.WriteString("pgmigrate_target.")
-		sql.WriteString(column.quoted)
-		fmt.Fprintf(&sql, "=pgmigrate_batch.identity_%d", i)
-	}
+	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal - 1")
 	return true, replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeUpdate,
@@ -2783,14 +2810,7 @@ func applyDeleteTextStage(
 	sql.WriteString(" AS pgmigrate_target USING ")
 	sql.WriteString(stage)
 	sql.WriteString(" AS pgmigrate_batch WHERE ")
-	for i, column := range identityColumns {
-		if i != 0 {
-			sql.WriteString(" AND ")
-		}
-		sql.WriteString("pgmigrate_target.")
-		sql.WriteString(column.quoted)
-		fmt.Fprintf(&sql, "=pgmigrate_batch.column_%d", i)
-	}
+	writeBatchIdentityPredicate(&sql, identityColumns, "column_", 0)
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
 	return true, replay.queue(sql.String(), nil, applyExpectation{
 		relation: relation, kind: ChangeDelete,
@@ -2832,14 +2852,7 @@ func applyDeleteValueChunk(
 		fmt.Fprintf(&sql, ",identity_%d", i)
 	}
 	sql.WriteString(") WHERE ")
-	for i, column := range identityColumns {
-		if i != 0 {
-			sql.WriteString(" AND ")
-		}
-		sql.WriteString("pgmigrate_target.")
-		sql.WriteString(column.quoted)
-		fmt.Fprintf(&sql, "=pgmigrate_batch.identity_%d", i)
-	}
+	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
 	return replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeDelete,
@@ -2888,14 +2901,7 @@ func applyDeleteArrayChunk(
 		fmt.Fprintf(&sql, "identity_%d", i)
 	}
 	sql.WriteString(",ordinal) WHERE ")
-	for i, column := range identityColumns {
-		if i != 0 {
-			sql.WriteString(" AND ")
-		}
-		sql.WriteString("pgmigrate_target.")
-		sql.WriteString(column.quoted)
-		fmt.Fprintf(&sql, "=pgmigrate_batch.identity_%d", i)
-	}
+	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal - 1")
 	return true, replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeDelete,

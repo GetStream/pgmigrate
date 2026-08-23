@@ -136,6 +136,34 @@ func TestApplyPredicateStaysIndexableOnNotNullColumns(t *testing.T) {
 	}
 }
 
+func TestBatchIdentityPredicateUsesExactBTreeRowBounds(t *testing.T) {
+	t.Parallel()
+	columns := []targetColumn{
+		{quoted: `"app_pk"`, notNull: true},
+		{quoted: `"user_id"`, notNull: true},
+		{quoted: `"channel_cid"`, notNull: true},
+	}
+	var sql strings.Builder
+	writeBatchIdentityPredicate(&sql, columns, "identity_", 2)
+	want := `ROW(pgmigrate_target."app_pk",pgmigrate_target."user_id",pgmigrate_target."channel_cid")>=` +
+		`ROW(pgmigrate_batch.identity_2,pgmigrate_batch.identity_3,pgmigrate_batch.identity_4) AND ` +
+		`ROW(pgmigrate_target."app_pk",pgmigrate_target."user_id",pgmigrate_target."channel_cid")<=` +
+		`ROW(pgmigrate_batch.identity_2,pgmigrate_batch.identity_3,pgmigrate_batch.identity_4)`
+	if got := sql.String(); got != want {
+		t.Fatalf("predicate = %q, want %q", got, want)
+	}
+}
+
+func TestBatchIdentityPredicateKeepsSingleColumnEquality(t *testing.T) {
+	t.Parallel()
+	var sql strings.Builder
+	writeBatchIdentityPredicate(&sql, []targetColumn{{quoted: `"id"`, notNull: true}}, "column_", 7)
+	want := `pgmigrate_target."id"=pgmigrate_batch.column_7`
+	if got := sql.String(); got != want {
+		t.Fatalf("predicate = %q, want %q", got, want)
+	}
+}
+
 // TestApplyPreparationDistinguishesNullFromEmpty guards the bind-parameter
 // contract: nil means SQL NULL and non-nil zero-length means a zero-length
 // value. Inferring nullness from the data pointer applied every empty string as
