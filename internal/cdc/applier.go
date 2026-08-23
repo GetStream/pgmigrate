@@ -424,6 +424,7 @@ func (a *Applier) resolveEndPosition(requested, durable LSN) (LSN, error) {
 type targetRelation struct {
 	source           Relation
 	quoted           string
+	heapBytes        int64
 	columns          []targetColumn
 	mappedColumns    []targetColumn
 	generatedColumns []targetColumn
@@ -980,7 +981,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		             AND (index_row.indisunique OR index_row.indisexclusion)
 		             AND (index_row.indexprs IS NOT NULL OR index_row.indpred IS NOT NULL)
 		         ) AS set_dml_safe,
-		       t.oid < 16384 AS built_in_type
+		       t.oid < 16384 AS built_in_type,
+		       pg_catalog.pg_relation_size(c.oid) AS heap_bytes
 		FROM pg_catalog.pg_attribute a
 		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -1007,10 +1009,11 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 	for rows.Next() {
 		var column targetColumn
 		var setDMLSafe, builtIn, selectiveUpdates bool
+		var heapBytes int64
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
 			&column.generated, &column.notNull, &column.conflicting,
-			&selectiveUpdates, &setDMLSafe, &builtIn,
+			&selectiveUpdates, &setDMLSafe, &builtIn, &heapBytes,
 		); err != nil {
 			return nil, err
 		}
@@ -1019,6 +1022,7 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		result.capabilities.binaryCopy = result.capabilities.binaryCopy && setDMLSafe && builtIn
 		result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe
 		hasSelectiveUpdates = hasSelectiveUpdates || selectiveUpdates
+		result.heapBytes = heapBytes
 		if column.identity == "a" {
 			result.overrideIdentity = true
 		}
@@ -1865,7 +1869,11 @@ func applyInserts(replay *applyPipeline, relation *targetRelation, changes []Cha
 	return nil
 }
 
-const applyArrayChunkRows = 8192
+const (
+	applyArrayChunkRows          = 8192
+	applySelectiveProbeChunkRows = 512
+	selectiveBitmapMinHeapBytes  = 1 << 30
+)
 
 func applyInsertCopy(
 	replay *applyPipeline,
@@ -2164,6 +2172,9 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 		chunkRows := applyArrayChunkRows
 		if relation.capabilities.selectiveUpdates {
 			chunkRows = updateChunkRows(len(setColumns) + len(identityColumns))
+			if relation.heapBytes >= selectiveBitmapMinHeapBytes && chunkRows > applySelectiveProbeChunkRows {
+				chunkRows = applySelectiveProbeChunkRows
+			}
 		}
 		seen := map[string]struct{}{firstKey: {}}
 		end := start + 1
@@ -2310,6 +2321,115 @@ func selectiveIdentityParams(
 	return params, true, nil
 }
 
+func appendSelectiveIdentityScalarParams(
+	params []rawParam,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	changes []Change,
+) ([]rawParam, [][]int, error) {
+	positions := make([][]int, len(changes))
+	for row := range changes {
+		predicate := changes[row].Old
+		if predicate == nil {
+			predicate = changes[row].New
+		}
+		positions[row] = make([]int, len(identityColumns))
+		for i, column := range identityColumns {
+			param, err := datumParamForColumn(
+				relation, column, (*predicate)[column.sourceIndex], ChangeUpdate,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+			params = append(params, param)
+			positions[row][i] = len(params)
+		}
+	}
+	return params, positions, nil
+}
+
+// writeSelectiveTargetRowsCTE forces PostgreSQL to collect all exact
+// replica-identity matches into a bitmap before it touches the heap. A nested
+// loop issues one synchronous random heap read per WAL row, which is
+// catastrophic when a restored table is much larger than cache. BitmapOr keeps
+// the same primary-key predicates but visits matching heap pages physically.
+func writeSelectiveTargetRowsCTE(
+	sql *strings.Builder,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+	identityParamPositions [][]int,
+) {
+	sql.WriteString("WITH pgmigrate_target_rows AS MATERIALIZED (SELECT ")
+	selected := make(map[string]struct{}, len(setColumns)+len(identityColumns))
+	written := 0
+	writeColumn := func(column targetColumn) {
+		if _, exists := selected[column.name]; exists {
+			return
+		}
+		selected[column.name] = struct{}{}
+		if written != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString("pgmigrate_bitmap_target.")
+		sql.WriteString(column.quoted)
+		written++
+	}
+	for _, columnIndex := range setColumns {
+		writeColumn(relation.columns[columnIndex])
+	}
+	for _, column := range identityColumns {
+		writeColumn(column)
+	}
+	sql.WriteString(" FROM ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_bitmap_target WHERE ")
+	for row, positions := range identityParamPositions {
+		if row != 0 {
+			sql.WriteString(" OR ")
+		}
+		sql.WriteByte('(')
+		writeSelectiveIdentityBound(sql, identityColumns, positions, ">=")
+		sql.WriteString(" AND ")
+		writeSelectiveIdentityBound(sql, identityColumns, positions, "<=")
+		sql.WriteByte(')')
+	}
+	sql.WriteString(") ")
+}
+
+func writeSelectiveIdentityBound(
+	sql *strings.Builder,
+	identityColumns []targetColumn,
+	paramPositions []int,
+	operator string,
+) {
+	if len(identityColumns) == 1 {
+		sql.WriteString("pgmigrate_bitmap_target.")
+		sql.WriteString(identityColumns[0].quoted)
+		sql.WriteString(operator)
+		fmt.Fprintf(sql, "$%d", paramPositions[0])
+		return
+	}
+	sql.WriteString("ROW(")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString("pgmigrate_bitmap_target.")
+		sql.WriteString(column.quoted)
+	}
+	sql.WriteString(")")
+	sql.WriteString(operator)
+	sql.WriteString("ROW(")
+	for i, position := range paramPositions {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(sql, "$%d", position)
+	}
+	sql.WriteByte(')')
+}
+
 func inspectSelectiveUpdateMasks(
 	replay *applyPipeline,
 	relation *targetRelation,
@@ -2345,21 +2465,36 @@ func inspectSelectiveUpdateMasks(
 		)
 	}
 	params = append(params, identityParams...)
+	batchParamCount := len(params)
 	var sql strings.Builder
+	targetRows := relation.quoted
+	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+		var identityParamPositions [][]int
+		params, identityParamPositions, err = appendSelectiveIdentityScalarParams(
+			params, relation, identityColumns, changes,
+		)
+		if err != nil {
+			return nil, err
+		}
+		writeSelectiveTargetRowsCTE(
+			&sql, relation, identityColumns, setColumns, identityParamPositions,
+		)
+		targetRows = "pgmigrate_target_rows"
+	}
 	sql.WriteString("SELECT pgmigrate_batch.ordinal - 1")
 	for i, columnIndex := range setColumns {
 		sql.WriteString(",(pgmigrate_target.")
 		sql.WriteString(relation.columns[columnIndex].quoted)
 		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
 	}
-	sql.WriteString(" FROM (SELECT * FROM unnest(")
-	for i := range params {
+	sql.WriteString(" FROM unnest(")
+	for i := 0; i < batchParamCount; i++ {
 		if i != 0 {
 			sql.WriteByte(',')
 		}
 		fmt.Fprintf(&sql, "$%d", i+1)
 	}
-	sql.WriteString(") WITH ORDINALITY AS pgmigrate_unsorted(")
+	sql.WriteString(") WITH ORDINALITY AS pgmigrate_batch(")
 	for i := range setColumns {
 		if i != 0 {
 			sql.WriteByte(',')
@@ -2372,11 +2507,8 @@ func inspectSelectiveUpdateMasks(
 		}
 		fmt.Fprintf(&sql, "identity_%d", i)
 	}
-	sql.WriteString(",ordinal) ORDER BY ")
-	writeBatchIdentityOrder(&sql, identityColumns, "identity_", 0)
-	sql.WriteString(" OFFSET 0")
-	sql.WriteString(") AS pgmigrate_batch JOIN ")
-	sql.WriteString(relation.quoted)
+	sql.WriteString(",ordinal) JOIN ")
+	sql.WriteString(targetRows)
 	sql.WriteString(" AS pgmigrate_target ON ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
 	masks := make([][]int, len(changes))
@@ -2428,25 +2560,6 @@ func inspectSelectiveUpdateMasks(
 	return masks, nil
 }
 
-// writeBatchIdentityOrder makes target lookups follow replica-identity order.
-// A restored table is substantially clustered by the COPY part key, while WAL
-// arrival order is effectively random. Sorting the small in-memory batch avoids
-// turning one comparison chunk into thousands of serial random heap reads. The
-// ordinal still carries source order into the result and subsequent DML.
-func writeBatchIdentityOrder(
-	sql *strings.Builder,
-	identityColumns []targetColumn,
-	batchColumnPrefix string,
-	batchColumnOffset int,
-) {
-	for i := range identityColumns {
-		if i != 0 {
-			sql.WriteByte(',')
-		}
-		fmt.Fprintf(sql, "pgmigrate_unsorted.%s%d", batchColumnPrefix, batchColumnOffset+i)
-	}
-}
-
 func inspectSelectiveUpdateMasksValues(
 	replay *applyPipeline,
 	relation *targetRelation,
@@ -2455,19 +2568,13 @@ func inspectSelectiveUpdateMasksValues(
 	changes []Change,
 ) ([][]int, error) {
 	params := make([]rawParam, 0, len(changes)*(len(setColumns)+len(identityColumns)))
-	var sql strings.Builder
-	sql.WriteString("SELECT pgmigrate_batch.ordinal")
-	for i, columnIndex := range setColumns {
-		sql.WriteString(",(pgmigrate_target.")
-		sql.WriteString(relation.columns[columnIndex].quoted)
-		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
-	}
-	sql.WriteString(" FROM (SELECT * FROM (VALUES ")
+	identityParamPositions := make([][]int, len(changes))
+	var values strings.Builder
 	for row := range changes {
 		if row != 0 {
-			sql.WriteByte(',')
+			values.WriteByte(',')
 		}
-		fmt.Fprintf(&sql, "(%d", row)
+		fmt.Fprintf(&values, "(%d", row)
 		for _, columnIndex := range setColumns {
 			column := relation.columns[columnIndex]
 			param, err := datumParam(
@@ -2477,13 +2584,14 @@ func inspectSelectiveUpdateMasksValues(
 				return nil, err
 			}
 			params = append(params, param)
-			fmt.Fprintf(&sql, ",$%d", len(params))
+			fmt.Fprintf(&values, ",$%d", len(params))
 		}
 		predicate := changes[row].Old
 		if predicate == nil {
 			predicate = changes[row].New
 		}
-		for _, column := range identityColumns {
+		identityParamPositions[row] = make([]int, len(identityColumns))
+		for i, column := range identityColumns {
 			param, err := datumParamForColumn(
 				relation, column, (*predicate)[column.sourceIndex], ChangeUpdate,
 			)
@@ -2491,22 +2599,36 @@ func inspectSelectiveUpdateMasksValues(
 				return nil, err
 			}
 			params = append(params, param)
-			fmt.Fprintf(&sql, ",$%d", len(params))
+			identityParamPositions[row][i] = len(params)
+			fmt.Fprintf(&values, ",$%d", len(params))
 		}
-		sql.WriteByte(')')
+		values.WriteByte(')')
 	}
-	sql.WriteString(") AS pgmigrate_unsorted(ordinal")
+	var sql strings.Builder
+	targetRows := relation.quoted
+	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+		writeSelectiveTargetRowsCTE(
+			&sql, relation, identityColumns, setColumns, identityParamPositions,
+		)
+		targetRows = "pgmigrate_target_rows"
+	}
+	sql.WriteString("SELECT pgmigrate_batch.ordinal")
+	for i, columnIndex := range setColumns {
+		sql.WriteString(",(pgmigrate_target.")
+		sql.WriteString(relation.columns[columnIndex].quoted)
+		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
+	}
+	sql.WriteString(" FROM (VALUES ")
+	sql.WriteString(values.String())
+	sql.WriteString(") AS pgmigrate_batch(ordinal")
 	for i := range setColumns {
 		fmt.Fprintf(&sql, ",set_%d", i)
 	}
 	for i := range identityColumns {
 		fmt.Fprintf(&sql, ",identity_%d", i)
 	}
-	sql.WriteString(") ORDER BY ")
-	writeBatchIdentityOrder(&sql, identityColumns, "identity_", 0)
-	sql.WriteString(" OFFSET 0")
-	sql.WriteString(") AS pgmigrate_batch JOIN ")
-	sql.WriteString(relation.quoted)
+	sql.WriteString(") JOIN ")
+	sql.WriteString(targetRows)
 	sql.WriteString(" AS pgmigrate_target ON ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
 	return queueSelectiveUpdateInspection(

@@ -953,8 +953,11 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Force the scalar VALUES inspection transport used when a real target
-		// column has no usable array parameter representation.
+		// column has no usable array parameter representation, and the bitmap
+		// heap path used by a target relation too large to remain cached.
+		otherArrayOID := targetRelation.columns[2].arrayOID
 		targetRelation.columns[2].arrayOID = 0
+		targetRelation.heapBytes = selectiveBitmapMinHeapBytes
 		if _, err := conn.Exec(ctx, `
 			INSERT INTO public.pipeline_selective_update
 				(id, indexed_value, other_value, unique_a, unique_b)
@@ -1006,6 +1009,28 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}
 		if uniqueValues != "c-new:d-new" {
 			t.Fatalf("selective unique values=%q", uniqueValues)
+		}
+		// Restore the array transport and exercise the same bitmap target lookup
+		// through its compact unnest input.
+		targetRelation.columns[2].arrayOID = otherArrayOID
+		arrayTransaction := Transaction{
+			CommitLSN: 412, EndLSN: 413, Relations: []Relation{source},
+			Changes: []Change{{
+				RelationOID: source.OID, Kind: ChangeUpdate,
+				Old: tuple(text("1"), text("indexed-old"), text("other-new"), text("a"), text("b")),
+				New: tuple(text("1"), text("indexed-old"), text("other-array"), text("a"), text("b")),
+			}},
+		}
+		if err := apply("pipeline-selective-update-array", &arrayTransaction); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.QueryRow(ctx, `
+			SELECT other_value FROM public.pipeline_selective_update WHERE id = 1
+		`).Scan(&values); err != nil {
+			t.Fatal(err)
+		}
+		if values != "other-array" {
+			t.Fatalf("selective array value=%q", values)
 		}
 		if _, err := conn.Exec(ctx, "SELECT pg_stat_force_next_flush()"); err != nil {
 			t.Fatal(err)
