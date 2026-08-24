@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	replayClaimPlanVersion        = 3
+	replayClaimPlanVersion        = 4
 	replayClaimMinimumPlanVersion = 2
 	replayClaimTable              = "pgmigrate_internal.cdc_replay_claims"
 	replayClaimWorkTable          = "pgmigrate_internal.cdc_replay_claim_work"

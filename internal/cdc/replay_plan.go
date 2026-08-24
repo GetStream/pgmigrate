@@ -368,7 +368,24 @@ func replayChangeKeyForVersion(
 	if planVersion == 2 {
 		return replayChangeKeyV2(relation, relationFingerprint, change)
 	}
+	if planVersion == 3 {
+		return replayChangeKeyV3(relation, relationFingerprint, change)
+	}
 	return replayChangeKey(relation, relationFingerprint, change)
+}
+
+// replayChangeKeyV3 freezes the stricter plan-v3 relation-lane admission.
+// Plan v4 may classify a built-in CHECK or partial UNIQUE index as local to one
+// ordered relation lane, but an active v3 claim must retain its exact barriers.
+func replayChangeKeyV3(
+	relation *targetRelation,
+	relationFingerprint [sha256.Size]byte,
+	change *Change,
+) ([sha256.Size]byte, bool, error) {
+	return replayChangeKeyWithOrderedLane(
+		relation, relationFingerprint, change,
+		relation != nil && relation.capabilities.relationOrderedLaneV3,
+	)
 }
 
 // replayChangeKeyV2 reconstructs claims written by v58 exactly. Keep this
@@ -452,7 +469,19 @@ func replayChangeKey(
 	relationFingerprint [sha256.Size]byte,
 	change *Change,
 ) ([sha256.Size]byte, bool, error) {
-	if relation == nil || change == nil || !relation.capabilities.relationOrderedLane {
+	return replayChangeKeyWithOrderedLane(
+		relation, relationFingerprint, change,
+		relation != nil && relation.capabilities.relationOrderedLane,
+	)
+}
+
+func replayChangeKeyWithOrderedLane(
+	relation *targetRelation,
+	relationFingerprint [sha256.Size]byte,
+	change *Change,
+	orderedLane bool,
+) ([sha256.Size]byte, bool, error) {
+	if relation == nil || change == nil || !orderedLane {
 		return [sha256.Size]byte{}, false, nil
 	}
 	if !replayLanePayloadSafe(relation, change) {
@@ -479,14 +508,14 @@ func replayChangeKey(
 		return [sha256.Size]byte{}, false, nil
 	}
 
-	// A non-primary UNIQUE/exclusion index can make different primary-key rows
+	// A non-primary UNIQUE index can make different primary-key rows
 	// conflict, and some otherwise-side-effect-free relations do not expose a
 	// canonical primary key at all. Give every such write the same table key.
 	// This serializes that table in source order while still allowing unrelated
 	// tables to run concurrently. Multi-table source transactions carry every
 	// relation key and are unioned atomically by the component planner.
 	if !relation.capabilities.relationLane || relation.capabilities.crossKeyConflicts {
-		return replayRelationLaneKey(relation, relationFingerprint)
+		return replayRelationLaneKeyWithAdmission(relation, relationFingerprint, orderedLane)
 	}
 
 	primary := primaryKeyColumns(relation)
@@ -506,12 +535,12 @@ func replayChangeKey(
 		// make two primary-key rows conflict, so they must not create a global
 		// serial barrier.
 		if !canShardUpdateByPrimaryKey(relation, change) {
-			return replayRelationLaneKey(relation, relationFingerprint)
+			return replayRelationLaneKeyWithAdmission(relation, relationFingerprint, orderedLane)
 		}
 	case ChangeDelete:
 		deletePrimary, safe := primaryKeyDeleteColumns(relation)
 		if !safe || !sameTargetColumns(primary, deletePrimary) {
-			return replayRelationLaneKey(relation, relationFingerprint)
+			return replayRelationLaneKeyWithAdmission(relation, relationFingerprint, orderedLane)
 		}
 	}
 	if tuple == nil {
@@ -544,7 +573,18 @@ func replayRelationLaneKey(
 	relation *targetRelation,
 	relationFingerprint [sha256.Size]byte,
 ) ([sha256.Size]byte, bool, error) {
-	if relation == nil || !relation.capabilities.relationOrderedLane {
+	return replayRelationLaneKeyWithAdmission(
+		relation, relationFingerprint,
+		relation != nil && relation.capabilities.relationOrderedLane,
+	)
+}
+
+func replayRelationLaneKeyWithAdmission(
+	relation *targetRelation,
+	relationFingerprint [sha256.Size]byte,
+	orderedLane bool,
+) ([sha256.Size]byte, bool, error) {
+	if relation == nil || !orderedLane {
 		return [sha256.Size]byte{}, false, nil
 	}
 	hasher := newReplayClaimHasher("pgmigrate-replay-relation-lane-v1")
@@ -786,7 +826,11 @@ func targetRelationReplayFingerprintVersion(
 	writeReplayHashBool(hasher, relation.overrideIdentity)
 	writeReplayHashBool(hasher, relation.capabilities.relationLane)
 	if planVersion >= 3 {
-		writeReplayHashBool(hasher, relation.capabilities.relationOrderedLane)
+		if planVersion == 3 {
+			writeReplayHashBool(hasher, relation.capabilities.relationOrderedLaneV3)
+		} else {
+			writeReplayHashBool(hasher, relation.capabilities.relationOrderedLane)
+		}
 		writeReplayHashBool(hasher, relation.capabilities.primaryKeyArbiter)
 	}
 	writeReplayHashBool(hasher, relation.capabilities.keyedSetDML)

@@ -554,10 +554,14 @@ type targetRelationCapabilities struct {
 	// relationLane permits hashing independent primary-key rows across target
 	// sessions. relationOrderedLane is the strictly weaker guarantee that every
 	// write for this relation may share one relation-scoped lane. The latter
-	// keeps non-PK UNIQUE/exclusion conflicts and tables without a canonical PK
+	// keeps non-PK UNIQUE conflicts and tables without a canonical PK
 	// in source order without turning them into a global replay barrier.
 	relationLane        bool
 	relationOrderedLane bool
+	// relationOrderedLaneV3 freezes the stricter plan-v3 catalog admission so
+	// an active v3 claim reconstructs exactly after a rolling binary restart.
+	// Plan v4 separates relation-local ordering from set-DML transport safety.
+	relationOrderedLaneV3 bool
 	// primaryKeyArbiter is true only when PostgreSQL can use the target primary
 	// key as an ON CONFLICT arbiter. DEFERRABLE primary keys still identify rows
 	// and order replay safely, but PostgreSQL rejects them as conflict arbiters.
@@ -567,7 +571,8 @@ type targetRelationCapabilities struct {
 	textCopyStage     bool
 	selectiveUpdates  bool
 	// crossKeyConflicts is true when distinct primary-key rows can conflict
-	// through an ordinary non-primary UNIQUE or exclusion index. Such a relation
+	// through an ordinary non-primary UNIQUE index. Relations with exclusion
+	// indexes remain global replay barriers. A cross-key UNIQUE relation
 	// remains safe for set DML inside one target transaction, but is not eligible
 	// for primary-key-sharded target transactions.
 	crossKeyConflicts bool
@@ -1182,6 +1187,244 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		           AND (cross_key_index.indisunique OR cross_key_index.indisexclusion)
 		           AND NOT cross_key_index.indisprimary
 		       ) AS cross_key_conflicts,
+		       c.relkind = 'r'
+		       AND c.relpersistence = 'p'
+		       AND NOT c.relhassubclass
+		       AND NOT c.relispartition
+		       AND NOT c.relrowsecurity
+		       AND NOT c.relforcerowsecurity
+		       AND c.relam = (
+		         SELECT heap_am.oid FROM pg_catalog.pg_am heap_am WHERE heap_am.amname = 'heap'
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_trigger trigger_row
+		         WHERE trigger_row.tgrelid = c.oid AND trigger_row.tgenabled IN ('R', 'A')
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_rewrite rule_row
+		         WHERE rule_row.ev_class = c.oid
+		           AND rule_row.rulename <> '_RETURN'
+		           AND rule_row.ev_enabled IN ('R', 'A')
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1
+		         FROM pg_catalog.pg_constraint check_constraint
+		         CROSS JOIN LATERAL regexp_matches(
+		           check_constraint.conbin::text,
+		           '\{([A-Z][A-Z0-9_]*)[[:space:]]',
+		           'g'
+		         ) AS node_match
+		         WHERE check_constraint.conrelid = c.oid
+		           AND check_constraint.contype = 'c'
+		           AND node_match[1] <> ALL (ARRAY[
+		             'ARRAYEXPR',
+		             'BOOLEXPR',
+		             'CONST',
+		             'FUNCEXPR',
+		             'NULLTEST',
+		             'OPEXPR',
+		             'RELABELTYPE',
+		             'SCALARARRAYOPEXPR',
+		             'VAR'
+		           ])
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1
+		         FROM pg_catalog.pg_constraint check_constraint
+		         CROSS JOIN LATERAL regexp_matches(
+		           check_constraint.conbin::text,
+		           ':([a-z_]*funcid) ([0-9]+)',
+		           'g'
+		         ) AS function_match
+		         JOIN pg_catalog.pg_proc check_function
+		           ON check_function.oid = function_match[2]::oid
+		         JOIN pg_catalog.pg_namespace check_function_namespace
+		           ON check_function_namespace.oid = check_function.pronamespace
+		         WHERE check_constraint.conrelid = c.oid
+		           AND check_constraint.contype = 'c'
+		           AND function_match[2]::oid <> 0
+		           AND (
+		             check_function.oid >= 16384
+		             OR
+		             check_function_namespace.nspname <> 'pg_catalog'
+		             OR check_function.provolatile <> 'i'
+		           )
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1
+		         FROM pg_catalog.pg_constraint check_constraint
+		         JOIN pg_catalog.pg_depend check_dependency
+		           ON check_dependency.classid = 'pg_catalog.pg_constraint'::regclass
+		          AND check_dependency.objid = check_constraint.oid
+		         LEFT JOIN pg_catalog.pg_operator check_operator
+		           ON check_dependency.refclassid = 'pg_catalog.pg_operator'::regclass
+		          AND check_operator.oid = check_dependency.refobjid
+		         LEFT JOIN pg_catalog.pg_namespace check_operator_namespace
+		           ON check_operator_namespace.oid = check_operator.oprnamespace
+		         LEFT JOIN pg_catalog.pg_collation check_collation
+		           ON check_dependency.refclassid = 'pg_catalog.pg_collation'::regclass
+		          AND check_collation.oid = check_dependency.refobjid
+		         LEFT JOIN pg_catalog.pg_namespace check_collation_namespace
+		           ON check_collation_namespace.oid = check_collation.collnamespace
+		         LEFT JOIN pg_catalog.pg_type check_type
+		           ON check_dependency.refclassid = 'pg_catalog.pg_type'::regclass
+		          AND check_type.oid = check_dependency.refobjid
+		         WHERE check_constraint.conrelid = c.oid
+		           AND check_constraint.contype = 'c'
+		           AND (
+		             (
+		               check_dependency.refclassid = 'pg_catalog.pg_class'::regclass
+		               AND check_dependency.refobjid <> c.oid
+		             )
+		             OR (
+		               check_dependency.refclassid = 'pg_catalog.pg_operator'::regclass
+		               AND (
+		                 check_operator.oid >= 16384
+		                 OR check_operator_namespace.nspname <> 'pg_catalog'
+		               )
+		             )
+		             OR (
+		               check_dependency.refclassid = 'pg_catalog.pg_collation'::regclass
+		               AND NOT check_collation.collisdeterministic
+		             )
+		             OR (
+		               check_dependency.refclassid = 'pg_catalog.pg_type'::regclass
+		               AND check_type.oid >= 16384
+		               AND check_type.typtype <> 'e'
+		             )
+		             OR check_dependency.refclassid NOT IN (
+		               'pg_catalog.pg_class'::regclass,
+		               'pg_catalog.pg_proc'::regclass,
+		               'pg_catalog.pg_operator'::regclass,
+		               'pg_catalog.pg_collation'::regclass,
+		               'pg_catalog.pg_type'::regclass
+		             )
+		           )
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_attribute generated_attribute
+		         WHERE generated_attribute.attrelid = c.oid
+		           AND generated_attribute.attnum > 0
+		           AND NOT generated_attribute.attisdropped
+		           AND generated_attribute.attgenerated <> ''
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_index exclusion_index
+		         WHERE exclusion_index.indrelid = c.oid
+		           AND exclusion_index.indisexclusion
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1
+		         FROM pg_catalog.pg_index maintained_index
+		         JOIN LATERAL unnest(
+		           maintained_index.indclass::oid[],
+		           maintained_index.indcollation::oid[]
+		         ) WITH ORDINALITY
+		           AS maintained_entry(opclass_oid, collation_oid, ordinality) ON
+		             maintained_entry.ordinality <= maintained_index.indnkeyatts
+		         JOIN pg_catalog.pg_opclass maintained_opclass
+		           ON maintained_opclass.oid = maintained_entry.opclass_oid
+		         JOIN pg_catalog.pg_namespace maintained_opclass_namespace
+		           ON maintained_opclass_namespace.oid = maintained_opclass.opcnamespace
+		         LEFT JOIN pg_catalog.pg_collation maintained_collation
+		           ON maintained_collation.oid = maintained_entry.collation_oid
+		         LEFT JOIN pg_catalog.pg_namespace maintained_collation_namespace
+		           ON maintained_collation_namespace.oid = maintained_collation.collnamespace
+		         WHERE maintained_index.indrelid = c.oid
+		           AND (
+		             (
+		               (
+		                 maintained_opclass.oid >= 16384
+		                 OR maintained_opclass_namespace.nspname <> 'pg_catalog'
+		               )
+		               AND NOT EXISTS (
+		                 SELECT 1
+		                 FROM pg_catalog.pg_depend extension_dependency
+		                 JOIN pg_catalog.pg_extension trusted_extension
+		                   ON extension_dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+		                  AND trusted_extension.oid = extension_dependency.refobjid
+		                 WHERE extension_dependency.classid = 'pg_catalog.pg_opclass'::regclass
+		                   AND extension_dependency.objid = maintained_opclass.oid
+		                   AND extension_dependency.deptype = 'e'
+		                   AND trusted_extension.extname = 'btree_gin'
+		               )
+		             )
+		             OR (
+		               maintained_entry.collation_oid <> 0
+		               AND NOT maintained_collation.collisdeterministic
+		             )
+		           )
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1
+		         FROM pg_catalog.pg_index dependency_index
+		         JOIN pg_catalog.pg_depend dependency
+		           ON dependency.classid = 'pg_catalog.pg_class'::regclass
+		          AND dependency.objid = dependency_index.indexrelid
+		         LEFT JOIN pg_catalog.pg_proc dependency_function
+		           ON dependency.refclassid = 'pg_catalog.pg_proc'::regclass
+		          AND dependency_function.oid = dependency.refobjid
+		         LEFT JOIN pg_catalog.pg_namespace dependency_function_namespace
+		           ON dependency_function_namespace.oid = dependency_function.pronamespace
+		         LEFT JOIN pg_catalog.pg_operator dependency_operator
+		           ON dependency.refclassid = 'pg_catalog.pg_operator'::regclass
+		          AND dependency_operator.oid = dependency.refobjid
+		         LEFT JOIN pg_catalog.pg_namespace dependency_operator_namespace
+		           ON dependency_operator_namespace.oid = dependency_operator.oprnamespace
+		         LEFT JOIN pg_catalog.pg_collation dependency_collation
+		           ON dependency.refclassid = 'pg_catalog.pg_collation'::regclass
+		          AND dependency_collation.oid = dependency.refobjid
+		         LEFT JOIN pg_catalog.pg_type dependency_type
+		           ON dependency.refclassid = 'pg_catalog.pg_type'::regclass
+		          AND dependency_type.oid = dependency.refobjid
+		         LEFT JOIN pg_catalog.pg_ts_config dependency_ts_config
+		           ON dependency.refclassid = 'pg_catalog.pg_ts_config'::regclass
+		          AND dependency_ts_config.oid = dependency.refobjid
+		         WHERE dependency_index.indrelid = c.oid
+		           AND (
+		             (
+		               dependency_function.oid IS NOT NULL
+		               AND (
+		                 dependency_function.oid >= 16384
+		                 OR dependency_function_namespace.nspname <> 'pg_catalog'
+		               )
+		             )
+		             OR (
+		               dependency_operator.oid IS NOT NULL
+		               AND (
+		                 dependency_operator.oid >= 16384
+		                 OR dependency_operator_namespace.nspname <> 'pg_catalog'
+		               )
+		             )
+		             OR (
+		               dependency.refclassid = 'pg_catalog.pg_class'::regclass
+		               AND dependency.refobjid <> c.oid
+		             )
+		             OR (
+		               dependency.refclassid = 'pg_catalog.pg_collation'::regclass
+		               AND NOT dependency_collation.collisdeterministic
+		             )
+		             OR (
+		               dependency.refclassid = 'pg_catalog.pg_type'::regclass
+		               AND dependency_type.oid >= 16384
+		               AND dependency_type.typtype <> 'e'
+		             )
+		             OR (
+		               dependency.refclassid = 'pg_catalog.pg_ts_config'::regclass
+		               AND dependency_ts_config.oid >= 16384
+		             )
+		             OR dependency.refclassid NOT IN (
+		               'pg_catalog.pg_class'::regclass,
+		               'pg_catalog.pg_constraint'::regclass,
+		               'pg_catalog.pg_opclass'::regclass,
+		               'pg_catalog.pg_proc'::regclass,
+		               'pg_catalog.pg_operator'::regclass,
+		               'pg_catalog.pg_collation'::regclass,
+		               'pg_catalog.pg_type'::regclass,
+		               'pg_catalog.pg_ts_config'::regclass
+		             )
+		           )
+		       ) AS relation_ordered_lane_safe,
 		       c.relpersistence = 'p'
 		       AND NOT c.relhassubclass
 		       AND NOT c.relispartition
@@ -1269,7 +1512,7 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		               AND dependency_operator_namespace.nspname <> 'pg_catalog'
 		             )
 		           )
-		       ) AS relation_ordered_lane_safe,
+		       ) AS relation_ordered_lane_v3_safe,
 		       c.relkind = 'r'
 		         AND NOT c.relrowsecurity
 		         AND NOT c.relforcerowsecurity
@@ -1344,26 +1587,28 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		source: *source,
 		quoted: pgx.Identifier{source.Namespace, source.Name}.Sanitize(),
 		capabilities: targetRelationCapabilities{
-			relationLane:        true,
-			relationOrderedLane: true,
-			primaryKeyArbiter:   true,
-			keyedSetDML:         true,
-			binaryCopy:          true,
-			textCopyStage:       true,
+			relationLane:          true,
+			relationOrderedLane:   true,
+			relationOrderedLaneV3: true,
+			primaryKeyArbiter:     true,
+			keyedSetDML:           true,
+			binaryCopy:            true,
+			textCopyStage:         true,
 		},
 	}
 	hasSelectiveUpdates := false
 	for rows.Next() {
 		var column targetColumn
 		var replayKeyCatalogSafe, primaryKeyArbiter, setDMLSafe, builtIn, lanePayloadSafe bool
-		var selectiveUpdates, crossKeyConflicts, relationOrderedLaneSafe bool
+		var selectiveUpdates, crossKeyConflicts bool
+		var relationOrderedLaneSafe, relationOrderedLaneV3Safe bool
 		var heapBytes, heapBlocksRead, heapBlocksHit int64
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
 			&column.generated, &column.notNull, &column.primaryPos, &replayKeyCatalogSafe,
 			&primaryKeyArbiter,
 			&column.conflicting, &selectiveUpdates, &crossKeyConflicts,
-			&relationOrderedLaneSafe, &setDMLSafe,
+			&relationOrderedLaneSafe, &relationOrderedLaneV3Safe, &setDMLSafe,
 			&builtIn, &lanePayloadSafe, &heapBytes,
 			&heapBlocksRead, &heapBlocksHit,
 		); err != nil {
@@ -1374,6 +1619,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		// columns are intentionally skipped by the writable-column gates below.
 		result.capabilities.relationOrderedLane =
 			result.capabilities.relationOrderedLane && relationOrderedLaneSafe
+		result.capabilities.relationOrderedLaneV3 =
+			result.capabilities.relationOrderedLaneV3 && relationOrderedLaneV3Safe
 		result.capabilities.primaryKeyArbiter =
 			result.capabilities.primaryKeyArbiter && primaryKeyArbiter
 		// Generated columns are omitted from every target INSERT/UPDATE column
@@ -1384,10 +1631,13 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 			// but payload type input must also be free of user-defined side effects.
 			// Built-ins and enums (including enum arrays) satisfy that invariant;
 			// domains and arbitrary extension/base types retain serial source order.
-			laneSafe := setDMLSafe && lanePayloadSafe
-			result.capabilities.relationLane = result.capabilities.relationLane && laneSafe
+			setLaneSafe := setDMLSafe && lanePayloadSafe
+			result.capabilities.relationLane =
+				result.capabilities.relationLane && setLaneSafe
 			result.capabilities.relationOrderedLane =
-				result.capabilities.relationOrderedLane && laneSafe
+				result.capabilities.relationOrderedLane && lanePayloadSafe
+			result.capabilities.relationOrderedLaneV3 =
+				result.capabilities.relationOrderedLaneV3 && setLaneSafe
 			result.capabilities.keyedSetDML = result.capabilities.keyedSetDML && setDMLSafe
 			result.capabilities.binaryCopy = result.capabilities.binaryCopy && setDMLSafe && builtIn
 			result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe

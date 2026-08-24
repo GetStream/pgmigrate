@@ -256,14 +256,186 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 	}
 }
 
+func TestPG17ReplayClaimV3ReconstructsAfterV4CatalogTightening(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	control := target.Connect(t)
+	ctx := context.Background()
+	if _, err := control.Exec(ctx, `
+		CREATE FUNCTION pg_catalog.claim_v3_catalog_predicate(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> '';
+		CREATE TABLE public.claim_v3_items (
+			id text PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE INDEX claim_v3_items_partial
+			ON public.claim_v3_items (value)
+			WHERE pg_catalog.claim_v3_catalog_predicate(value)
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	const streamID = "plan-v3-catalog-resume"
+	const generation = "plan-v3-catalog-resume-v1"
+	if err := EnsureStreamProgressIdentity(ctx, control, StreamIdentityConfig{
+		StreamID: streamID, Generation: generation,
+		FreshSetup: true, TargetHasCopiedData: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureReplayClaimTables(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureApplySession(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+
+	relation := replayTestRelation(9_005, "claim_v3_items")
+	loaded, err := loadTargetRelation(ctx, control, &relation.source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.capabilities.relationLane || loaded.capabilities.relationOrderedLane ||
+		!loaded.capabilities.relationOrderedLaneV3 {
+		t.Fatalf("v3 compatibility fixture capabilities=%+v", loaded.capabilities)
+	}
+
+	const transactionCount = 64
+	transactions := make([]Transaction, transactionCount)
+	resolved := make([]map[uint32]*targetRelation, transactionCount)
+	for index := range transactions {
+		transactions[index] = replayTestTransaction(
+			LSN(4_000+index*2), relation,
+			Change{
+				RelationOID: relation.source.OID, Kind: ChangeInsert,
+				New: replayTuple(fmt.Sprintf("id-%03d-a", index), fmt.Sprintf("value-%03d-a", index)),
+			},
+			Change{
+				RelationOID: relation.source.OID, Kind: ChangeInsert,
+				New: replayTuple(fmt.Sprintf("id-%03d-b", index), fmt.Sprintf("value-%03d-b", index)),
+			},
+		)
+		resolved[index] = map[uint32]*targetRelation{relation.source.OID: loaded}
+	}
+	plan, err := buildReplayPlanForGenerationVersion(
+		streamID, generation, generation, 0, 8, transactions, resolved, 3,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Claim.PlanVersion != 3 || !plan.HasParallel || replayPlanHasSerialWork(plan) {
+		t.Fatalf("v3 compatibility fixture plan=%#v claim=%+v", plan.Steps, plan.Claim)
+	}
+	freshV4, err := buildReplayPlanForGenerationVersion(
+		streamID, generation, generation, 0, 8, transactions, resolved, 4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayPlanHasSerialWork(freshV4) {
+		t.Fatal("v4 did not tighten the custom pg_catalog index dependency")
+	}
+
+	claim, err := ensureReplayClaim(ctx, control, plan.Claim, plan.Works)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Claim = claim
+	workers, err := openApplyWorkers(
+		ctx, control, newApplyStatementCache(applyStatementCacheCapacity), target.URI, 4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	interrupted := errors.New("test: interrupt plan-v3 claim after one lane")
+	var committed atomic.Int32
+	first := &Applier{config: ApplierConfig{
+		StreamID: streamID, StreamGeneration: generation,
+		afterReplayWork: func(replayClaim, replayClaimWork) error {
+			if committed.Add(1) == 1 {
+				return interrupted
+			}
+			return nil
+		},
+	}}
+	if err := first.executeReplayPlan(
+		ctx, workers, plan, transactions, resolved,
+	); !errors.Is(err, interrupted) {
+		t.Fatalf("plan-v3 interruption=%v, want %v", err, interrupted)
+	}
+	closeApplyWorkers(workers[1:])
+	assertReplayProgress(t, control, streamID, 0, 0, 0)
+	for index := range transactions {
+		var pairRows int
+		if err := control.QueryRow(ctx, `
+			SELECT count(*) FROM public.claim_v3_items WHERE id IN ($1, $2)
+		`, fmt.Sprintf("id-%03d-a", index), fmt.Sprintf("id-%03d-b", index)).Scan(&pairRows); err != nil {
+			t.Fatal(err)
+		}
+		if pairRows != 0 && pairRows != 2 {
+			t.Fatalf("plan-v3 source transaction %d exposed %d/2 rows", index, pairRows)
+		}
+	}
+
+	reconstructed, err := buildReplayPlanForGenerationVersion(
+		streamID, generation, generation, 0, 8, transactions, resolved, 3,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayClaimsEqual(reconstructed.Claim, claim) ||
+		!slices.Equal(reconstructed.Works, plan.Works) {
+		t.Fatal("v4 binary did not reconstruct the exact active plan-version-3 claim")
+	}
+	reconstructed.Claim = claim
+	resumeControl, err := postgres.Connect(ctx, target.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumeControl.Close(context.Background())
+	if err := configureApplySession(ctx, resumeControl); err != nil {
+		t.Fatal(err)
+	}
+	resumeWorkers, err := openApplyWorkers(
+		ctx, resumeControl, newApplyStatementCache(applyStatementCacheCapacity), target.URI, 3,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeApplyWorkers(resumeWorkers[1:])
+	resumed := &Applier{config: ApplierConfig{StreamID: streamID, StreamGeneration: generation}}
+	if err := resumed.executeReplayPlan(
+		ctx, resumeWorkers, reconstructed, transactions, resolved,
+	); err != nil {
+		t.Fatal(err)
+	}
+	assertReplayProgress(
+		t, control, streamID, claim.EndLSN, transactionCount, transactionCount*2,
+	)
+	var rows int
+	if err := control.QueryRow(ctx, "SELECT count(*) FROM public.claim_v3_items").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != transactionCount*2 {
+		t.Fatalf("plan-v3 resumed rows=%d, want %d", rows, transactionCount*2)
+	}
+	if _, exists, err := readReplayClaim(ctx, control, streamID); err != nil || exists {
+		t.Fatalf("finalized plan-v3 claim exists=%t err=%v", exists, err)
+	}
+}
+
 func TestPG17ReplayClaimCommitsContiguousSerialWorkAndReceiptsAtomically(t *testing.T) {
 	target := pgtest.Start(t, 17)
 	control := target.Connect(t)
 	ctx := context.Background()
 	if _, err := control.Exec(ctx, `
+		CREATE FUNCTION public.serial_claim_check(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> '';
 		CREATE TABLE public.serial_claim_items (
 			id text PRIMARY KEY,
-			value text NOT NULL CHECK (value <> '')
+			value text NOT NULL CHECK (public.serial_claim_check(value))
 		)
 	`); err != nil {
 		t.Fatal(err)
@@ -289,8 +461,8 @@ func TestPG17ReplayClaimCommitsContiguousSerialWorkAndReceiptsAtomically(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.capabilities.relationLane {
-		t.Fatal("CHECK-constrained fixture unexpectedly admitted parallel replay")
+	if loaded.capabilities.relationLane || loaded.capabilities.relationOrderedLane {
+		t.Fatal("custom CHECK-constrained fixture unexpectedly admitted parallel replay")
 	}
 	const transactionCount = 128
 	transactions := make([]Transaction, transactionCount)

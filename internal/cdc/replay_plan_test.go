@@ -540,19 +540,63 @@ func TestReplayUpdateWithoutOldTupleRequiresReplicaIdentityPrimaryKey(t *testing
 	}
 }
 
-func TestReplayPlanV2FingerprintIgnoresV3RelationLaneCapability(t *testing.T) {
+func TestReplayPlanVersionedFingerprintFreezesRelationLaneCapability(t *testing.T) {
 	t.Parallel()
 	left := replayTestRelation(52, "compat_items")
 	right := replayTestRelation(52, "compat_items")
 	right.capabilities.relationOrderedLane = false
-	right.capabilities.primaryKeyArbiter = false
 	if targetRelationReplayFingerprintVersion(left, 2) !=
 		targetRelationReplayFingerprintVersion(right, 2) {
-		t.Fatal("plan v2 fingerprint included a plan v3 capability")
+		t.Fatal("plan v2 fingerprint included a newer relation-lane capability")
 	}
+	if targetRelationReplayFingerprintVersion(left, 3) !=
+		targetRelationReplayFingerprintVersion(right, 3) {
+		t.Fatal("plan v3 fingerprint included relaxed plan-v4 lane safety")
+	}
+	if targetRelationReplayFingerprintVersion(left, 4) ==
+		targetRelationReplayFingerprintVersion(right, 4) {
+		t.Fatal("plan v4 fingerprint omitted relaxed relation-lane safety")
+	}
+	right.capabilities.relationOrderedLaneV3 = false
 	if targetRelationReplayFingerprintVersion(left, 3) ==
 		targetRelationReplayFingerprintVersion(right, 3) {
-		t.Fatal("plan v3 fingerprint omitted relation-ordered lane safety")
+		t.Fatal("plan v3 fingerprint omitted its frozen lane safety")
+	}
+}
+
+func TestReplayPlanV4RelaxesOnlyRelationLocalOrdering(t *testing.T) {
+	t.Parallel()
+	relation := replayTestRelation(60, "checked_items")
+	relation.capabilities.relationLane = false
+	relation.capabilities.relationOrderedLane = true
+	relation.capabilities.relationOrderedLaneV3 = false
+	relation.capabilities.keyedSetDML = false
+	transaction := replayTestTransaction(540, relation, Change{
+		RelationOID: relation.source.OID, Kind: ChangeInsert, New: replayTuple("a", "one"),
+	})
+	resolved := []map[uint32]*targetRelation{{relation.source.OID: relation}}
+
+	legacy, err := buildReplayPlanForGenerationVersion(
+		"stream", "generation", "generation", 40, 8,
+		[]Transaction{transaction}, resolved, 3,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.Steps) != 1 || legacy.Steps[0].SerialTransaction != 0 {
+		t.Fatalf("plan v3 no longer reconstructs its strict barrier: %#v", legacy.Steps)
+	}
+
+	current, err := buildReplayPlanForGenerationVersion(
+		"stream", "generation", "generation", 40, 8,
+		[]Transaction{transaction}, resolved, 4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current.Steps) != 1 || current.Steps[0].SerialTransaction >= 0 ||
+		len(current.Steps[0].Lanes) != 1 {
+		t.Fatalf("plan v4 did not use one ordered relation lane: %#v", current.Steps)
 	}
 }
 
@@ -739,7 +783,7 @@ func replayTestRelation(oid uint32, name string) *targetRelation {
 	return &targetRelation{
 		source: source, quoted: `"public"."` + name + `"`,
 		capabilities: targetRelationCapabilities{
-			relationLane: true, relationOrderedLane: true,
+			relationLane: true, relationOrderedLane: true, relationOrderedLaneV3: true,
 			primaryKeyArbiter: true, keyedSetDML: true,
 			binaryCopy: true, textCopyStage: true,
 		},

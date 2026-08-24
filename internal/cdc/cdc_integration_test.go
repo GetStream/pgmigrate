@@ -934,6 +934,25 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			id integer PRIMARY KEY,
 			value text CHECK (value <> 'bad')
 		);
+		CREATE FUNCTION public.pipeline_custom_check(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> 'bad';
+		CREATE TABLE public.pipeline_custom_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (public.pipeline_custom_check(value))
+		);
+		CREATE TABLE public.pipeline_volatile_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (random() >= 0)
+		);
+		CREATE TABLE public.pipeline_sqlvalue_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (CURRENT_TIMESTAMP IS NOT NULL)
+		);
+		CREATE TABLE public.pipeline_io_cast_checked (
+			id integer PRIMARY KEY,
+			value text CHECK ((value::timestamptz) > '-infinity'::timestamptz)
+		);
 		CREATE TABLE public.pipeline_selective_update (
 			id integer PRIMARY KEY,
 			indexed_value text NOT NULL,
@@ -977,6 +996,31 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		CREATE INDEX pipeline_custom_index_partial
 			ON public.pipeline_custom_index (value)
 			WHERE public.pipeline_custom_index_predicate(value);
+		CREATE FUNCTION pg_catalog.pipeline_catalog_index_predicate(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> '';
+		CREATE TABLE public.pipeline_catalog_custom_index (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE INDEX pipeline_catalog_custom_index_partial
+			ON public.pipeline_catalog_custom_index (value)
+			WHERE pg_catalog.pipeline_catalog_index_predicate(value);
+		CREATE TABLE public.pipeline_index_domain_guard (enabled boolean NOT NULL);
+		INSERT INTO public.pipeline_index_domain_guard VALUES (true);
+		CREATE FUNCTION public.pipeline_index_domain_check(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> 'blocked'
+				AND (SELECT enabled FROM public.pipeline_index_domain_guard LIMIT 1);
+		CREATE DOMAIN public.pipeline_index_domain AS text
+			CHECK (public.pipeline_index_domain_check(VALUE));
+		CREATE TABLE public.pipeline_custom_type_index (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE UNIQUE INDEX pipeline_custom_type_index_expression
+			ON public.pipeline_custom_type_index
+			((value::public.pipeline_index_domain));
 		CREATE UNLOGGED TABLE public.pipeline_unlogged (
 			id integer PRIMARY KEY,
 			value text NOT NULL
@@ -1120,8 +1164,45 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if checked.capabilities.relationLane || checked.capabilities.relationOrderedLane {
-			t.Fatal("checked relation was eligible for relation-lane replay")
+		if checked.capabilities.relationLane || !checked.capabilities.relationOrderedLane ||
+			checked.capabilities.relationOrderedLaneV3 || checked.capabilities.keyedSetDML {
+			t.Fatalf("built-in checked relation capabilities=%+v", checked.capabilities)
+		}
+		customCheckedSource := relation(1205, "pipeline_custom_checked", 25)
+		customChecked, err := relationCache.resolve(ctx, conn, &customCheckedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if customChecked.capabilities.relationOrderedLane ||
+			customChecked.capabilities.relationOrderedLaneV3 {
+			t.Fatalf("custom checked relation capabilities=%+v", customChecked.capabilities)
+		}
+		volatileCheckedSource := relation(1206, "pipeline_volatile_checked", 25)
+		volatileChecked, err := relationCache.resolve(ctx, conn, &volatileCheckedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if volatileChecked.capabilities.relationOrderedLane ||
+			volatileChecked.capabilities.relationOrderedLaneV3 {
+			t.Fatalf("volatile checked relation capabilities=%+v", volatileChecked.capabilities)
+		}
+		sqlValueCheckedSource := relation(1207, "pipeline_sqlvalue_checked", 25)
+		sqlValueChecked, err := relationCache.resolve(
+			ctx, conn, &sqlValueCheckedSource, loadTargetRelation,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sqlValueChecked.capabilities.relationOrderedLane {
+			t.Fatalf("SQL-value checked relation capabilities=%+v", sqlValueChecked.capabilities)
+		}
+		ioCastCheckedSource := relation(1208, "pipeline_io_cast_checked", 25)
+		ioCastChecked, err := relationCache.resolve(ctx, conn, &ioCastCheckedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ioCastChecked.capabilities.relationOrderedLane {
+			t.Fatalf("I/O-cast checked relation capabilities=%+v", ioCastChecked.capabilities)
 		}
 		selectiveSource := selectiveRelation(1193)
 		selective, err := relationCache.resolve(ctx, conn, &selectiveSource, loadTargetRelation)
@@ -1138,7 +1219,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 		if uniqueIndexed.capabilities.relationLane || uniqueIndexed.capabilities.keyedSetDML ||
-			uniqueIndexed.capabilities.relationOrderedLane || uniqueIndexed.capabilities.selectiveUpdates {
+			!uniqueIndexed.capabilities.relationOrderedLane ||
+			uniqueIndexed.capabilities.relationOrderedLaneV3 || uniqueIndexed.capabilities.selectiveUpdates {
 			t.Fatalf("unique partial indexed relation capabilities=%+v", uniqueIndexed.capabilities)
 		}
 		customSource := stageRelation(1192, "pipeline_stage")
@@ -1186,6 +1268,28 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}
 		if !customIndex.capabilities.relationLane || customIndex.capabilities.relationOrderedLane {
 			t.Fatalf("custom expression dependency capabilities=%+v", customIndex.capabilities)
+		}
+		catalogCustomIndexSource := relation(1209, "pipeline_catalog_custom_index", 25)
+		catalogCustomIndex, err := relationCache.resolve(
+			ctx, conn, &catalogCustomIndexSource, loadTargetRelation,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !catalogCustomIndex.capabilities.relationLane ||
+			catalogCustomIndex.capabilities.relationOrderedLane ||
+			!catalogCustomIndex.capabilities.relationOrderedLaneV3 {
+			t.Fatalf("pg_catalog custom index capabilities=%+v", catalogCustomIndex.capabilities)
+		}
+		customTypeIndexSource := relation(1210, "pipeline_custom_type_index", 25)
+		customTypeIndex, err := relationCache.resolve(
+			ctx, conn, &customTypeIndexSource, loadTargetRelation,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if customTypeIndex.capabilities.relationOrderedLane {
+			t.Fatalf("custom type index capabilities=%+v", customTypeIndex.capabilities)
 		}
 		unloggedSource := relation(1202, "pipeline_unlogged", 25)
 		unlogged, err := relationCache.resolve(ctx, conn, &unloggedSource, loadTargetRelation)
