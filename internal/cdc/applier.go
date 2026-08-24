@@ -1919,7 +1919,40 @@ func useExactIdentityMembership(
 	relation *targetRelation,
 	identityColumns []targetColumn,
 ) bool {
-	return useSelectiveBitmap(relation)
+	return len(identityColumns) == 1 && useSelectiveBitmap(relation)
+}
+
+// writeDirectSelectiveTargetJoin performs one parameterized exact lookup per
+// composite identity. OFFSET 0 keeps PostgreSQL from flattening the lateral
+// subquery into a broad row-bound join that can choose an unrelated index.
+// Unlike a hundreds-of-terms BitmapOr it has negligible planning cost and lets
+// the primary key serve each lookup directly.
+func writeDirectSelectiveTargetJoin(
+	sql *strings.Builder,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	setColumns []int,
+) {
+	sql.WriteString(" JOIN LATERAL (SELECT ")
+	for i, columnIndex := range setColumns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString("pgmigrate_lookup.")
+		sql.WriteString(relation.columns[columnIndex].quoted)
+	}
+	sql.WriteString(" FROM ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_lookup WHERE ")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString("pgmigrate_lookup.")
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(sql, "=pgmigrate_batch.identity_%d", i)
+	}
+	sql.WriteString(" OFFSET 0) AS pgmigrate_target ON true")
 }
 
 func applyInsertCopy(
@@ -2560,10 +2593,15 @@ func inspectSelectiveUpdateMasks(
 		}
 		fmt.Fprintf(&sql, "identity_%d", i)
 	}
-	sql.WriteString(",ordinal) JOIN ")
-	sql.WriteString(targetRows)
-	sql.WriteString(" AS pgmigrate_target ON ")
-	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	sql.WriteString(",ordinal)")
+	if targetRows == "pgmigrate_target_rows" {
+		sql.WriteString(" JOIN ")
+		sql.WriteString(targetRows)
+		sql.WriteString(" AS pgmigrate_target ON ")
+		writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	} else {
+		writeDirectSelectiveTargetJoin(&sql, relation, identityColumns, setColumns)
+	}
 	masks := make([][]int, len(changes))
 	seen := make([]bool, len(changes))
 	replay.queue(sql.String(), params, applyExpectation{
@@ -2680,10 +2718,15 @@ func inspectSelectiveUpdateMasksValues(
 	for i := range identityColumns {
 		fmt.Fprintf(&sql, ",identity_%d", i)
 	}
-	sql.WriteString(") JOIN ")
-	sql.WriteString(targetRows)
-	sql.WriteString(" AS pgmigrate_target ON ")
-	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	sql.WriteByte(')')
+	if targetRows == "pgmigrate_target_rows" {
+		sql.WriteString(" JOIN ")
+		sql.WriteString(targetRows)
+		sql.WriteString(" AS pgmigrate_target ON ")
+		writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	} else {
+		writeDirectSelectiveTargetJoin(&sql, relation, identityColumns, setColumns)
+	}
 	return queueSelectiveUpdateInspection(
 		replay, relation, setColumns, changes, sql.String(), params,
 	)

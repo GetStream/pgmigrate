@@ -236,7 +236,7 @@ func TestResidentCompositeUpdateSkipsTextStageWithoutBitmapGuard(t *testing.T) {
 		t.Fatal("test relation must exercise the cache-resident path")
 	}
 	if useExactIdentityMembership(relation, identityColumns) {
-		t.Fatal("cache-resident composite identity enabled the BitmapOr guard")
+		t.Fatal("composite identity enabled the BitmapOr guard")
 	}
 	changes := make([]Change, minimumTextCopyStageRows)
 	applied, err := applyUpdateTextStage(nil, relation, identityColumns, nil, changes)
