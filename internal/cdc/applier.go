@@ -1023,10 +1023,15 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		); err != nil {
 			return nil, err
 		}
-		result.capabilities.relationLane = result.capabilities.relationLane && setDMLSafe && builtIn
-		result.capabilities.keyedSetDML = result.capabilities.keyedSetDML && setDMLSafe
-		result.capabilities.binaryCopy = result.capabilities.binaryCopy && setDMLSafe && builtIn
-		result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe
+		// Generated columns are omitted from every target INSERT/UPDATE column
+		// list and maintained by PostgreSQL. Their own non-writability must not
+		// disable set DML or selective updates for the writable relation columns.
+		if !column.generated {
+			result.capabilities.relationLane = result.capabilities.relationLane && setDMLSafe && builtIn
+			result.capabilities.keyedSetDML = result.capabilities.keyedSetDML && setDMLSafe
+			result.capabilities.binaryCopy = result.capabilities.binaryCopy && setDMLSafe && builtIn
+			result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe
+		}
 		hasSelectiveUpdates = hasSelectiveUpdates || selectiveUpdates
 		result.heapBytes = heapBytes
 		result.heapBlocksRead = heapBlocksRead
@@ -2207,9 +2212,9 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 		chunkRows := applyArrayChunkRows
 		if relation.capabilities.selectiveUpdates {
 			chunkRows = updateChunkRows(len(setColumns) + len(identityColumns))
-			if useExactIdentityMembership(relation, identityColumns) && chunkRows > applySelectiveProbeChunkRows {
-				chunkRows = applySelectiveProbeChunkRows
-			}
+		}
+		if useExactIdentityMembership(relation, identityColumns) && chunkRows > applySelectiveProbeChunkRows {
+			chunkRows = applySelectiveProbeChunkRows
 		}
 		seen := map[string]struct{}{firstKey: {}}
 		end := start + 1
@@ -2936,7 +2941,7 @@ func applyUpdateTextStage(
 	// primary-key rows. The array and VALUES paths append the scalar exact-key
 	// membership guard used by selective bitmap replay, so retain those paths
 	// for precisely the relations where the guard is required.
-	if relation.capabilities.selectiveUpdates && useExactIdentityMembership(relation, identityColumns) {
+	if useExactIdentityMembership(relation, identityColumns) {
 		return false, nil
 	}
 	stageColumns := make([]targetColumn, 0, len(setColumns)+len(identityColumns))

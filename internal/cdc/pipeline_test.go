@@ -220,7 +220,7 @@ func TestSelectiveBitmapUsesTargetCacheEvidence(t *testing.T) {
 	}
 }
 
-func TestSelectiveCompositeUpdateSkipsTextStageWithoutExactIdentityGuard(t *testing.T) {
+func TestCompositeUpdateSkipsTextStageWithoutExactIdentityGuard(t *testing.T) {
 	t.Parallel()
 	relation := &targetRelation{
 		heapBytes:      selectiveBitmapMinHeapBytes,

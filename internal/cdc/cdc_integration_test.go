@@ -772,6 +772,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			other_value text NOT NULL,
 			unique_a text NOT NULL,
 			unique_b text NOT NULL,
+			indexed_length integer GENERATED ALWAYS AS (length(indexed_value)) STORED,
 			UNIQUE (unique_a, unique_b)
 		);
 		CREATE INDEX pipeline_selective_update_partial
