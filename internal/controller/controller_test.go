@@ -316,6 +316,7 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 		"metrics":":9190",
 		"wal_sample_duration":"45s",
 		"segment_prune_interval":"2m",
+		"replay_workers":12,
 		"replay_batch_bytes":67108864,
 		"replay_batch_changes":262144,
 		"retry_base_copy":true,
@@ -347,7 +348,7 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 	decode(t, got, &view)
 	if view.Workers != 7 || view.SplitThreshold != 2048 || view.RestoreJobs != 3 ||
 		view.WALSampleDuration != "45s" || view.SegmentPruneInterval != "2m0s" ||
-		view.ReplayBatchBytes != 67_108_864 || view.ReplayBatchChanges != 262_144 ||
+		view.ReplayWorkers != 12 || view.ReplayBatchBytes != 67_108_864 || view.ReplayBatchChanges != 262_144 ||
 		view.VerifyWorkers != 2 || view.VerifyTableTimeout != "1h30m0s" || view.VerifyConvergeTimeout != "1m30s" {
 		t.Fatalf("updated view = %#v", view)
 	}
@@ -364,6 +365,7 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 	expected.Metrics = ":9190"
 	expected.WALSampleDuration = 45 * time.Second
 	expected.SegmentPruneInterval = 2 * time.Minute
+	expected.ReplayWorkers = 12
 	expected.ReplayBatchBytes = 67_108_864
 	expected.ReplayBatchChanges = 262_144
 	expected.RetryBaseCopy = true
@@ -405,11 +407,104 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 	}
 }
 
+func TestControllerConfigurationPersistsNonSecretsAcrossRestart(t *testing.T) {
+	cfg := validControllerConfig(t)
+	cfg.Source = "postgres://source-user:source-password@source/database"
+	cfg.Target = "postgres://target-user:target-password@target/database"
+	cfg.NoCleanup = true
+	cfg.EndPosition = "0/CAFE"
+	server := newTestServer(t, cfg, "controller-token-secret", noOpActions())
+
+	got := requestJSON(t, server, http.MethodPut, "/api/config", `{
+		"source":"postgres://replacement-source:replacement-password@source/database",
+		"target":"postgres://replacement-target:replacement-password@target/database",
+		"replay_workers":24,
+		"replay_batch_bytes":4194304,
+		"replay_batch_changes":8192
+	}`, "controller-token-secret")
+	if got.Code != http.StatusOK {
+		t.Fatalf("PUT config status = %d, body = %s", got.Code, got.Body.String())
+	}
+
+	path := filepath.Join(cfg.Dir, controllerConfigurationFile)
+	serialized, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		cfg.Source, cfg.Target, "replacement-source", "replacement-target",
+		"replacement-password", "controller-token-secret", `"source"`, `"target"`, `"token"`,
+	} {
+		if strings.Contains(string(serialized), forbidden) {
+			t.Errorf("persisted controller configuration contains %q", forbidden)
+		}
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if permissions := info.Mode().Perm(); permissions != 0o600 {
+		t.Errorf("persisted mode = %o, want 600", permissions)
+	}
+
+	restarted := config.FromEnvironment()
+	restarted.Source = "postgres://runtime-source/runtime"
+	restarted.Target = "postgres://runtime-target/runtime"
+	restarted.Dir = cfg.Dir
+	restarted.NoCleanup = false
+	restarted.EndPosition = "0/BEEF"
+	second := newTestServer(t, restarted, "new-runtime-token", noOpActions())
+	loaded := second.configurationSnapshot()
+	if loaded.ReplayWorkers != 24 || loaded.ReplayBatchBytes != 4_194_304 || loaded.ReplayBatchChanges != 8192 {
+		t.Fatalf("persisted replay configuration was not restored: %#v", loaded)
+	}
+	if loaded.Source != restarted.Source || loaded.Target != restarted.Target || loaded.Dir != restarted.Dir ||
+		loaded.NoCleanup != restarted.NoCleanup || loaded.EndPosition != restarted.EndPosition {
+		t.Fatalf("persisted configuration replaced secrets or runtime-only fields: %#v", loaded)
+	}
+}
+
+func TestControllerConfigurationSaveFailureDoesNotMutateLiveConfig(t *testing.T) {
+	server := newTestServer(t, validControllerConfig(t), "", noOpActions())
+	before := server.configurationSnapshot()
+	beforeRevision := server.configurationViewSnapshot().Revision
+
+	blockedDirectory := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(blockedDirectory, []byte("block mkdir"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server.configurationPath = filepath.Join(blockedDirectory, controllerConfigurationFile)
+	got := requestJSON(t, server, http.MethodPut, "/api/config", `{"replay_workers":24}`, "")
+	if got.Code != http.StatusInternalServerError || !strings.Contains(got.Body.String(), "persist controller configuration") {
+		t.Fatalf("PUT config status = %d, body = %s", got.Code, got.Body.String())
+	}
+	if after := server.configurationSnapshot(); after != before {
+		t.Fatalf("failed atomic save changed live config\nbefore: %#v\nafter:  %#v", before, after)
+	}
+	if afterRevision := server.configurationViewSnapshot().Revision; afterRevision != beforeRevision {
+		t.Fatalf("failed atomic save changed revision from %q to %q", beforeRevision, afterRevision)
+	}
+}
+
+func TestControllerRejectsCorruptPersistedConfiguration(t *testing.T) {
+	cfg := validControllerConfig(t)
+	path := filepath.Join(cfg.Dir, controllerConfigurationFile)
+	if err := os.WriteFile(path, []byte(`{"version":1,"replay_workers":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := New(Options{Config: cfg, Address: DefaultAddress, Actions: noOpActions()})
+	if err == nil || !strings.Contains(err.Error(), "decode persisted controller configuration") {
+		t.Fatalf("New() error = %v, want corrupt persisted configuration failure", err)
+	}
+}
+
 func TestInvalidConfigurationDoesNotReplaceCurrentConfiguration(t *testing.T) {
 	server := newTestServer(t, validControllerConfig(t), "", noOpActions())
 	before := server.configurationSnapshot()
 	for _, body := range []string{
 		`{"workers":0}`,
+		`{"replay_workers":0}`,
+		`{"replay_workers":65}`,
 		`{"replay_batch_bytes":0}`,
 		`{"replay_batch_changes":0}`,
 		`{"wal_sample_duration":"tomorrow"}`,
@@ -644,6 +739,12 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		"transactions applied",
 		"sampleReplay",
 		"row changes",
+		"Replay workers",
+		`data-config="replay_workers" type="number" min="1" max="64"`,
+		"resume LSN advances only after every receipt",
+		"Current durable replay claim",
+		"renderReplayClaim",
+		"receipted changes",
 		"Restart base copy",
 		"base-copy snapshot is no longer reusable",
 		"copied bytes shown above are historical",
@@ -664,7 +765,7 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 	for _, field := range []string{
 		"table_filter", "ack_warnings", "allow_collation_change", "workers",
 		"split_threshold", "restore_jobs", "pg_dump_path", "pg_restore_path",
-		"metrics", "wal_sample_duration", "segment_prune_interval", "replay_batch_bytes",
+		"metrics", "wal_sample_duration", "segment_prune_interval", "replay_workers", "replay_batch_bytes",
 		"replay_batch_changes", "retry_base_copy",
 		"skip_target_tuning", "warn_on_tuning_errors", "target_memory",
 		"maintenance_work_mem", "max_parallel_maintenance_workers", "max_wal_size",

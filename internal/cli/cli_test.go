@@ -30,6 +30,29 @@ func TestSequencesIsItsOwnCommand(t *testing.T) {
 	}
 }
 
+func TestReplayWorkersFlagDefaultsConservatively(t *testing.T) {
+	flag := NewRootCommand().PersistentFlags().Lookup("replay-workers")
+	if flag == nil {
+		t.Fatal("replay-workers flag is missing")
+	}
+	if flag.DefValue != "8" {
+		t.Fatalf("replay-workers defaults to %s, want 8", flag.DefValue)
+	}
+}
+
+func TestDatabaseConfigurationBoundsReplayWorkers(t *testing.T) {
+	cfg := config.FromEnvironment()
+	cfg.Source = "postgres://source/db"
+	cfg.Target = "postgres://target/db"
+	cfg.Dir = t.TempDir()
+	cfg.ReplayWorkers = config.ReplayWorkersMax + 1
+
+	err := validateDatabaseConfig(cfg)
+	if err == nil || !strings.Contains(err.Error(), "at most 64") {
+		t.Fatalf("validateDatabaseConfig() error = %v, want replay worker maximum", err)
+	}
+}
+
 func TestControllerIsItsOwnCommand(t *testing.T) {
 	root := NewRootCommand()
 	command, _, err := root.Find([]string{"controller"})

@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/GetStream/pgmigrate/internal/observe"
 	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/state"
+	"github.com/jackc/pgx/v5"
 )
 
 const (
@@ -68,12 +70,13 @@ type Server struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu               sync.Mutex
-	operations       map[string]operation
-	nextID           int64
-	configGeneration string
-	configRevision   uint64
-	copySample       copySample
+	mu                sync.Mutex
+	operations        map[string]operation
+	nextID            int64
+	configGeneration  string
+	configRevision    uint64
+	configurationPath string
+	copySample        copySample
 }
 
 type copySample struct {
@@ -129,6 +132,24 @@ type copyView struct {
 	RateBytesPerSecond float64       `json:"rate_bytes_per_second"`
 }
 
+// replayClaimView reports target-visible work inside the currently active
+// durable replay claim. The local applied LSN deliberately does not advance
+// until the whole claim commits, so these receipt counters keep the dashboard
+// moving without pretending partially completed work is a durable watermark.
+type replayClaimView struct {
+	ClaimID           string    `json:"claim_id"`
+	StartLSN          string    `json:"start_lsn"`
+	EndLSN            string    `json:"end_lsn"`
+	WorkDone          int64     `json:"work_done"`
+	WorkTotal         int64     `json:"work_total"`
+	TransactionsDone  int64     `json:"transactions_done"`
+	TransactionsTotal int64     `json:"transactions_total"`
+	ChangesDone       int64     `json:"changes_done"`
+	ChangesTotal      int64     `json:"changes_total"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+}
+
 // configurationView is the mutable controller configuration exposed to the
 // dashboard. Database credentials are deliberately represented only by
 // configured flags; their values are write-only through configurationUpdate.
@@ -147,6 +168,7 @@ type configurationView struct {
 	Metrics                string  `json:"metrics"`
 	WALSampleDuration      string  `json:"wal_sample_duration"`
 	SegmentPruneInterval   string  `json:"segment_prune_interval"`
+	ReplayWorkers          int     `json:"replay_workers"`
 	ReplayBatchBytes       int64   `json:"replay_batch_bytes"`
 	ReplayBatchChanges     int     `json:"replay_batch_changes"`
 	RetryBaseCopy          bool    `json:"retry_base_copy"`
@@ -185,6 +207,7 @@ type configurationUpdate struct {
 	Metrics                *string  `json:"metrics"`
 	WALSampleDuration      *string  `json:"wal_sample_duration"`
 	SegmentPruneInterval   *string  `json:"segment_prune_interval"`
+	ReplayWorkers          *int     `json:"replay_workers"`
 	ReplayBatchBytes       *int64   `json:"replay_batch_bytes"`
 	ReplayBatchChanges     *int     `json:"replay_batch_changes"`
 	RetryBaseCopy          *bool    `json:"retry_base_copy"`
@@ -209,6 +232,7 @@ type configurationUpdate struct {
 type statusResponse struct {
 	Snapshot              *observe.Snapshot        `json:"snapshot,omitempty"`
 	Copy                  copyView                 `json:"copy"`
+	ReplayClaim           *replayClaimView         `json:"replay_claim,omitempty"`
 	Findings              []findingView            `json:"findings,omitempty"`
 	Failure               *failureView             `json:"failure,omitempty"`
 	Operations            map[string]operationView `json:"operations"`
@@ -228,6 +252,11 @@ func New(options Options) (*Server, error) {
 	if err := options.Config.ValidateDir(); err != nil {
 		return nil, err
 	}
+	loadedConfig, err := loadControllerConfiguration(options.Config)
+	if err != nil {
+		return nil, err
+	}
+	options.Config = loadedConfig
 	if options.Actions.Preflight == nil || options.Actions.Run == nil || options.Actions.Verify == nil {
 		return nil, errors.New("preflight, run, and verify controller actions are required")
 	}
@@ -247,8 +276,9 @@ func New(options Options) (*Server, error) {
 			"migration":    {State: "idle"},
 			"verification": {State: "idle"},
 		},
-		configGeneration: configGeneration,
-		configRevision:   1,
+		configGeneration:  configGeneration,
+		configRevision:    1,
+		configurationPath: filepath.Join(options.Config.Dir, controllerConfigurationFile),
 	}, nil
 }
 
@@ -388,6 +418,17 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	response.Snapshot = &snapshot
+	if replayPhase(snapshot.Phase) && response.ConnectionsConfigured {
+		migration, migrationErr := store.Migration(ctx)
+		if migrationErr == nil && migration.SlotName != "" {
+			replayCtx, replayCancel := context.WithTimeout(ctx, 2*time.Second)
+			claim, liveErr := liveReplayClaimProgress(replayCtx, cfg.Target, migration.SlotName)
+			replayCancel()
+			if liveErr == nil {
+				response.ReplayClaim = claim
+			}
+		}
+	}
 	parts, err := store.ListParts(ctx)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -433,6 +474,70 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func replayPhase(phase state.Phase) bool {
+	switch phase {
+	case state.PhaseCatchup, state.PhaseFollow, state.PhaseDrained, state.PhaseCutover:
+		return true
+	default:
+		return false
+	}
+}
+
+func liveReplayClaimProgress(
+	ctx context.Context,
+	targetDSN string,
+	streamID string,
+) (*replayClaimView, error) {
+	conn, err := postgres.Connect(ctx, targetDSN)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close(context.Background())
+
+	var claimTable, workTable *string
+	if err := conn.QueryRow(ctx, `
+		SELECT to_regclass('pgmigrate_internal.cdc_replay_claims')::text,
+		       to_regclass('pgmigrate_internal.cdc_replay_claim_work')::text
+	`).Scan(&claimTable, &workTable); err != nil {
+		return nil, fmt.Errorf("inspect replay progress tables: %w", err)
+	}
+	if claimTable == nil || workTable == nil {
+		return nil, nil
+	}
+
+	var progress replayClaimView
+	err = conn.QueryRow(ctx, `
+		SELECT claim.claim_id, claim.start_lsn::text, claim.end_lsn::text,
+		       count(*) FILTER (WHERE work.committed_at IS NOT NULL)::bigint,
+		       claim.expected_work::bigint,
+		       coalesce(sum(work.expected_transactions)
+		         FILTER (WHERE work.committed_at IS NOT NULL), 0)::bigint,
+		       claim.transactions,
+		       coalesce(sum(work.expected_changes)
+		         FILTER (WHERE work.committed_at IS NOT NULL), 0)::bigint,
+		       claim.changes,
+		       claim.created_at,
+		       coalesce(max(work.committed_at), claim.created_at)
+		FROM pgmigrate_internal.cdc_replay_claims AS claim
+		LEFT JOIN pgmigrate_internal.cdc_replay_claim_work AS work
+		  ON work.claim_id = claim.claim_id
+		WHERE claim.stream_id = $1
+		GROUP BY claim.claim_id
+	`, streamID).Scan(
+		&progress.ClaimID, &progress.StartLSN, &progress.EndLSN,
+		&progress.WorkDone, &progress.WorkTotal,
+		&progress.TransactionsDone, &progress.TransactionsTotal,
+		&progress.ChangesDone, &progress.ChangesTotal, &progress.CreatedAt, &progress.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read active replay claim progress: %w", err)
+	}
+	return &progress, nil
 }
 
 func liveCopyProgress(ctx context.Context, targetDSN string) (active, rows, bytes int64, err error) {
@@ -505,6 +610,11 @@ func (s *Server) putConfiguration(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
+		var persistence *configurationPersistenceError
+		if errors.As(err, &persistence) {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -514,6 +624,18 @@ func (s *Server) putConfiguration(w http.ResponseWriter, r *http.Request) {
 
 type configurationConflictError struct {
 	operation string
+}
+
+type configurationPersistenceError struct {
+	err error
+}
+
+func (e *configurationPersistenceError) Error() string {
+	return "persist controller configuration: " + e.err.Error()
+}
+
+func (e *configurationPersistenceError) Unwrap() error {
+	return e.err
 }
 
 func (e *configurationConflictError) Error() string {
@@ -545,6 +667,9 @@ func (s *Server) updateConfiguration(update configurationUpdate) (configurationV
 	}
 	if err := validateConfiguration(candidate); err != nil {
 		return configurationView{}, err
+	}
+	if err := saveControllerConfiguration(s.configurationPath, candidate); err != nil {
+		return configurationView{}, &configurationPersistenceError{err: err}
 	}
 	s.cfg = candidate
 	s.configRevision++
@@ -582,6 +707,7 @@ func applyConfigurationUpdate(candidate *config.Config, update configurationUpda
 	setIfPresent(&candidate.VerifyDutyCycle, update.VerifyDutyCycle)
 	setIfPresent(&candidate.VerifyCDCRows, update.VerifyCDCRows)
 	setIfPresent(&candidate.CDCSampleRows, update.CDCSampleRows)
+	setIfPresent(&candidate.ReplayWorkers, update.ReplayWorkers)
 	setIfPresent(&candidate.ReplayBatchBytes, update.ReplayBatchBytes)
 	setIfPresent(&candidate.ReplayBatchChanges, update.ReplayBatchChanges)
 	if err := parseDurationUpdate("wal_sample_duration", update.WALSampleDuration, &candidate.WALSampleDuration); err != nil {
@@ -628,6 +754,9 @@ func validateConfiguration(cfg config.Config) error {
 		cfg.ReplayBatchBytes < 1 || cfg.ReplayBatchChanges < 1 {
 		return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, segment-prune-interval, replay-batch-bytes, and replay-batch-changes must be positive")
 	}
+	if err := config.ValidateReplayWorkers(cfg.ReplayWorkers); err != nil {
+		return err
+	}
 	if cfg.CDCSampleRows < 0 {
 		return errors.New("cdc-sample-rows must not be negative")
 	}
@@ -650,6 +779,7 @@ func viewConfiguration(cfg config.Config, revision string) configurationView {
 		Workers: cfg.Workers, SplitThreshold: cfg.SplitThreshold, RestoreJobs: cfg.RestoreJobs,
 		PGDumpPath: cfg.PGDumpPath, PGRestorePath: cfg.PGRestorePath, Metrics: cfg.Metrics,
 		WALSampleDuration: cfg.WALSampleDuration.String(), SegmentPruneInterval: cfg.SegmentPruneInterval.String(),
+		ReplayWorkers:    cfg.ReplayWorkers,
 		ReplayBatchBytes: cfg.ReplayBatchBytes, ReplayBatchChanges: cfg.ReplayBatchChanges,
 		RetryBaseCopy: cfg.RetryBaseCopy, SkipTargetTuning: cfg.SkipTargetTuning,
 		WarnOnTuningErrors: cfg.WarnOnTuningErrors, TargetMemory: cfg.TargetMemory,

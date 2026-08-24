@@ -255,7 +255,7 @@ func TestApplierSkipPathsRemoveReaderSpills(t *testing.T) {
 			}}
 			_, _, _ = applier.applyFromReader(
 				ctx, nil, reader, newTargetRelationCache(),
-				newApplyStatementCache(applyStatementCacheCapacity), testCase.progress,
+				newApplyStatementCache(applyStatementCacheCapacity), nil, testCase.progress,
 			)
 			if _, err := os.Stat(spillPath); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("reader spill remains after skip: %v", err)

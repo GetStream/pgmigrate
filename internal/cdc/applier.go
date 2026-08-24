@@ -14,10 +14,12 @@ import (
 	"sync"
 	"time"
 
+	migrationconfig "github.com/GetStream/pgmigrate/internal/config"
 	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // DivergenceError reports source/target state that prevents exactly-once
@@ -43,14 +45,23 @@ type ApplierConfig struct {
 	Durable              *DurableWatermark
 	PollInterval         time.Duration
 	ReconnectDelay       time.Duration
-	BatchMaxDataBytes    int64
-	BatchMaxChanges      int
+	// ReplayWorkers is the maximum number of target sessions that execute one
+	// durable replay claim concurrently. A zero value keeps direct library users
+	// on the legacy single-session path; the application supplies its explicit
+	// operator-configured default.
+	ReplayWorkers     int
+	BatchMaxDataBytes int64
+	BatchMaxChanges   int
 	// EndPosition returns the optional inclusive cutover boundary. Transactions
 	// beyond it are never applied.
 	EndPosition func(context.Context) (LSN, bool, error)
 	// AfterProgress runs after target data and progress commit. Maintenance
 	// failures are terminal rather than hidden behind reconnect.
 	AfterProgress ProgressCallback
+	// afterReplayWork and beforeReplayFinalize are deterministic crash-test
+	// hooks. Production leaves them nil.
+	afterReplayWork      func(replayClaim, replayClaimWork) error
+	beforeReplayFinalize func(replayClaim) error
 	// Sampler, when set, is told which rows each committed transaction wrote, so
 	// that verification can check the replication path rather than only the rows
 	// the base copy left in the heap.
@@ -59,6 +70,11 @@ type ApplierConfig struct {
 
 type Applier struct {
 	config ApplierConfig
+	// streamGeneration is the current durable target-side generation token.
+	// The configured generation remains immutable; successful replay claims move
+	// this token monotonically so transactions started by older binaries can
+	// never pass the progress guard after a claim finalizes.
+	streamGeneration string
 
 	// endPosition caches the normalized cutover boundary. NormalizeEndPosition
 	// decodes every staged transaction from the start of the retained set, and
@@ -86,8 +102,14 @@ func NewApplier(config ApplierConfig) (*Applier, error) {
 	if config.ReconnectDelay <= 0 {
 		config.ReconnectDelay = time.Second
 	}
-	if config.BatchMaxDataBytes < 0 || config.BatchMaxChanges < 0 {
-		return nil, errors.New("cdc: replay batch limits must not be negative")
+	if config.ReplayWorkers < 0 || config.BatchMaxDataBytes < 0 || config.BatchMaxChanges < 0 {
+		return nil, errors.New("cdc: replay workers and batch limits must not be negative")
+	}
+	if config.ReplayWorkers == 0 {
+		config.ReplayWorkers = 1
+	}
+	if err := migrationconfig.ValidateReplayWorkers(config.ReplayWorkers); err != nil {
+		return nil, fmt.Errorf("cdc: %w", err)
 	}
 	if config.BatchMaxDataBytes == 0 {
 		config.BatchMaxDataBytes = applyBatchDefaultDataBytes
@@ -176,6 +198,16 @@ func (a *Applier) runConnection(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	effectiveGeneration, err := resolveStreamEffectiveGeneration(
+		ctx, conn, a.config.StreamID, a.config.StreamGeneration,
+	)
+	if err != nil {
+		return err
+	}
+	a.streamGeneration = effectiveGeneration
+	if err := ensureReplayClaimTables(ctx, conn); err != nil {
+		return err
+	}
 
 	progress, progressExists, err := postgres.ReadProgress(ctx, conn, a.config.StreamID)
 	if err != nil {
@@ -184,6 +216,14 @@ func (a *Applier) runConnection(ctx context.Context) error {
 	if err := configureApplySession(ctx, conn); err != nil {
 		return err
 	}
+	statementCache := newApplyStatementCache(applyStatementCacheCapacity)
+	workers, err := openApplyWorkers(
+		ctx, conn, statementCache, a.config.ConnString, a.config.ReplayWorkers,
+	)
+	if err != nil {
+		return err
+	}
+	defer closeApplyWorkers(workers[1:])
 	if progressExists && a.config.AfterProgress != nil {
 		if err := a.config.AfterProgress(ctx, LSN(progress)); err != nil {
 			return err
@@ -199,7 +239,6 @@ func (a *Applier) runConnection(ctx context.Context) error {
 	}
 	defer reader.Close()
 	relationCache := newTargetRelationCache()
-	statementCache := newApplyStatementCache(applyStatementCacheCapacity)
 	for {
 		if err := reader.Refresh(a.config.Durable.Load()); err != nil {
 			return err
@@ -214,7 +253,7 @@ func (a *Applier) runConnection(ctx context.Context) error {
 			}
 		}
 		applied, next, err := a.applyFromReader(
-			ctx, conn, reader, relationCache, statementCache, LSN(progress),
+			ctx, conn, reader, relationCache, statementCache, workers, LSN(progress),
 		)
 		if err != nil {
 			return err
@@ -236,6 +275,13 @@ func (a *Applier) runConnection(ctx context.Context) error {
 		case <-timer.C:
 		}
 	}
+}
+
+func (a *Applier) effectiveStreamGeneration() string {
+	if a.streamGeneration != "" {
+		return a.streamGeneration
+	}
+	return a.config.StreamGeneration
 }
 
 func configureApplySession(ctx context.Context, conn *pgx.Conn) error {
@@ -267,18 +313,20 @@ func (a *Applier) applyAvailable(ctx context.Context, conn *pgx.Conn, progress L
 	defer reader.Close()
 	return a.applyFromReader(
 		ctx, conn, reader, newTargetRelationCache(),
-		newApplyStatementCache(applyStatementCacheCapacity), progress,
+		newApplyStatementCache(applyStatementCacheCapacity), nil, progress,
 	)
 }
 
 const (
 	// Catch-up batches are bounded independently by source transaction count,
-	// row changes, and decoded payload size. Transactions above the per-source
-	// change limit retain the original standalone apply path.
-	applyBatchMaxTransactions       = 16384
-	applyBatchDefaultChanges        = 131072
-	applyBatchMaxTransactionChanges = 256
-	applyBatchDefaultDataBytes      = 32 << 20
+	// row changes, and decoded payload size. A resident source transaction is
+	// never split: when it alone exceeds a bound it becomes a one-transaction
+	// replay claim, preserving its atomicity while retaining set-based DML and
+	// durable claim receipts. Only disk-spilled transactions keep the streaming
+	// standalone path.
+	applyBatchMaxTransactions  = 16384
+	applyBatchDefaultChanges   = 131072
+	applyBatchDefaultDataBytes = 32 << 20
 )
 
 func (a *Applier) applyFromReader(
@@ -287,29 +335,58 @@ func (a *Applier) applyFromReader(
 	reader *Reader,
 	relationCache *targetRelationCache,
 	statementCache *applyStatementCache,
+	workers []*applyWorker,
 	progress LSN,
 ) (bool, LSN, error) {
+	if len(workers) == 0 {
+		workers = []*applyWorker{{conn: conn, statements: statementCache}}
+	}
+	var activeClaim replayClaim
+	claimExists := false
+	if conn != nil && a.config.StreamID != "" {
+		var err error
+		activeClaim, claimExists, err = readReplayClaim(ctx, conn, a.config.StreamID)
+		if err != nil {
+			return false, progress, err
+		}
+	}
+	if claimExists && (activeClaim.StreamID != a.config.StreamID ||
+		activeClaim.Generation != a.config.StreamGeneration ||
+		activeClaim.FenceGeneration != a.effectiveStreamGeneration() ||
+		activeClaim.StartLSN != progress) {
+		return false, progress, errors.New("cdc: active replay claim does not match target progress identity")
+	}
+	applyBatch := func(batch []Transaction, claim *replayClaim) (bool, LSN, error) {
+		return a.applyTransactionBatchWithWorkers(
+			ctx, conn, relationCache, statementCache, workers, batch, progress, claim,
+		)
+	}
 	batch := make([]Transaction, 0, applyBatchMaxTransactions)
 	batchChanges := 0
 	var batchDataBytes int64
 	for {
 		transaction, err := reader.Next()
 		if errors.Is(err, io.EOF) {
+			if claimExists {
+				return false, progress, fmt.Errorf(
+					"cdc: durable replay claim ends at %s but retained input ended first",
+					pglogrepl.LSN(activeClaim.EndLSN),
+				)
+			}
 			if len(batch) == 0 {
 				return false, progress, nil // nothing staged is left to apply
 			}
-			return a.applyTransactionBatch(
-				ctx, conn, relationCache, statementCache, batch, progress,
-			)
+			return applyBatch(batch, nil)
 		}
 		if err != nil {
+			if claimExists {
+				return false, progress, err
+			}
 			// Publish the verified prefix before surfacing a corrupt or otherwise
 			// unreadable suffix. The next apply pass resumes at the committed
 			// progress and reports the same suffix error.
 			if len(batch) != 0 {
-				return a.applyTransactionBatch(
-					ctx, conn, relationCache, statementCache, batch, progress,
-				)
+				return applyBatch(batch, nil)
 			}
 			return false, progress, err
 		}
@@ -318,6 +395,22 @@ func (a *Applier) applyFromReader(
 		if transaction.EndLSN <= progress {
 			if err := transaction.CleanupSpill(); err != nil {
 				return false, progress, fmt.Errorf("cdc: cleanup already-applied reader spill: %w", err)
+			}
+			continue
+		}
+		if claimExists {
+			if transaction.EndLSN > activeClaim.EndLSN {
+				return false, progress, errors.Join(
+					fmt.Errorf(
+						"cdc: retained replay transaction ends at %s beyond active claim %s",
+						pglogrepl.LSN(transaction.EndLSN), pglogrepl.LSN(activeClaim.EndLSN),
+					),
+					transaction.CleanupSpill(), cleanupTransactionBatch(batch),
+				)
+			}
+			batch = append(batch, transaction)
+			if transaction.EndLSN == activeClaim.EndLSN {
+				return applyBatch(batch, &activeClaim)
 			}
 			continue
 		}
@@ -333,22 +426,20 @@ func (a *Applier) applyFromReader(
 				if len(batch) == 0 {
 					return false, progress, nil
 				}
-				return a.applyTransactionBatch(
-					ctx, conn, relationCache, statementCache, batch, progress,
-				)
+				return applyBatch(batch, nil)
 			}
 		}
-		if transaction.IsSpilled() || transaction.ChangeCount() > applyBatchMaxTransactionChanges {
+		if transaction.IsSpilled() {
 			if len(batch) != 0 {
 				// The reader already advanced over this transaction. Hold it for
 				// the next call so the completed small batch can publish progress
 				// and maintenance callbacks before a large transaction starts.
 				reader.pending = &transaction
-				return a.applyTransactionBatch(
-					ctx, conn, relationCache, statementCache, batch, progress,
-				)
+				return applyBatch(batch, nil)
 			}
-			applyErr := a.applyTransaction(ctx, conn, relationCache, statementCache, &transaction)
+			applyErr := a.applyTransaction(
+				ctx, conn, relationCache, statementCache, progress, &transaction,
+			)
 			cleanupErr := transaction.CleanupSpill()
 			if applyErr != nil {
 				return false, progress, errors.Join(applyErr, cleanupErr)
@@ -358,15 +449,23 @@ func (a *Applier) applyFromReader(
 			}
 			return true, transaction.EndLSN, nil
 		}
-		batchChanges += int(transaction.ChangeCount())
-		batchDataBytes += int64(transactionApplyDataBytes(&transaction))
+		transactionChanges := int(transaction.ChangeCount())
+		transactionDataBytes := int64(transactionApplyDataBytes(&transaction))
+		if len(batch) != 0 &&
+			(batchChanges+transactionChanges > a.config.BatchMaxChanges ||
+				batchDataBytes+transactionDataBytes > a.config.BatchMaxDataBytes) {
+			// Keep the configured claim bound without splitting this source
+			// transaction. The next pass will claim it alone.
+			reader.pending = &transaction
+			return applyBatch(batch, nil)
+		}
+		batchChanges += transactionChanges
+		batchDataBytes += transactionDataBytes
 		batch = append(batch, transaction)
 		if len(batch) >= applyBatchMaxTransactions ||
 			batchChanges >= a.config.BatchMaxChanges ||
 			batchDataBytes >= a.config.BatchMaxDataBytes {
-			return a.applyTransactionBatch(
-				ctx, conn, relationCache, statementCache, batch, progress,
-			)
+			return applyBatch(batch, nil)
 		}
 	}
 }
@@ -457,21 +556,28 @@ type targetRelationCapabilities struct {
 	binaryCopy       bool
 	textCopyStage    bool
 	selectiveUpdates bool
+	// crossKeyConflicts is true when distinct primary-key rows can conflict
+	// through an ordinary non-primary UNIQUE or exclusion index. Such a relation
+	// remains safe for set DML inside one target transaction, but is not eligible
+	// for primary-key-sharded target transactions.
+	crossKeyConflicts bool
 }
 
 type targetColumn struct {
-	name        string
-	quoted      string
-	oid         uint32
-	arrayOID    uint32
-	key         bool
-	primary     bool
-	primaryPos  int
-	identity    string
-	sourceIndex int
-	generated   bool
-	notNull     bool
-	conflicting bool
+	name                string
+	quoted              string
+	oid                 uint32
+	arrayOID            uint32
+	key                 bool
+	primary             bool
+	primaryPos          int
+	replayKeySafe       bool
+	lanePayloadTextOnly bool
+	identity            string
+	sourceIndex         int
+	generated           bool
+	notNull             bool
+	conflicting         bool
 }
 
 type targetRelationCache struct {
@@ -526,6 +632,7 @@ func (a *Applier) applyTransaction(
 	conn *pgx.Conn,
 	relationCache *targetRelationCache,
 	statementCache *applyStatementCache,
+	progress LSN,
 	transaction *Transaction,
 ) error {
 	relations, err := resolveTargetRelations(ctx, conn, relationCache, transaction)
@@ -549,7 +656,8 @@ func (a *Applier) applyTransaction(
 	if replayErr == nil {
 		replay.queueProgress(
 			a.config.StreamID,
-			a.config.StreamGeneration,
+			a.effectiveStreamGeneration(),
+			progress,
 			transaction.EndLSN,
 			1,
 			int64(transaction.ChangeCount()),
@@ -587,6 +695,23 @@ func (a *Applier) applyTransactionBatch(
 	transactions []Transaction,
 	progress LSN,
 ) (bool, LSN, error) {
+	return a.applyTransactionBatchWithWorkers(
+		ctx, conn, relationCache, statementCache,
+		[]*applyWorker{{conn: conn, statements: statementCache}},
+		transactions, progress, nil,
+	)
+}
+
+func (a *Applier) applyTransactionBatchWithWorkers(
+	ctx context.Context,
+	conn *pgx.Conn,
+	relationCache *targetRelationCache,
+	statementCache *applyStatementCache,
+	workers []*applyWorker,
+	transactions []Transaction,
+	progress LSN,
+	resume *replayClaim,
+) (bool, LSN, error) {
 	if len(transactions) == 0 {
 		return false, progress, nil
 	}
@@ -597,6 +722,53 @@ func (a *Applier) applyTransactionBatch(
 			return false, progress, errors.Join(err, cleanupTransactionBatch(transactions))
 		}
 		relations[i] = resolved
+	}
+
+	laneCount := a.config.ReplayWorkers
+	if resume != nil {
+		laneCount = resume.LaneCount
+	} else if laneCount > 1 {
+		// More logical lanes than sessions reduce hash-skew tails without opening
+		// more target connections. Receipts remain keyed by the durable lane, and
+		// the executor size-balances those independent lanes across the workers.
+		laneCount = min(laneCount*4, migrationconfig.ReplayWorkersMax)
+	}
+	if laneCount > 1 && (resume != nil || len(workers) > 1) {
+		startGeneration := a.effectiveStreamGeneration()
+		if resume != nil {
+			startGeneration = resume.StartGeneration
+		}
+		plan, err := buildReplayPlanForGeneration(
+			a.config.StreamID, a.config.StreamGeneration, startGeneration, progress,
+			laneCount, transactions, relations,
+		)
+		if err != nil {
+			return false, progress, errors.Join(err, cleanupTransactionBatch(transactions))
+		}
+		// Unsafe source transactions are explicit serial barriers in the durable
+		// plan. Never send them through the legacy relation regrouping fallback,
+		// even when the surrounding safe work happens to hash to one lane.
+		if resume != nil || plan.HasParallel || replayPlanHasSerialWork(plan) {
+			if resume != nil && !replayClaimsEqual(plan.Claim, *resume) {
+				return false, progress, errors.Join(
+					errors.New("cdc: reconstructed replay claim digest does not match target claim"),
+					cleanupTransactionBatch(transactions),
+				)
+			}
+			claim, err := ensureReplayClaim(ctx, conn, plan.Claim, plan.Works)
+			if err != nil {
+				return false, progress, errors.Join(err, cleanupTransactionBatch(transactions))
+			}
+			plan.Claim = claim
+			if err := a.executeReplayPlan(ctx, workers, plan, transactions, relations); err != nil {
+				return false, progress, errors.Join(err, cleanupTransactionBatch(transactions))
+			}
+			a.streamGeneration = claim.FenceGeneration
+			if err := cleanupTransactionBatch(transactions); err != nil {
+				return false, progress, err
+			}
+			return true, claim.EndLSN, nil
+		}
 	}
 
 	replay := newApplyPipeline(ctx, conn.PgConn(), statementCache)
@@ -641,7 +813,8 @@ func (a *Applier) applyTransactionBatch(
 		}
 		replay.queueProgress(
 			a.config.StreamID,
-			a.config.StreamGeneration,
+			a.effectiveStreamGeneration(),
+			progress,
 			last,
 			int64(len(transactions)),
 			rows,
@@ -674,6 +847,7 @@ func (a *Applier) applyTransactionBatch(
 
 type relationBatchedChange struct {
 	transactionIndex int
+	changeIndex      int
 	change           *Change
 	relation         *targetRelation
 	collector        *sampleCollector
@@ -712,6 +886,7 @@ func planRelationBatchedChanges(
 			}
 			item := relationBatchedChange{
 				transactionIndex: transactionIndex,
+				changeIndex:      changeIndex,
 				change:           change,
 				relation:         relation,
 				collector:        collectors[transactionIndex],
@@ -960,15 +1135,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		       a.attidentity::text,
 		       a.attgenerated <> '',
 		       a.attnotnull,
-		       coalesce((
-		         SELECT primary_key.ordinality::integer
-		         FROM pg_catalog.pg_index primary_index
-		         JOIN LATERAL unnest(primary_index.indkey) WITH ORDINALITY
-		           AS primary_key(attnum, ordinality) ON true
-		         WHERE primary_index.indrelid = c.oid
-		           AND primary_index.indisprimary
-		           AND primary_key.attnum = a.attnum
-		       ), 0) AS primary_key_position,
+		       coalesce(primary_key.position, 0) AS primary_key_position,
+		       coalesce(primary_key.catalog_safe, false) AS replay_key_catalog_safe,
 		       EXISTS (
 		         SELECT 1 FROM pg_catalog.pg_index conflict_index
 		         WHERE conflict_index.indrelid = c.oid
@@ -981,6 +1149,12 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		           AND NOT (selective_index.indisunique OR selective_index.indisexclusion)
 		           AND (selective_index.indexprs IS NOT NULL OR selective_index.indpred IS NOT NULL)
 		       ) AS selective_updates,
+		       EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_index cross_key_index
+		         WHERE cross_key_index.indrelid = c.oid
+		           AND (cross_key_index.indisunique OR cross_key_index.indisexclusion)
+		           AND NOT cross_key_index.indisprimary
+		       ) AS cross_key_conflicts,
 		       c.relkind = 'r'
 		         AND NOT c.relrowsecurity
 		         AND NOT c.relforcerowsecurity
@@ -1006,6 +1180,14 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		             AND (index_row.indexprs IS NOT NULL OR index_row.indpred IS NOT NULL)
 		         ) AS set_dml_safe,
 		       t.oid < 16384 AS built_in_type,
+		       (t.oid < 16384 OR t.typtype = 'e' OR (
+		          t.typtype = 'b'
+		          AND t.typcategory = 'A'
+		          AND t.typinput = 'pg_catalog.array_in'::regproc
+		          AND t.typoutput = 'pg_catalog.array_out'::regproc
+		          AND element_type.typtype = 'e'
+		       ))
+		         AS replay_lane_payload_safe,
 		       pg_catalog.pg_relation_size(c.oid) AS heap_bytes,
 		       coalesce(io.heap_blks_read, 0) AS heap_blocks_read,
 		       coalesce(io.heap_blks_hit, 0) AS heap_blocks_hit
@@ -1013,6 +1195,27 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+		LEFT JOIN pg_catalog.pg_type element_type ON element_type.oid = t.typelem
+		LEFT JOIN LATERAL (
+		         SELECT primary_entry.ordinality::integer AS position,
+		                opclass.opcdefault
+		                  AND (primary_entry.collation_oid = 0 OR pk_collation.collisdeterministic)
+		                  AS catalog_safe
+		         FROM pg_catalog.pg_index primary_index
+		         JOIN LATERAL unnest(
+		           primary_index.indkey::smallint[],
+		           primary_index.indclass::oid[],
+		           primary_index.indcollation::oid[]
+		         ) WITH ORDINALITY
+		           AS primary_entry(attnum, opclass_oid, collation_oid, ordinality) ON true
+		         JOIN pg_catalog.pg_opclass opclass ON opclass.oid = primary_entry.opclass_oid
+		         LEFT JOIN pg_catalog.pg_collation pk_collation
+		           ON pk_collation.oid = primary_entry.collation_oid
+		         WHERE primary_index.indrelid = c.oid
+		           AND primary_index.indisprimary
+		           AND primary_entry.attnum = a.attnum
+		           AND primary_entry.ordinality <= primary_index.indnkeyatts
+		       ) primary_key ON true
 		LEFT JOIN pg_catalog.pg_statio_all_tables io ON io.relid = c.oid
 		WHERE n.nspname = $1 AND c.relname = $2
 		  AND a.attnum > 0 AND NOT a.attisdropped
@@ -1035,12 +1238,14 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 	hasSelectiveUpdates := false
 	for rows.Next() {
 		var column targetColumn
-		var setDMLSafe, builtIn, selectiveUpdates bool
+		var replayKeyCatalogSafe, setDMLSafe, builtIn, lanePayloadSafe bool
+		var selectiveUpdates, crossKeyConflicts bool
 		var heapBytes, heapBlocksRead, heapBlocksHit int64
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
-			&column.generated, &column.notNull, &column.primaryPos, &column.conflicting,
-			&selectiveUpdates, &setDMLSafe, &builtIn, &heapBytes,
+			&column.generated, &column.notNull, &column.primaryPos, &replayKeyCatalogSafe,
+			&column.conflicting, &selectiveUpdates, &crossKeyConflicts, &setDMLSafe,
+			&builtIn, &lanePayloadSafe, &heapBytes,
 			&heapBlocksRead, &heapBlocksHit,
 		); err != nil {
 			return nil, err
@@ -1049,12 +1254,19 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		// list and maintained by PostgreSQL. Their own non-writability must not
 		// disable set DML or selective updates for the writable relation columns.
 		if !column.generated {
-			result.capabilities.relationLane = result.capabilities.relationLane && setDMLSafe && builtIn
+			// Cross-transaction ordering depends only on the target primary key,
+			// but payload type input must also be free of user-defined side effects.
+			// Built-ins and enums (including enum arrays) satisfy that invariant;
+			// domains and arbitrary extension/base types retain serial source order.
+			result.capabilities.relationLane =
+				result.capabilities.relationLane && setDMLSafe && lanePayloadSafe
 			result.capabilities.keyedSetDML = result.capabilities.keyedSetDML && setDMLSafe
 			result.capabilities.binaryCopy = result.capabilities.binaryCopy && setDMLSafe && builtIn
 			result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe
 		}
 		hasSelectiveUpdates = hasSelectiveUpdates || selectiveUpdates
+		result.capabilities.crossKeyConflicts =
+			result.capabilities.crossKeyConflicts || crossKeyConflicts
 		result.heapBytes = heapBytes
 		result.heapBlocksRead = heapBlocksRead
 		result.heapBlocksHit = heapBlocksHit
@@ -1062,7 +1274,9 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 			result.overrideIdentity = true
 		}
 		column.quoted = pgx.Identifier{column.name}.Sanitize()
+		column.lanePayloadTextOnly = !builtIn
 		column.primary = column.primaryPos > 0
+		column.replayKeySafe = replayKeyCatalogSafe && replayKeyTargetTypeSafe(column.oid)
 		if column.generated {
 			result.generatedColumns = append(result.generatedColumns, column)
 		} else {
@@ -1099,7 +1313,20 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		}
 		result.columns[i].sourceIndex = sourceIndex
 		result.columns[i].key = source.Columns[sourceIndex].Flags&1 != 0
+		result.columns[i].replayKeySafe = result.columns[i].replayKeySafe &&
+			source.Columns[sourceIndex].Type == result.columns[i].oid
 	}
+	hasReplayPrimaryKey := false
+	for i := range result.columns {
+		if !result.columns[i].primary {
+			continue
+		}
+		hasReplayPrimaryKey = true
+		result.capabilities.relationLane =
+			result.capabilities.relationLane && result.columns[i].replayKeySafe
+	}
+	result.capabilities.relationLane =
+		result.capabilities.relationLane && hasReplayPrimaryKey
 	targetColumns := make(map[string]targetColumn, len(result.columns)+len(result.generatedColumns))
 	for _, column := range result.columns {
 		targetColumns[column.name] = column
@@ -1120,6 +1347,30 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		result.mappedColumns = append(result.mappedColumns, column)
 	}
 	return result, nil
+}
+
+// replayKeyTargetTypeSafe admits only built-in types whose pgoutput text is a
+// canonical representative of PostgreSQL equality. Numeric scale, bpchar
+// padding, floating-point signed zero, timetz offsets, and custom types can
+// produce distinct bytes that compare equal through a primary-key index.
+func replayKeyTargetTypeSafe(oid uint32) bool {
+	switch oid {
+	case pgtype.BoolOID,
+		pgtype.ByteaOID,
+		pgtype.Int2OID,
+		pgtype.Int4OID,
+		pgtype.Int8OID,
+		pgtype.TextOID,
+		pgtype.VarcharOID,
+		pgtype.DateOID,
+		pgtype.TimeOID,
+		pgtype.TimestampOID,
+		pgtype.TimestamptzOID,
+		pgtype.UUIDOID:
+		return true
+	default:
+		return false
+	}
 }
 
 func (a *Applier) applySpilledChanges(
@@ -1351,12 +1602,13 @@ func (p *applyPipeline) commit() {
 
 func (p *applyPipeline) queueProgress(
 	streamID, generation string,
+	expectedLSN LSN,
 	remoteLSN LSN,
 	transactions, rows int64,
 ) {
 	p.queueUnprepared(
 		streamProgressSQL,
-		streamProgressParams(streamID, generation, remoteLSN, transactions, rows),
+		streamProgressParams(streamID, generation, expectedLSN, remoteLSN, transactions, rows),
 		applyExpectation{
 			description: "update transactional apply progress", expectedRows: 1,
 			progressGuard: true,

@@ -56,6 +56,15 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 	barrierEvery := benchmarkNonNegativeIntEnv(
 		t, "PGMIGRATE_CDC_BENCH_BARRIER_EVERY", 0,
 	)
+	replayWorkers := benchmarkPositiveIntEnv(
+		t, "PGMIGRATE_CDC_BENCH_REPLAY_WORKERS", 8,
+	)
+	replayBatchBytes := benchmarkPositiveIntEnv(
+		t, "PGMIGRATE_CDC_BENCH_REPLAY_BATCH_BYTES", 8<<20,
+	)
+	replayBatchChanges := benchmarkPositiveIntEnv(
+		t, "PGMIGRATE_CDC_BENCH_REPLAY_BATCH_CHANGES", 32_768,
+	)
 	sessionCount := transactionCount * cdcReplayDeletesPerTransaction
 	expectedChanges := transactionCount * cdcReplayChangesPerTransaction
 	if barrierEvery > 0 {
@@ -273,7 +282,8 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 		ConnString: target.URI, Directory: directory,
 		StreamID: streamID, StreamGeneration: streamGeneration,
 		FreshSetup: true, TargetHasCopiedData: true, Durable: durable,
-		PollInterval: time.Millisecond,
+		PollInterval: time.Millisecond, ReplayWorkers: replayWorkers,
+		BatchMaxDataBytes: int64(replayBatchBytes), BatchMaxChanges: replayBatchChanges,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -330,8 +340,9 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 
 	rate := float64(expectedChanges) / elapsed.Seconds()
 	t.Logf(
-		"cdc_replay changes=%d source_transactions=%d accounts=%d barrier_every=%d elapsed=%s changes_per_second=%.0f target=%.0f",
+		"cdc_replay changes=%d source_transactions=%d accounts=%d barrier_every=%d replay_workers=%d replay_batch_bytes=%d replay_batch_changes=%d elapsed=%s changes_per_second=%.0f target=%.0f",
 		expectedChanges, transactionCount, accountCount, barrierEvery,
+		replayWorkers, replayBatchBytes, replayBatchChanges,
 		elapsed.Round(time.Millisecond), rate, minimumRate,
 	)
 	if rate < minimumRate {

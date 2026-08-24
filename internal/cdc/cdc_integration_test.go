@@ -19,6 +19,7 @@ import (
 	"github.com/GetStream/pgmigrate/internal/pgtest"
 	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {
@@ -622,7 +623,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 10, 2, 20); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 0, 10, 2, 20); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -646,7 +647,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 11, 3, 30); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 10, 11, 3, 30); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -673,7 +674,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 12, 5, 50); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 11, 12, 5, 50); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -703,7 +704,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, "wrong-generation", 13, 7, 70); !errors.Is(err, ErrStreamGenerationMismatch) {
+	if err := updateStreamProgress(ctx, tx, stream, "wrong-generation", 12, 13, 7, 70); !errors.Is(err, ErrStreamGenerationMismatch) {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("generation mismatch error=%v", err)
 	}
@@ -732,17 +733,184 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 		t.Fatalf("generation mismatch changed replay counters: %+v exists=%t", replay, exists)
 	}
 
+	// Two appliers may briefly overlap during a restart. Both can start from the
+	// same checkpoint, but only the transaction whose exact expected LSN still
+	// matches may publish DML and progress.
+	stale, err := restarted.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winnerConn := target.Connect(t)
+	winner, err := winnerConn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, winner, stream, generation, 12, 13, 1, 1); err != nil {
+		_ = winner.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := winner.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.Exec(ctx, "INSERT INTO public.progress_upsert_data VALUES (2)"); err != nil {
+		_ = stale.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, stale, stream, generation, 12, 14, 1, 1); !errors.Is(err, ErrStreamGenerationMismatch) {
+		_ = stale.Rollback(ctx)
+		t.Fatalf("stale expected-LSN error=%v", err)
+	}
+	if err := stale.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.QueryRow(
+		ctx, "SELECT count(*) FROM public.progress_upsert_data WHERE id = 2",
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("stale expected-LSN transaction committed %d rows", count)
+	}
+	replay, exists, err = postgres.ReadReplicationProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || LSN(replay.RemoteLSN) != 13 || replay.Transactions != 11 || replay.Rows != 101 {
+		t.Fatalf("winner replay progress=%+v exists=%t", replay, exists)
+	}
+
 	tx, err = restarted.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, "missing-identity", generation, 1, 11, 110); !errors.Is(err, ErrStreamGenerationMismatch) {
+	if err := updateStreamProgress(ctx, tx, "missing-identity", generation, 0, 1, 11, 110); !errors.Is(err, ErrStreamGenerationMismatch) {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("missing identity error=%v", err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPG17TargetPrimaryKeyReplaySafety(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	conn := target.Connect(t)
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.replay_key_types (
+			bool_key boolean,
+			bytea_key bytea,
+			int2_key smallint,
+			int4_key integer,
+			int8_key bigint,
+			text_key text,
+			varchar_key varchar,
+			date_key date,
+			time_key time without time zone,
+			timestamp_key timestamp without time zone,
+			timestamptz_key timestamp with time zone,
+			uuid_key uuid,
+			numeric_key numeric,
+			bpchar_key character(8),
+			float4_key real,
+			float8_key double precision,
+			timetz_key time with time zone,
+			PRIMARY KEY (
+				bool_key, bytea_key, int2_key, int4_key, int8_key, text_key,
+				varchar_key, date_key, time_key, timestamp_key, timestamptz_key,
+				uuid_key, numeric_key, bpchar_key, float4_key, float8_key, timetz_key
+			)
+		);
+		CREATE TABLE public.replay_key_source_mismatch (id integer PRIMARY KEY);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	type replayKeyType struct {
+		name string
+		oid  uint32
+		safe bool
+	}
+	types := []replayKeyType{
+		{name: "bool_key", oid: pgtype.BoolOID, safe: true},
+		{name: "bytea_key", oid: pgtype.ByteaOID, safe: true},
+		{name: "int2_key", oid: pgtype.Int2OID, safe: true},
+		{name: "int4_key", oid: pgtype.Int4OID, safe: true},
+		{name: "int8_key", oid: pgtype.Int8OID, safe: true},
+		{name: "text_key", oid: pgtype.TextOID, safe: true},
+		{name: "varchar_key", oid: pgtype.VarcharOID, safe: true},
+		{name: "date_key", oid: pgtype.DateOID, safe: true},
+		{name: "time_key", oid: pgtype.TimeOID, safe: true},
+		{name: "timestamp_key", oid: pgtype.TimestampOID, safe: true},
+		{name: "timestamptz_key", oid: pgtype.TimestamptzOID, safe: true},
+		{name: "uuid_key", oid: pgtype.UUIDOID, safe: true},
+		{name: "numeric_key", oid: pgtype.NumericOID},
+		{name: "bpchar_key", oid: pgtype.BPCharOID},
+		{name: "float4_key", oid: pgtype.Float4OID},
+		{name: "float8_key", oid: pgtype.Float8OID},
+		{name: "timetz_key", oid: pgtype.TimetzOID},
+	}
+	source := Relation{
+		OID: 9001, Namespace: "public", Name: "replay_key_types", ReplicaIdentity: 'd',
+		Columns: make([]Column, 0, len(types)),
+	}
+	for _, keyType := range types {
+		source.Columns = append(source.Columns, Column{Name: keyType.name, Type: keyType.oid, Flags: 1})
+	}
+	loaded, err := loadTargetRelation(ctx, conn, &source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns := make(map[string]targetColumn, len(loaded.columns))
+	for _, column := range loaded.columns {
+		columns[column.name] = column
+	}
+	for _, keyType := range types {
+		column, exists := columns[keyType.name]
+		if !exists {
+			t.Fatalf("target column %q was not loaded", keyType.name)
+		}
+		if column.replayKeySafe != keyType.safe {
+			t.Errorf("target column %q replayKeySafe=%t, want %t", keyType.name, column.replayKeySafe, keyType.safe)
+		}
+	}
+
+	mismatchSource := Relation{
+		OID: 9002, Namespace: "public", Name: "replay_key_source_mismatch", ReplicaIdentity: 'd',
+		Columns: []Column{{Name: "id", Type: pgtype.Int8OID, Flags: 1}},
+	}
+	mismatch, err := loadTargetRelation(ctx, conn, &mismatchSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mismatch.columns) != 1 || mismatch.columns[0].replayKeySafe {
+		t.Fatalf("source/target type mismatch replay columns=%+v", mismatch.columns)
+	}
+
+	t.Run("nondeterministic collation", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `
+			CREATE COLLATION public.replay_key_nondeterministic
+				(provider=icu, locale='und-u-ks-level2', deterministic=false);
+			CREATE TABLE public.replay_key_nondeterministic_table (
+				id text COLLATE public.replay_key_nondeterministic PRIMARY KEY
+			);
+		`); err != nil {
+			t.Skipf("server lacks nondeterministic ICU collations: %v", err)
+		}
+		nondeterministicSource := Relation{
+			OID: 9003, Namespace: "public", Name: "replay_key_nondeterministic_table", ReplicaIdentity: 'd',
+			Columns: []Column{{Name: "id", Type: pgtype.TextOID, Flags: 1}},
+		}
+		nondeterministic, err := loadTargetRelation(ctx, conn, &nondeterministicSource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(nondeterministic.columns) != 1 || nondeterministic.columns[0].replayKeySafe {
+			t.Fatalf("nondeterministic primary key replay columns=%+v", nondeterministic.columns)
+		}
+	})
 }
 
 func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
@@ -871,10 +1039,20 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}); err != nil {
 			return err
 		}
+		current, exists, err := postgres.ReadProgress(ctx, conn, stream)
+		if err != nil {
+			return err
+		}
+		var progress LSN
+		if exists {
+			progress = LSN(current)
+		}
 		applier := &Applier{config: ApplierConfig{
 			StreamID: stream, StreamGeneration: generation,
 		}}
-		return applier.applyTransaction(ctx, conn, relationCache, statementCache, transaction)
+		return applier.applyTransaction(
+			ctx, conn, relationCache, statementCache, progress, transaction,
+		)
 	}
 	applyBatch := func(
 		stream string, progress LSN, transactions []Transaction,
@@ -1752,7 +1930,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		evictionRelations := newTargetRelationCache()
 		evictionStatements := newApplyStatementCache(1)
 		if err := applier.applyTransaction(
-			ctx, evictionConn, evictionRelations, evictionStatements,
+			ctx, evictionConn, evictionRelations, evictionStatements, 0,
 			&Transaction{
 				CommitLSN: 69, EndLSN: 70, Relations: []Relation{source},
 				Changes: []Change{{
@@ -1773,7 +1951,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := applier.applyTransaction(
-			ctx, evictionConn, evictionRelations, evictionStatements,
+			ctx, evictionConn, evictionRelations, evictionStatements, 70,
 			&Transaction{
 				CommitLSN: 70, EndLSN: 71, Relations: []Relation{source},
 				Changes: []Change{{
@@ -1872,7 +2050,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			StreamID: stream, StreamGeneration: "wrong-generation",
 		}}
 		err := applier.applyTransaction(
-			ctx, conn, relationCache, statementCache,
+			ctx, conn, relationCache, statementCache, 0,
 			&Transaction{
 				CommitLSN: 79, EndLSN: 80, Relations: []Relation{source},
 				Changes: []Change{{

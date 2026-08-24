@@ -13,9 +13,24 @@ import (
 )
 
 const (
-	SourceEnv = "PGMIGRATE_SOURCE"
-	TargetEnv = "PGMIGRATE_TARGET"
+	SourceEnv        = "PGMIGRATE_SOURCE"
+	TargetEnv        = "PGMIGRATE_TARGET"
+	ReplayWorkersMax = 64
 )
+
+// ValidateReplayWorkers bounds target connections created by the replay
+// applier. Each worker owns a PostgreSQL session, so accepting an arbitrary
+// value can exhaust the target connection pool before replay starts.
+func ValidateReplayWorkers(workers int) error {
+	switch {
+	case workers < 1:
+		return errors.New("replay-workers must be positive")
+	case workers > ReplayWorkersMax:
+		return fmt.Errorf("replay-workers must be at most %d", ReplayWorkersMax)
+	default:
+		return nil
+	}
+}
 
 // Config contains configuration shared by pgmigrate commands.
 type Config struct {
@@ -38,6 +53,7 @@ type Config struct {
 	SequenceOffset         int64
 	WALSampleDuration      time.Duration
 	SegmentPruneInterval   time.Duration
+	ReplayWorkers          int
 	ReplayBatchBytes       int64
 	ReplayBatchChanges     int
 	RetryBaseCopy          bool
@@ -121,8 +137,9 @@ func FromEnvironment() Config {
 		RestoreJobs:          max(1, runtime.NumCPU()/2),
 		WALSampleDuration:    time.Minute,
 		SegmentPruneInterval: time.Minute,
-		ReplayBatchBytes:     32 << 20,
-		ReplayBatchChanges:   131_072,
+		ReplayWorkers:        8,
+		ReplayBatchBytes:     8 << 20,
+		ReplayBatchChanges:   32_768,
 		SequenceOffset:       1_000_000,
 
 		VerifyWorkers:         1,

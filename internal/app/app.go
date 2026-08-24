@@ -1367,6 +1367,7 @@ func runApplierToFollow(
 		), TargetHasCopiedData: true, Durable: durable, EndPosition: endPosition(store),
 		AfterProgress:     pruner.OnProgress,
 		Sampler:           samplerOrNil(sampler),
+		ReplayWorkers:     cfg.ReplayWorkers,
 		BatchMaxDataBytes: cfg.ReplayBatchBytes,
 		BatchMaxChanges:   cfg.ReplayBatchChanges,
 	})

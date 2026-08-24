@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestPersisterSquashesBatchIntoOneDurableWatermark(t *testing.T) {
@@ -51,6 +54,42 @@ func TestDurableWatermarkIsMonotonic(t *testing.T) {
 	}
 }
 
+func TestReplayKeyTargetTypeSafe(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		oid  uint32
+		safe bool
+	}{
+		{name: "bool", oid: pgtype.BoolOID, safe: true},
+		{name: "bytea", oid: pgtype.ByteaOID, safe: true},
+		{name: "int2", oid: pgtype.Int2OID, safe: true},
+		{name: "int4", oid: pgtype.Int4OID, safe: true},
+		{name: "int8", oid: pgtype.Int8OID, safe: true},
+		{name: "text", oid: pgtype.TextOID, safe: true},
+		{name: "varchar", oid: pgtype.VarcharOID, safe: true},
+		{name: "date", oid: pgtype.DateOID, safe: true},
+		{name: "time", oid: pgtype.TimeOID, safe: true},
+		{name: "timestamp", oid: pgtype.TimestampOID, safe: true},
+		{name: "timestamptz", oid: pgtype.TimestamptzOID, safe: true},
+		{name: "uuid", oid: pgtype.UUIDOID, safe: true},
+		{name: "numeric", oid: pgtype.NumericOID},
+		{name: "bpchar", oid: pgtype.BPCharOID},
+		{name: "float4", oid: pgtype.Float4OID},
+		{name: "float8", oid: pgtype.Float8OID},
+		{name: "timetz", oid: pgtype.TimetzOID},
+		{name: "custom", oid: 50000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := replayKeyTargetTypeSafe(test.oid); got != test.safe {
+				t.Fatalf("replayKeyTargetTypeSafe(%d) = %t, want %t", test.oid, got, test.safe)
+			}
+		})
+	}
+}
+
 func TestApplierReplayBatchLimitsDefaultAndAllowOverrides(t *testing.T) {
 	t.Parallel()
 	base := ApplierConfig{
@@ -62,7 +101,8 @@ func TestApplierReplayBatchLimitsDefaultAndAllowOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if applier.config.BatchMaxDataBytes != applyBatchDefaultDataBytes ||
-		applier.config.BatchMaxChanges != applyBatchDefaultChanges {
+		applier.config.BatchMaxChanges != applyBatchDefaultChanges ||
+		applier.config.ReplayWorkers != 1 {
 		t.Fatalf("default batch limits = %d bytes / %d changes", applier.config.BatchMaxDataBytes, applier.config.BatchMaxChanges)
 	}
 	base.BatchMaxDataBytes = 64 << 20
@@ -77,6 +117,15 @@ func TestApplierReplayBatchLimitsDefaultAndAllowOverrides(t *testing.T) {
 	base.BatchMaxDataBytes = -1
 	if _, err := NewApplier(base); err == nil {
 		t.Fatal("negative replay batch limit was accepted")
+	}
+	base.BatchMaxDataBytes = 1
+	base.ReplayWorkers = -1
+	if _, err := NewApplier(base); err == nil {
+		t.Fatal("negative replay worker count was accepted")
+	}
+	base.ReplayWorkers = config.ReplayWorkersMax + 1
+	if _, err := NewApplier(base); err == nil {
+		t.Fatal("replay worker count above the shared maximum was accepted")
 	}
 }
 
