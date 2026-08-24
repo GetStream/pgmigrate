@@ -1911,15 +1911,15 @@ func useSelectiveBitmap(relation *targetRelation) bool {
 	return true
 }
 
-// useExactIdentityMembership requires a scalar exact-key guard whenever the
-// paired row bounds are not sufficient to keep planning bounded. Composite
-// identities need that guard regardless of cache temperature; on single-key
-// cold heaps it also enables BitmapOr page ordering.
+// useExactIdentityMembership adds a scalar exact-key BitmapOr guard only for a
+// cold heap. The batch join is already semantically exact for composite keys;
+// forcing a hundreds-of-terms OR on a cache-resident table makes replay read
+// every target row twice and can cost more than the update itself.
 func useExactIdentityMembership(
 	relation *targetRelation,
 	identityColumns []targetColumn,
 ) bool {
-	return len(identityColumns) > 1 || useSelectiveBitmap(relation)
+	return useSelectiveBitmap(relation)
 }
 
 func applyInsertCopy(
