@@ -582,20 +582,21 @@ type targetRelationCapabilities struct {
 }
 
 type targetColumn struct {
-	name                string
-	quoted              string
-	oid                 uint32
-	arrayOID            uint32
-	key                 bool
-	primary             bool
-	primaryPos          int
-	replayKeySafe       bool
-	lanePayloadTextOnly bool
-	identity            string
-	sourceIndex         int
-	generated           bool
-	notNull             bool
-	conflicting         bool
+	name                      string
+	quoted                    string
+	oid                       uint32
+	arrayOID                  uint32
+	nondeterministicCollation bool
+	key                       bool
+	primary                   bool
+	primaryPos                int
+	replayKeySafe             bool
+	lanePayloadTextOnly       bool
+	identity                  string
+	sourceIndex               int
+	generated                 bool
+	notNull                   bool
+	conflicting               bool
 }
 
 type targetRelationCache struct {
@@ -1292,6 +1293,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		SELECT a.attname,
 		       a.atttypid,
 		       t.typarray,
+		       a.attcollation <> 0 AND NOT column_collation.collisdeterministic
+		         AS nondeterministic_collation,
 		       a.attidentity::text,
 		       a.attgenerated <> '',
 		       a.attnotnull,
@@ -1706,6 +1709,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
 		LEFT JOIN pg_catalog.pg_type element_type ON element_type.oid = t.typelem
+		LEFT JOIN pg_catalog.pg_collation column_collation
+		  ON column_collation.oid = a.attcollation
 		LEFT JOIN LATERAL (
 		         SELECT primary_entry.ordinality::integer AS position,
 		                opclass.opcdefault
@@ -1757,7 +1762,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		var relationOrderedLaneSafe, relationOrderedLaneV4TSSafe, relationOrderedLaneV3Safe bool
 		var heapBytes, heapBlocksRead, heapBlocksHit int64
 		if err := rows.Scan(
-			&column.name, &column.oid, &column.arrayOID, &column.identity,
+			&column.name, &column.oid, &column.arrayOID, &column.nondeterministicCollation,
+			&column.identity,
 			&column.generated, &column.notNull, &column.primaryPos, &replayKeyCatalogSafe,
 			&primaryKeyArbiter,
 			&column.conflicting, &selectiveUpdates, &crossKeyConflicts,
@@ -3650,6 +3656,27 @@ func writeExactIdentityDisjunction(
 	}
 }
 
+func writeSelectiveDifference(
+	sql *strings.Builder,
+	relation *targetRelation,
+	columnIndex int,
+	batchColumn int,
+) {
+	sql.WriteByte(',')
+	column := relation.columns[columnIndex]
+	if column.nondeterministicCollation {
+		// A nondeterministic collation can report two byte-distinct values as
+		// equal. Skipping that assignment would leave an observably different
+		// scalar or array value on the target while advancing durable progress.
+		// Treat it as changed without invoking its collation-aware equality.
+		sql.WriteString("true")
+		return
+	}
+	sql.WriteString("(pgmigrate_target.")
+	sql.WriteString(column.quoted)
+	fmt.Fprintf(sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", batchColumn)
+}
+
 func inspectSelectiveUpdateMasks(
 	replay *applyPipeline,
 	relation *targetRelation,
@@ -3703,9 +3730,7 @@ func inspectSelectiveUpdateMasks(
 	}
 	sql.WriteString("SELECT pgmigrate_batch.ordinal - 1")
 	for i, columnIndex := range setColumns {
-		sql.WriteString(",(pgmigrate_target.")
-		sql.WriteString(relation.columns[columnIndex].quoted)
-		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
+		writeSelectiveDifference(&sql, relation, columnIndex, i)
 	}
 	sql.WriteString(" FROM unnest(")
 	for i := 0; i < batchParamCount; i++ {
@@ -3839,9 +3864,7 @@ func inspectSelectiveUpdateMasksValues(
 	}
 	sql.WriteString("SELECT pgmigrate_batch.ordinal")
 	for i, columnIndex := range setColumns {
-		sql.WriteString(",(pgmigrate_target.")
-		sql.WriteString(relation.columns[columnIndex].quoted)
-		fmt.Fprintf(&sql, " IS DISTINCT FROM pgmigrate_batch.set_%d)", i)
+		writeSelectiveDifference(&sql, relation, columnIndex, i)
 	}
 	sql.WriteString(" FROM (VALUES ")
 	sql.WriteString(values.String())

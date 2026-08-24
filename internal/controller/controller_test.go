@@ -709,6 +709,17 @@ func TestIndexContainsControllerProgressUI(t *testing.T) {
 			t.Errorf("index does not contain %q", want)
 		}
 	}
+	for _, forbidden := range []string{
+		"historical · current run passed it",
+		"historical=currentRunAdvanced&&",
+		"Previous attempt failed in ${f.phase}; current run advanced past it",
+		"currentRunAdvanced=",
+		"renderFindings(data,currentRunAdvanced)",
+	} {
+		if strings.Contains(body, forbidden) {
+			t.Errorf("controller progress UI retains timestamp-based failure inference %q", forbidden)
+		}
+	}
 	if recorder.Header().Get("Content-Security-Policy") == "" {
 		t.Error("Content-Security-Policy header is missing")
 	}

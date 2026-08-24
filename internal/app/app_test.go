@@ -16,6 +16,7 @@ import (
 	"github.com/GetStream/pgmigrate/internal/cdc"
 	"github.com/GetStream/pgmigrate/internal/config"
 	"github.com/GetStream/pgmigrate/internal/copy"
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/preflight"
 	"github.com/GetStream/pgmigrate/internal/schema"
 	"github.com/GetStream/pgmigrate/internal/state"
@@ -290,6 +291,51 @@ func TestFailureSignatureGroupsRetriesOfTheSameCause(t *testing.T) {
 	plain := failureSignature(errors.New("pg_restore failed: exit status 1"))
 	if plain == first || plain != failureSignature(errors.New("pg_restore failed: exit status 1")) {
 		t.Fatalf("unstable signature for a non-PostgreSQL error: %s", plain)
+	}
+}
+
+func TestTargetProgressPassesFailureOnlyMonotonically(t *testing.T) {
+	t.Parallel()
+	baseline := postgres.ReplicationProgress{
+		RemoteLSN: 10, Transactions: 20, Rows: 30,
+	}
+	tests := map[string]struct {
+		current postgres.ReplicationProgress
+		passed  bool
+		err     bool
+	}{
+		"equal baseline": {
+			current: baseline,
+		},
+		"row-neutral transaction advanced": {
+			current: postgres.ReplicationProgress{RemoteLSN: 11, Transactions: 21, Rows: 30},
+			passed:  true,
+		},
+		"only remote LSN advanced": {
+			current: postgres.ReplicationProgress{RemoteLSN: 11, Transactions: 20, Rows: 30},
+			passed:  true,
+		},
+		"remote LSN regressed": {
+			current: postgres.ReplicationProgress{RemoteLSN: 9, Transactions: 21, Rows: 31},
+			err:     true,
+		},
+		"transaction count regressed": {
+			current: postgres.ReplicationProgress{RemoteLSN: 11, Transactions: 19, Rows: 31},
+			err:     true,
+		},
+		"row count regressed": {
+			current: postgres.ReplicationProgress{RemoteLSN: 11, Transactions: 21, Rows: 29},
+			err:     true,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			passed, err := targetProgressPassedFailure(baseline, test.current)
+			if (err != nil) != test.err || passed != test.passed {
+				t.Fatalf("passed=%t err=%v, want passed=%t err=%t", passed, err, test.passed, test.err)
+			}
+		})
 	}
 }
 

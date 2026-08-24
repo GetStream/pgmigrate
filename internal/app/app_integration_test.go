@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GetStream/pgmigrate/internal/cdc"
 	"github.com/GetStream/pgmigrate/internal/config"
@@ -64,6 +65,114 @@ func TestPG17TargetIdentityRejectsWrongEndpoints(t *testing.T) {
 	}
 	if err := validateTargetProgress(ctx, target.URI, "pgmigrate_stream", generation); !errors.Is(err, cdc.ErrMissingTargetProgress) {
 		t.Fatalf("missing target progress error = %v", err)
+	}
+}
+
+func TestPG17ResumeClearsFailureOnlyAfterDurableTargetProgress(t *testing.T) {
+	ctx := context.Background()
+	target := pgtest.Start(t, 17)
+	const streamID = "resume-failure-progress"
+	const generation = "resume-failure-progress-v1"
+	if err := initializeTargetProgress(ctx, target.URI, streamID, generation); err != nil {
+		t.Fatal(err)
+	}
+	targetConn := target.Connect(t)
+	if _, err := targetConn.Exec(ctx, `
+		UPDATE pgmigrate_internal.replication_progress
+		SET remote_lsn='0/10', transactions_applied=5, rows_applied=7,
+		    updated_at=clock_timestamp()
+		WHERE stream_id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	store, err := state.Open(ctx, dir, state.Fingerprints{Source: "source", Filter: "filter"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	recordDivergence := func() {
+		t.Helper()
+		if err := store.UpsertFinding(ctx, state.Finding{
+			ID: cdcDivergenceFindingID, Kind: "divergence", Severity: "error",
+			Message: "selective update value arrays unsupported",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordFailedAttempt(
+			ctx, state.PhaseCatchup, "error:divergence", "selective update value arrays unsupported",
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recordDivergence()
+	baseline, err := captureFailedAttemptProgress(ctx, store, target.URI, streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline == nil || baseline.progress.RemoteLSN != 0x10 ||
+		baseline.progress.Transactions != 5 || baseline.progress.Rows != 7 {
+		t.Fatalf("resume failure baseline=%#v", baseline)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	durable := &cdc.DurableWatermark{}
+	durable.Publish(0x20)
+	monitorErr := make(chan error, 1)
+	go func() {
+		monitorErr <- monitorProgress(
+			runCtx, store, target.URI, streamID, durable, dir, baseline,
+		)
+	}()
+	waitFor := func(description string, condition func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if condition() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", description)
+	}
+	waitFor("equal baseline observation", func() bool {
+		snapshot, err := store.Snapshot(ctx)
+		return err == nil && snapshot.Apply.AppliedLSN == "0/10"
+	})
+	if attempt, err := store.FailedAttempt(ctx); err != nil || attempt.Consecutive != 1 {
+		t.Fatalf("equal baseline failure=%#v err=%v", attempt, err)
+	}
+	if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+		t.Fatalf("equal baseline findings=%#v err=%v", findings, err)
+	}
+
+	// A transaction may be row-neutral. LSN and transaction progress, with no
+	// counter regression, still proves the resumed run passed the old failure.
+	if _, err := targetConn.Exec(ctx, `
+		UPDATE pgmigrate_internal.replication_progress
+		SET remote_lsn='0/20', transactions_applied=6, rows_applied=7,
+		    updated_at=clock_timestamp()
+		WHERE stream_id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("failure resolution after durable progress", func() bool {
+		attempt, attemptErr := store.FailedAttempt(ctx)
+		findings, findingsErr := store.PendingFindings(ctx)
+		return attemptErr == nil && findingsErr == nil &&
+			attempt.Consecutive == 0 && len(findings) == 0
+	})
+	cancel()
+	if err := <-monitorErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("monitor exit=%v, want cancellation", err)
+	}
+
+	// The same divergence recurring after proven progress is a new blocker.
+	recordDivergence()
+	if attempt, err := store.FailedAttempt(ctx); err != nil || attempt.Consecutive != 1 {
+		t.Fatalf("recurrent failure=%#v err=%v", attempt, err)
+	}
+	if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+		t.Fatalf("recurrent divergence=%#v err=%v", findings, err)
 	}
 }
 

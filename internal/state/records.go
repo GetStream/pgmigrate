@@ -94,6 +94,51 @@ func (s *Store) ClearFailedAttempt(ctx context.Context) error {
 	})
 }
 
+// ResolveFailedAttempt clears attempt only if it is still the failure the
+// caller observed, and resolves findingID in the same transaction. A later
+// failure must remain visible even if an older run subsequently reports
+// progress from another goroutine or process.
+func (s *Store) ResolveFailedAttempt(
+	ctx context.Context,
+	attempt FailedAttempt,
+	findingID string,
+) (bool, error) {
+	if attempt.Consecutive <= 0 {
+		return false, nil
+	}
+	cleared := false
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `
+			DELETE FROM failed_attempt
+			WHERE id=1 AND phase=? AND signature=? AND detail=?
+			  AND consecutive=? AND observed_at=?`,
+			attempt.Phase, attempt.Signature, attempt.Detail,
+			attempt.Consecutive, unixNano(attempt.ObservedAt),
+		)
+		if err != nil {
+			return fmt.Errorf("resolve failed attempt: %w", err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect failed attempt resolution: %w", err)
+		}
+		if rows == 0 {
+			return nil
+		}
+		if findingID != "" {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE findings SET resolved=1,
+					resolved_at=CASE WHEN resolved=0 THEN ? ELSE resolved_at END
+				WHERE id=?`, time.Now().UTC().UnixNano(), findingID); err != nil {
+				return fmt.Errorf("resolve finding %s with failed attempt: %w", findingID, err)
+			}
+		}
+		cleared = true
+		return nil
+	})
+	return cleared, err
+}
+
 // SetTargetCleanupRequested durably coordinates final target metadata cleanup
 // between the cutover controller and the run process.
 func (s *Store) SetTargetCleanupRequested(ctx context.Context, requested bool) error {

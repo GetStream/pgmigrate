@@ -965,9 +965,27 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		CREATE INDEX pipeline_selective_update_partial
 			ON public.pipeline_selective_update (indexed_value)
 			WHERE indexed_value <> '';
-		CREATE INDEX pipeline_selective_update_expression
-			ON public.pipeline_selective_update ((lower(indexed_value)));
-		CREATE TABLE public.pipeline_unique_indexed (
+			CREATE INDEX pipeline_selective_update_expression
+				ON public.pipeline_selective_update ((lower(indexed_value)));
+			CREATE COLLATION public.pipeline_nondeterministic (
+				provider = icu,
+				locale = 'und-u-ks-level2',
+				deterministic = false
+			);
+			CREATE TABLE public.pipeline_selective_array (
+				id integer PRIMARY KEY,
+				indexed_value text NOT NULL,
+				array_value text[],
+				toasted_array text[],
+				nondeterministic_text text COLLATE public.pipeline_nondeterministic,
+				nondeterministic_array text[] COLLATE public.pipeline_nondeterministic,
+				unique_value text NOT NULL UNIQUE
+			);
+			ALTER TABLE public.pipeline_selective_array
+				ALTER COLUMN toasted_array SET STORAGE EXTERNAL;
+			CREATE INDEX pipeline_selective_array_expression
+				ON public.pipeline_selective_array ((lower(indexed_value)));
+			CREATE TABLE public.pipeline_unique_indexed (
 			id integer PRIMARY KEY,
 			value text NOT NULL
 		);
@@ -1096,6 +1114,20 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 				{Name: "other_value", Type: 25},
 				{Name: "unique_a", Type: 25},
 				{Name: "unique_b", Type: 25},
+			},
+		}
+	}
+	selectiveArrayRelation := func(oid uint32) Relation {
+		return Relation{
+			OID: oid, Namespace: "public", Name: "pipeline_selective_array", ReplicaIdentity: 'd',
+			Columns: []Column{
+				{Name: "id", Type: 23, Flags: 1},
+				{Name: "indexed_value", Type: 25},
+				{Name: "array_value", Type: 1009},
+				{Name: "toasted_array", Type: 1009},
+				{Name: "nondeterministic_text", Type: 25},
+				{Name: "nondeterministic_array", Type: 1009},
+				{Name: "unique_value", Type: 25},
 			},
 		}
 	}
@@ -1688,6 +1720,230 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}
 		if hotUpdates < 1 {
 			t.Fatalf("selective replay produced %d HOT updates, want at least 1", hotUpdates)
+		}
+	})
+
+	t.Run("selective replay preserves arrays, TOAST, collation fidelity, and rollback", func(t *testing.T) {
+		source := selectiveArrayRelation(1220)
+		targetRelation, err := relationCache.resolve(ctx, conn, &source, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !targetRelation.capabilities.selectiveUpdates {
+			t.Fatalf("selective array relation capabilities=%+v", targetRelation.capabilities)
+		}
+		for _, columnIndex := range []int{2, 3, 5} {
+			if targetRelation.columns[columnIndex].arrayOID != 0 {
+				t.Fatalf(
+					"array column %s has array-of-array OID %d, want scalar VALUES fallback",
+					targetRelation.columns[columnIndex].name,
+					targetRelation.columns[columnIndex].arrayOID,
+				)
+			}
+		}
+		if targetRelation.columns[2].nondeterministicCollation ||
+			!targetRelation.columns[4].nondeterministicCollation ||
+			!targetRelation.columns[5].nondeterministicCollation {
+			t.Fatalf("selective collation catalog flags=%+v", targetRelation.columns)
+		}
+
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO public.pipeline_selective_array (
+				id, indexed_value, array_value, toasted_array,
+				nondeterministic_text, nondeterministic_array, unique_value
+			)
+			SELECT id,
+			       format('indexed-%s', id),
+			       ARRAY[format('old-%s', id)],
+			       ARRAY[(
+			         SELECT string_agg(md5(id::text || ':' || chunk::text), '' ORDER BY chunk)
+			         FROM generate_series(1, 1024) AS chunk
+			       )],
+			       format('case-%s', id),
+			       ARRAY[format('case-%s', id)],
+			       format('unique-%s', id)
+			FROM generate_series(1, 4) AS id
+		`); err != nil {
+			t.Fatal(err)
+		}
+		var toastedBefore string
+		var minimumToastedBytes int
+		if err := conn.QueryRow(ctx, `
+			SELECT string_agg(toasted_array::text, '|' ORDER BY id),
+			       min(octet_length(toasted_array::text))
+			FROM public.pipeline_selective_array
+		`).Scan(&toastedBefore, &minimumToastedBytes); err != nil {
+			t.Fatal(err)
+		}
+		if minimumToastedBytes < 16*1024 {
+			t.Fatalf("array fixture has only %d bytes, want an externally stored value", minimumToastedBytes)
+		}
+
+		null := TupleDatum{Kind: DatumNull}
+		unchangedToast := TupleDatum{Kind: DatumUnchangedToast}
+		oldRow := func(id int) *Tuple {
+			return tuple(text(strconv.Itoa(id)), null, null, null, null, null, null)
+		}
+		newRow := func(id int, arrayValue TupleDatum, nondeterministicText, nondeterministicArray, unique string) *Tuple {
+			return tuple(
+				text(strconv.Itoa(id)),
+				text(fmt.Sprintf("indexed-%d", id)),
+				arrayValue,
+				unchangedToast,
+				text(nondeterministicText),
+				text(nondeterministicArray),
+				text(unique),
+			)
+		}
+		arrayValues := []TupleDatum{
+			text(`{"comma,value","quote\"value","back\\slash","NULL",""}`),
+			text(`[0:1][3:4]={{a,b},{c,d}}`),
+			null,
+			text(`{}`),
+		}
+		arrayTransaction := Transaction{
+			CommitLSN: 520, EndLSN: 521, Relations: []Relation{source},
+			Changes: make([]Change, 0, len(arrayValues)),
+		}
+		for i, arrayValue := range arrayValues {
+			id := i + 1
+			arrayTransaction.Changes = append(arrayTransaction.Changes, Change{
+				RelationOID: source.OID,
+				Kind:        ChangeUpdate,
+				Old:         oldRow(id),
+				New: newRow(
+					id,
+					arrayValue,
+					fmt.Sprintf("case-%d", id),
+					fmt.Sprintf("{case-%d}", id),
+					fmt.Sprintf("unique-%d", id),
+				),
+			})
+		}
+		if err := apply("pipeline-selective-real-array", &arrayTransaction); err != nil {
+			t.Fatal(err)
+		}
+		var quotedArray, boundedArray, nullArray, emptyArray bool
+		if err := conn.QueryRow(ctx, `
+			SELECT
+			  (SELECT array_value IS NOT DISTINCT FROM
+			     $array${"comma,value","quote\"value","back\\slash","NULL",""}$array$::text[]
+			   FROM public.pipeline_selective_array WHERE id = 1),
+			  (SELECT array_value IS NOT DISTINCT FROM
+			     '[0:1][3:4]={{a,b},{c,d}}'::text[]
+			   FROM public.pipeline_selective_array WHERE id = 2),
+			  (SELECT array_value IS NULL
+			   FROM public.pipeline_selective_array WHERE id = 3),
+			  (SELECT cardinality(array_value) = 0
+			   FROM public.pipeline_selective_array WHERE id = 4)
+		`).Scan(&quotedArray, &boundedArray, &nullArray, &emptyArray); err != nil {
+			t.Fatal(err)
+		}
+		if !quotedArray || !boundedArray || !nullArray || !emptyArray {
+			t.Fatalf(
+				"array fidelity quoted=%t bounded=%t null=%t empty=%t",
+				quotedArray, boundedArray, nullArray, emptyArray,
+			)
+		}
+		var toastedAfter string
+		if err := conn.QueryRow(ctx, `
+			SELECT string_agg(toasted_array::text, '|' ORDER BY id)
+			FROM public.pipeline_selective_array
+		`).Scan(&toastedAfter); err != nil {
+			t.Fatal(err)
+		}
+		if toastedAfter != toastedBefore {
+			t.Fatal("selective array replay overwrote an unchanged TOAST value")
+		}
+		assertProgress(t, "pipeline-selective-real-array", arrayTransaction.EndLSN)
+
+		var textCollatesEqual, arrayCollatesEqual bool
+		if err := conn.QueryRow(ctx, `
+			SELECT
+			  'case-1' COLLATE public.pipeline_nondeterministic =
+			    'CASE-1' COLLATE public.pipeline_nondeterministic,
+			  ARRAY['case-1']::text[] COLLATE public.pipeline_nondeterministic =
+			    ARRAY['CASE-1']::text[] COLLATE public.pipeline_nondeterministic
+		`).Scan(&textCollatesEqual, &arrayCollatesEqual); err != nil {
+			t.Fatal(err)
+		}
+		if !textCollatesEqual || !arrayCollatesEqual {
+			t.Fatal("nondeterministic collation fixture does not equate case variants")
+		}
+		collationTransaction := Transaction{
+			CommitLSN: 522, EndLSN: 523, Relations: []Relation{source},
+			Changes: make([]Change, 0, 2),
+		}
+		for id := 1; id <= 2; id++ {
+			collationTransaction.Changes = append(collationTransaction.Changes, Change{
+				RelationOID: source.OID,
+				Kind:        ChangeUpdate,
+				Old:         oldRow(id),
+				New: tuple(
+					text(strconv.Itoa(id)),
+					text(fmt.Sprintf("indexed-%d", id)),
+					unchangedToast,
+					unchangedToast,
+					text(fmt.Sprintf("CASE-%d", id)),
+					text(fmt.Sprintf("{CASE-%d}", id)),
+					text(fmt.Sprintf("unique-%d", id)),
+				),
+			})
+		}
+		if err := apply("pipeline-selective-nondeterministic", &collationTransaction); err != nil {
+			t.Fatal(err)
+		}
+		var exactText, exactArray string
+		if err := conn.QueryRow(ctx, `
+			SELECT nondeterministic_text, nondeterministic_array::text
+			FROM public.pipeline_selective_array WHERE id = 1
+		`).Scan(&exactText, &exactArray); err != nil {
+			t.Fatal(err)
+		}
+		if exactText != "CASE-1" || exactArray != "{CASE-1}" {
+			t.Fatalf("nondeterministic fidelity text=%q array=%q", exactText, exactArray)
+		}
+		assertProgress(t, "pipeline-selective-nondeterministic", collationTransaction.EndLSN)
+
+		rollbackTransaction := Transaction{
+			CommitLSN: 524, EndLSN: 525, Relations: []Relation{source},
+			Changes: make([]Change, 0, 2),
+		}
+		for id := 3; id <= 4; id++ {
+			rollbackTransaction.Changes = append(rollbackTransaction.Changes, Change{
+				RelationOID: source.OID,
+				Kind:        ChangeUpdate,
+				Old:         oldRow(id),
+				New: tuple(
+					text(strconv.Itoa(id)),
+					text(fmt.Sprintf("indexed-%d", id)),
+					unchangedToast,
+					unchangedToast,
+					text(fmt.Sprintf("CASE-%d", id)),
+					text(fmt.Sprintf("{CASE-%d}", id)),
+					text("duplicate-unique-value"),
+				),
+			})
+		}
+		if err := apply("pipeline-selective-array-rollback", &rollbackTransaction); err == nil {
+			t.Fatal("expected the second selective update to violate the unique constraint")
+		}
+		var rolledBackRows int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*)
+			FROM public.pipeline_selective_array
+			WHERE id IN (3, 4)
+			  AND nondeterministic_text = ('case-' || id)::text
+			  AND unique_value = ('unique-' || id)::text
+		`).Scan(&rolledBackRows); err != nil {
+			t.Fatal(err)
+		}
+		if rolledBackRows != 2 {
+			t.Fatalf("failed selective transaction retained changes on %d rows", 2-rolledBackRows)
+		}
+		assertProgress(t, "pipeline-selective-array-rollback", 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after selective rollback=%q, want idle", status)
 		}
 	})
 

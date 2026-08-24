@@ -38,6 +38,8 @@ import (
 
 var errComplete = errors.New("migration complete")
 
+const cdcDivergenceFindingID = "cdc-divergence"
+
 type App struct {
 	Out io.Writer
 	// Progress receives human-readable progress, separately from Out so a machine
@@ -535,7 +537,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	group.Go(func() error { return runReceiverContinuous(groupCtx, receiver, store) })
 	group.Go(func() error { return persister.Run(groupCtx) })
 	group.Go(func() error {
-		return monitorProgress(groupCtx, store, cfg.Target, holder.Snapshot.Slot, durable, cfg.Dir)
+		return monitorProgress(groupCtx, store, cfg.Target, holder.Snapshot.Slot, durable, cfg.Dir, nil)
 	})
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, holder.Snapshot.Slot) })
 	watchCtx, stopSnapshotWatch := context.WithCancel(groupCtx)
@@ -694,6 +696,12 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 	if err := validateTargetProgress(ctx, cfg.Target, migration.SlotName, generation); err != nil {
 		return err
 	}
+	failureBaseline, err := captureFailedAttemptProgress(
+		ctx, store, cfg.Target, migration.SlotName,
+	)
+	if err != nil {
+		return err
+	}
 	binaryMode, err := loadCDCBinaryMode(ctx, store)
 	if err != nil {
 		return err
@@ -741,7 +749,11 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error { return runReceiverContinuous(groupCtx, receiver, store) })
 	group.Go(func() error { return persister.Run(groupCtx) })
-	group.Go(func() error { return monitorProgress(groupCtx, store, cfg.Target, snapshot.Slot, durable, cfg.Dir) })
+	group.Go(func() error {
+		return monitorProgress(
+			groupCtx, store, cfg.Target, snapshot.Slot, durable, cfg.Dir, failureBaseline,
+		)
+	})
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, snapshot.Slot) })
 	group.Go(func() error {
 		phase := migration.Phase
@@ -1749,7 +1761,7 @@ func recordFailedAttempt(ctx context.Context, out io.Writer, dir string, store *
 	var divergence *cdc.DivergenceError
 	if errors.As(runErr, &divergence) {
 		_ = store.UpsertFinding(context.WithoutCancel(ctx), state.Finding{
-			ID: "cdc-divergence", Kind: "divergence", Severity: "error", Message: detail,
+			ID: cdcDivergenceFindingID, Kind: "divergence", Severity: "error", Message: detail,
 		})
 	}
 	if err := store.RecordFailedAttempt(context.WithoutCancel(ctx), migration.Phase, failureSignature(runErr), detail); err != nil {
@@ -1782,7 +1794,67 @@ func pauseForCrashTest(ctx context.Context, phase state.Phase) error {
 	}
 }
 
-func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamID string, durable *cdc.DurableWatermark, dir string) error {
+type failedAttemptProgress struct {
+	attempt  state.FailedAttempt
+	progress postgres.ReplicationProgress
+}
+
+func captureFailedAttemptProgress(
+	ctx context.Context,
+	store *state.Store,
+	targetDSN string,
+	streamID string,
+) (*failedAttemptProgress, error) {
+	attempt, err := store.FailedAttempt(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if attempt.Consecutive == 0 {
+		return nil, nil
+	}
+	conn, err := postgres.Connect(ctx, targetDSN)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close(context.Background())
+	progress, exists, err := postgres.ReadReplicationProgress(ctx, conn, streamID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, cdc.ErrMissingTargetProgress
+	}
+	return &failedAttemptProgress{attempt: attempt, progress: progress}, nil
+}
+
+func targetProgressPassedFailure(
+	baseline postgres.ReplicationProgress,
+	current postgres.ReplicationProgress,
+) (bool, error) {
+	if current.RemoteLSN < baseline.RemoteLSN ||
+		current.Transactions < baseline.Transactions ||
+		current.Rows < baseline.Rows {
+		return false, fmt.Errorf(
+			"target replication progress regressed after resume: lsn %s/%s, transactions %d/%d, rows %d/%d",
+			current.RemoteLSN, baseline.RemoteLSN,
+			current.Transactions, baseline.Transactions,
+			current.Rows, baseline.Rows,
+		)
+	}
+	return current.RemoteLSN > baseline.RemoteLSN ||
+		current.Transactions > baseline.Transactions ||
+		current.Rows > baseline.Rows, nil
+}
+
+func monitorProgress(
+	ctx context.Context,
+	store *state.Store,
+	targetDSN string,
+	streamID string,
+	durable *cdc.DurableWatermark,
+	dir string,
+	failureBaseline *failedAttemptProgress,
+) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	nextLog := time.Now()
@@ -1796,6 +1868,13 @@ func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamI
 		if readErr != nil {
 			return readErr
 		}
+		passedFailure := false
+		if failureBaseline != nil {
+			passedFailure, err = targetProgressPassedFailure(failureBaseline.progress, progress)
+			if err != nil {
+				return err
+			}
+		}
 		if err := store.UpdateApplyProgress(ctx, state.ApplyProgress{
 			StagedLSN:  pglogrepl.LSN(durable.Load()).String(),
 			AppliedLSN: progress.RemoteLSN.String(),
@@ -1804,6 +1883,16 @@ func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamI
 			UpdatedAt:  progress.UpdatedAt,
 		}); err != nil {
 			return err
+		}
+		if failureBaseline != nil && passedFailure {
+			if _, err := store.ResolveFailedAttempt(
+				ctx, failureBaseline.attempt, cdcDivergenceFindingID,
+			); err != nil {
+				return err
+			}
+			// Whether it cleared or found a newer attempt, this baseline has been
+			// consumed and must never act on a later failure.
+			failureBaseline = nil
 		}
 		if !time.Now().Before(nextLog) {
 			logEvent(dir, "progress", map[string]any{
