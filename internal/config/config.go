@@ -38,6 +38,8 @@ type Config struct {
 	SequenceOffset         int64
 	WALSampleDuration      time.Duration
 	SegmentPruneInterval   time.Duration
+	ReplayBatchBytes       int64
+	ReplayBatchChanges     int
 	RetryBaseCopy          bool
 	SkipTargetTuning       bool
 	WarnOnTuningErrors     bool
@@ -119,6 +121,8 @@ func FromEnvironment() Config {
 		RestoreJobs:          max(1, runtime.NumCPU()/2),
 		WALSampleDuration:    time.Minute,
 		SegmentPruneInterval: time.Minute,
+		ReplayBatchBytes:     32 << 20,
+		ReplayBatchChanges:   131_072,
 		SequenceOffset:       1_000_000,
 
 		VerifyWorkers:         1,

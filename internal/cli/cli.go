@@ -61,6 +61,8 @@ func NewRootCommand() *cobra.Command {
 		"values each target sequence is set past the source's, leaving the source room to keep allocating")
 	flags.DurationVar(&cfg.WALSampleDuration, "wal-sample-duration", cfg.WALSampleDuration, "source WAL-rate sample duration")
 	flags.DurationVar(&cfg.SegmentPruneInterval, "segment-prune-interval", cfg.SegmentPruneInterval, "minimum interval between applied CDC segment pruning")
+	flags.Int64Var(&cfg.ReplayBatchBytes, "replay-batch-bytes", cfg.ReplayBatchBytes, "maximum decoded CDC payload committed in one crash-atomic target batch")
+	flags.IntVar(&cfg.ReplayBatchChanges, "replay-batch-changes", cfg.ReplayBatchChanges, "maximum row changes committed in one crash-atomic target batch")
 	flags.BoolVar(&cfg.RetryBaseCopy, "retry-base-copy", false, "restart the base copy even though the last attempts failed the same way")
 	flags.BoolVar(&cfg.SkipTargetTuning, "skip-target-tuning", false, "leave target settings alone during the bulk load")
 	flags.BoolVar(&cfg.WarnOnTuningErrors, "warn-on-tuning-errors", false, "continue when a target setting cannot be tuned instead of stopping")
@@ -118,8 +120,9 @@ func validateDatabaseConfig(cfg config.Config) error {
 		}
 	}
 	if cfg.Workers < 1 || cfg.RestoreJobs < 1 || cfg.SplitThreshold < 1 ||
-		cfg.WALSampleDuration <= 0 || cfg.SegmentPruneInterval <= 0 {
-		return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, and segment-prune-interval must be positive")
+		cfg.WALSampleDuration <= 0 || cfg.SegmentPruneInterval <= 0 ||
+		cfg.ReplayBatchBytes < 1 || cfg.ReplayBatchChanges < 1 {
+		return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, segment-prune-interval, replay-batch-bytes, and replay-batch-changes must be positive")
 	}
 	if _, err := cfg.TuningOverrides(); err != nil {
 		return err

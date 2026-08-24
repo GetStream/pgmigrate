@@ -51,6 +51,35 @@ func TestDurableWatermarkIsMonotonic(t *testing.T) {
 	}
 }
 
+func TestApplierReplayBatchLimitsDefaultAndAllowOverrides(t *testing.T) {
+	t.Parallel()
+	base := ApplierConfig{
+		ConnString: "postgres://target", Directory: t.TempDir(), StreamID: "stream",
+		Durable: new(DurableWatermark),
+	}
+	applier, err := NewApplier(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applier.config.BatchMaxDataBytes != applyBatchDefaultDataBytes ||
+		applier.config.BatchMaxChanges != applyBatchDefaultChanges {
+		t.Fatalf("default batch limits = %d bytes / %d changes", applier.config.BatchMaxDataBytes, applier.config.BatchMaxChanges)
+	}
+	base.BatchMaxDataBytes = 64 << 20
+	base.BatchMaxChanges = 262_144
+	applier, err = NewApplier(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applier.config.BatchMaxDataBytes != 64<<20 || applier.config.BatchMaxChanges != 262_144 {
+		t.Fatalf("overridden batch limits = %d bytes / %d changes", applier.config.BatchMaxDataBytes, applier.config.BatchMaxChanges)
+	}
+	base.BatchMaxDataBytes = -1
+	if _, err := NewApplier(base); err == nil {
+		t.Fatal("negative replay batch limit was accepted")
+	}
+}
+
 func TestTargetRelationCacheReloadsOnlyForChangedSourceDefinition(t *testing.T) {
 	t.Parallel()
 	cache := newTargetRelationCache()

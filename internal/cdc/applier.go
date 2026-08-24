@@ -43,6 +43,8 @@ type ApplierConfig struct {
 	Durable              *DurableWatermark
 	PollInterval         time.Duration
 	ReconnectDelay       time.Duration
+	BatchMaxDataBytes    int64
+	BatchMaxChanges      int
 	// EndPosition returns the optional inclusive cutover boundary. Transactions
 	// beyond it are never applied.
 	EndPosition func(context.Context) (LSN, bool, error)
@@ -83,6 +85,15 @@ func NewApplier(config ApplierConfig) (*Applier, error) {
 	}
 	if config.ReconnectDelay <= 0 {
 		config.ReconnectDelay = time.Second
+	}
+	if config.BatchMaxDataBytes < 0 || config.BatchMaxChanges < 0 {
+		return nil, errors.New("cdc: replay batch limits must not be negative")
+	}
+	if config.BatchMaxDataBytes == 0 {
+		config.BatchMaxDataBytes = applyBatchDefaultDataBytes
+	}
+	if config.BatchMaxChanges == 0 {
+		config.BatchMaxChanges = applyBatchDefaultChanges
 	}
 	return &Applier{config: config}, nil
 }
@@ -265,9 +276,9 @@ const (
 	// row changes, and decoded payload size. Transactions above the per-source
 	// change limit retain the original standalone apply path.
 	applyBatchMaxTransactions       = 16384
-	applyBatchMaxChanges            = 131072
+	applyBatchDefaultChanges        = 131072
 	applyBatchMaxTransactionChanges = 256
-	applyBatchMaxDataBytes          = 32 << 20
+	applyBatchDefaultDataBytes      = 32 << 20
 )
 
 func (a *Applier) applyFromReader(
@@ -280,7 +291,7 @@ func (a *Applier) applyFromReader(
 ) (bool, LSN, error) {
 	batch := make([]Transaction, 0, applyBatchMaxTransactions)
 	batchChanges := 0
-	batchDataBytes := 0
+	var batchDataBytes int64
 	for {
 		transaction, err := reader.Next()
 		if errors.Is(err, io.EOF) {
@@ -348,11 +359,11 @@ func (a *Applier) applyFromReader(
 			return true, transaction.EndLSN, nil
 		}
 		batchChanges += int(transaction.ChangeCount())
-		batchDataBytes += transactionApplyDataBytes(&transaction)
+		batchDataBytes += int64(transactionApplyDataBytes(&transaction))
 		batch = append(batch, transaction)
 		if len(batch) >= applyBatchMaxTransactions ||
-			batchChanges >= applyBatchMaxChanges ||
-			batchDataBytes >= applyBatchMaxDataBytes {
+			batchChanges >= a.config.BatchMaxChanges ||
+			batchDataBytes >= a.config.BatchMaxDataBytes {
 			return a.applyTransactionBatch(
 				ctx, conn, relationCache, statementCache, batch, progress,
 			)

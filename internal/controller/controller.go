@@ -147,6 +147,8 @@ type configurationView struct {
 	Metrics                string  `json:"metrics"`
 	WALSampleDuration      string  `json:"wal_sample_duration"`
 	SegmentPruneInterval   string  `json:"segment_prune_interval"`
+	ReplayBatchBytes       int64   `json:"replay_batch_bytes"`
+	ReplayBatchChanges     int     `json:"replay_batch_changes"`
 	RetryBaseCopy          bool    `json:"retry_base_copy"`
 	SkipTargetTuning       bool    `json:"skip_target_tuning"`
 	WarnOnTuningErrors     bool    `json:"warn_on_tuning_errors"`
@@ -183,6 +185,8 @@ type configurationUpdate struct {
 	Metrics                *string  `json:"metrics"`
 	WALSampleDuration      *string  `json:"wal_sample_duration"`
 	SegmentPruneInterval   *string  `json:"segment_prune_interval"`
+	ReplayBatchBytes       *int64   `json:"replay_batch_bytes"`
+	ReplayBatchChanges     *int     `json:"replay_batch_changes"`
 	RetryBaseCopy          *bool    `json:"retry_base_copy"`
 	SkipTargetTuning       *bool    `json:"skip_target_tuning"`
 	WarnOnTuningErrors     *bool    `json:"warn_on_tuning_errors"`
@@ -578,6 +582,8 @@ func applyConfigurationUpdate(candidate *config.Config, update configurationUpda
 	setIfPresent(&candidate.VerifyDutyCycle, update.VerifyDutyCycle)
 	setIfPresent(&candidate.VerifyCDCRows, update.VerifyCDCRows)
 	setIfPresent(&candidate.CDCSampleRows, update.CDCSampleRows)
+	setIfPresent(&candidate.ReplayBatchBytes, update.ReplayBatchBytes)
+	setIfPresent(&candidate.ReplayBatchChanges, update.ReplayBatchChanges)
 	if err := parseDurationUpdate("wal_sample_duration", update.WALSampleDuration, &candidate.WALSampleDuration); err != nil {
 		return err
 	}
@@ -618,8 +624,9 @@ func validateConfiguration(cfg config.Config) error {
 		}
 	}
 	if cfg.Workers < 1 || cfg.RestoreJobs < 1 || cfg.SplitThreshold < 1 ||
-		cfg.WALSampleDuration <= 0 || cfg.SegmentPruneInterval <= 0 {
-		return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, and segment-prune-interval must be positive")
+		cfg.WALSampleDuration <= 0 || cfg.SegmentPruneInterval <= 0 ||
+		cfg.ReplayBatchBytes < 1 || cfg.ReplayBatchChanges < 1 {
+		return errors.New("workers, restore-jobs, split-threshold, wal-sample-duration, segment-prune-interval, replay-batch-bytes, and replay-batch-changes must be positive")
 	}
 	if cfg.CDCSampleRows < 0 {
 		return errors.New("cdc-sample-rows must not be negative")
@@ -643,6 +650,7 @@ func viewConfiguration(cfg config.Config, revision string) configurationView {
 		Workers: cfg.Workers, SplitThreshold: cfg.SplitThreshold, RestoreJobs: cfg.RestoreJobs,
 		PGDumpPath: cfg.PGDumpPath, PGRestorePath: cfg.PGRestorePath, Metrics: cfg.Metrics,
 		WALSampleDuration: cfg.WALSampleDuration.String(), SegmentPruneInterval: cfg.SegmentPruneInterval.String(),
+		ReplayBatchBytes: cfg.ReplayBatchBytes, ReplayBatchChanges: cfg.ReplayBatchChanges,
 		RetryBaseCopy: cfg.RetryBaseCopy, SkipTargetTuning: cfg.SkipTargetTuning,
 		WarnOnTuningErrors: cfg.WarnOnTuningErrors, TargetMemory: cfg.TargetMemory,
 		MaintenanceWorkMem: cfg.MaintenanceWorkMem, MaxParallelMaintenance: cfg.MaxParallelMaintenance,

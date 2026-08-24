@@ -1365,8 +1365,10 @@ func runApplierToFollow(
 		StreamID: snapshot.Slot, StreamGeneration: streamGeneration(
 			migration.SourceFingerprint, migration.FilterFingerprint,
 		), TargetHasCopiedData: true, Durable: durable, EndPosition: endPosition(store),
-		AfterProgress: pruner.OnProgress,
-		Sampler:       samplerOrNil(sampler),
+		AfterProgress:     pruner.OnProgress,
+		Sampler:           samplerOrNil(sampler),
+		BatchMaxDataBytes: cfg.ReplayBatchBytes,
+		BatchMaxChanges:   cfg.ReplayBatchChanges,
 	})
 	if err != nil {
 		return err

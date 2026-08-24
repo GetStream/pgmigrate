@@ -287,6 +287,8 @@ directory's writer lock.
 | `--pg-restore <path>` | found on `PATH` | `pg_restore` executable |
 | `--metrics <address>` | off | serve Prometheus metrics at `/metrics` on this address, for example `:9187` |
 | `--segment-prune-interval <duration>` | `1m` | minimum interval between passes that delete applied CDC segments |
+| `--replay-batch-bytes <bytes>` | `33554432` (32 MiB) | maximum decoded CDC payload committed with one target progress checkpoint; larger values use more memory and hold one target transaction longer |
+| `--replay-batch-changes <n>` | `131072` | maximum row changes committed with one target progress checkpoint |
 | `--wal-sample-duration <duration>` | `1m` | source WAL-rate sample for the preflight checks `run` repeats |
 | `--retry-base-copy` | false | restart the base copy even though the last attempts failed the same way; see [Restarting a failed base copy](#restarting-a-failed-base-copy) |
 | `--cdc-sample-rows <n>` | `100000` | applied keys the applier keeps per relation, so `verify` can check the replication path. `0` records none |
@@ -807,6 +809,9 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
   mismatched stream generation or progress is fatal once copied data exists.
   Exact transaction and row-change counters commit with that same progress row,
   survive process failure, and never count a rolled-back replay batch.
+- Replay batch limits only change how many consecutive source transactions share
+  that atomic target commit. They do not add unordered appliers or relax source
+  transaction order.
 - Restarts from `indexes`, `catchup`, or `follow` retain the completed base copy
   and recover staged CDC.
 - Controller actions are isolated child processes. If the replay worker exits,

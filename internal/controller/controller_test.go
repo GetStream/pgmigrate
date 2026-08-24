@@ -316,6 +316,8 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 		"metrics":":9190",
 		"wal_sample_duration":"45s",
 		"segment_prune_interval":"2m",
+		"replay_batch_bytes":67108864,
+		"replay_batch_changes":262144,
 		"retry_base_copy":true,
 		"skip_target_tuning":true,
 		"warn_on_tuning_errors":true,
@@ -345,6 +347,7 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 	decode(t, got, &view)
 	if view.Workers != 7 || view.SplitThreshold != 2048 || view.RestoreJobs != 3 ||
 		view.WALSampleDuration != "45s" || view.SegmentPruneInterval != "2m0s" ||
+		view.ReplayBatchBytes != 67_108_864 || view.ReplayBatchChanges != 262_144 ||
 		view.VerifyWorkers != 2 || view.VerifyTableTimeout != "1h30m0s" || view.VerifyConvergeTimeout != "1m30s" {
 		t.Fatalf("updated view = %#v", view)
 	}
@@ -361,6 +364,8 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 	expected.Metrics = ":9190"
 	expected.WALSampleDuration = 45 * time.Second
 	expected.SegmentPruneInterval = 2 * time.Minute
+	expected.ReplayBatchBytes = 67_108_864
+	expected.ReplayBatchChanges = 262_144
 	expected.RetryBaseCopy = true
 	expected.SkipTargetTuning = true
 	expected.WarnOnTuningErrors = true
@@ -405,6 +410,8 @@ func TestInvalidConfigurationDoesNotReplaceCurrentConfiguration(t *testing.T) {
 	before := server.configurationSnapshot()
 	for _, body := range []string{
 		`{"workers":0}`,
+		`{"replay_batch_bytes":0}`,
+		`{"replay_batch_changes":0}`,
 		`{"wal_sample_duration":"tomorrow"}`,
 		`{"verify_duty_cycle":2}`,
 		`{"unknown_setting":true}`,
@@ -657,7 +664,8 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 	for _, field := range []string{
 		"table_filter", "ack_warnings", "allow_collation_change", "workers",
 		"split_threshold", "restore_jobs", "pg_dump_path", "pg_restore_path",
-		"metrics", "wal_sample_duration", "segment_prune_interval", "retry_base_copy",
+		"metrics", "wal_sample_duration", "segment_prune_interval", "replay_batch_bytes",
+		"replay_batch_changes", "retry_base_copy",
 		"skip_target_tuning", "warn_on_tuning_errors", "target_memory",
 		"maintenance_work_mem", "max_parallel_maintenance_workers", "max_wal_size",
 		"checkpoint_timeout", "verify_workers", "verify_sample_rows",
