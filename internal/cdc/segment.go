@@ -12,21 +12,40 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 const (
-	frameHeaderSize      = 8
-	DefaultRotationBytes = int64(1 << 30)
+	frameHeaderSize          = 8
+	DefaultRotationBytes     = int64(1 << 30)
+	DefaultRecoveryWorkers   = 4
+	MaxRecoveryWorkers       = 4
+	recoveryProgressInterval = time.Second
 )
 
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
 // WriterConfig configures an append-only segment writer.
 type WriterConfig struct {
-	Directory     string
-	RotationBytes int64
-	FileSync      func(*os.File) error
-	DirectorySync func(string) error
+	Directory        string
+	RotationBytes    int64
+	RecoveryWorkers  int
+	RecoveryProgress func(RecoveryProgress)
+	FileSync         func(*os.File) error
+	DirectorySync    func(string) error
+}
+
+// RecoveryProgress reports the read-only validation that precedes reopening a
+// durable CDC stream. The counters are monotonic. BytesTotal is the size
+// observed before validation; the segment checks themselves remain authoritative.
+type RecoveryProgress struct {
+	FilesChecked   int
+	FilesTotal     int
+	BytesScanned   int64
+	BytesTotal     int64
+	BytesTruncated int64
+	Elapsed        time.Duration
 }
 
 // Writer appends complete transactions to one .seg.partial tail.
@@ -179,6 +198,14 @@ func OpenWriter(config WriterConfig) (*Writer, Recovery, error) {
 	if config.RotationBytes == 0 {
 		config.RotationBytes = DefaultRotationBytes
 	}
+	if config.RecoveryWorkers < 0 || config.RecoveryWorkers > MaxRecoveryWorkers {
+		return nil, Recovery{}, fmt.Errorf(
+			"cdc: recovery workers must be between 0 and %d (0 uses the default)", MaxRecoveryWorkers,
+		)
+	}
+	if config.RecoveryWorkers == 0 {
+		config.RecoveryWorkers = DefaultRecoveryWorkers
+	}
 	if config.FileSync == nil {
 		config.FileSync = func(file *os.File) error { return file.Sync() }
 	}
@@ -188,7 +215,9 @@ func OpenWriter(config WriterConfig) (*Writer, Recovery, error) {
 	if err := mkdirAllDurable(config.Directory, 0o750); err != nil {
 		return nil, Recovery{}, err
 	}
-	recovery, finalized, err := recoverDirectory(config.Directory)
+	recovery, finalized, err := recoverDirectoryWithConfig(
+		config.Directory, config.RecoveryWorkers, config.RecoveryProgress,
+	)
 	if err != nil {
 		return nil, Recovery{}, err
 	}
@@ -571,6 +600,19 @@ func Recover(directory string) (Recovery, error) {
 }
 
 func recoverDirectory(directory string) (Recovery, []SegmentRange, error) {
+	return recoverDirectoryWithConfig(directory, DefaultRecoveryWorkers, nil)
+}
+
+type recoverySegmentResult struct {
+	scan scanResult
+	err  error
+}
+
+func recoverDirectoryWithConfig(
+	directory string,
+	workers int,
+	progress func(RecoveryProgress),
+) (Recovery, []SegmentRange, error) {
 	segments, err := listSegments(directory)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -578,48 +620,228 @@ func recoverDirectory(directory string) (Recovery, []SegmentRange, error) {
 		}
 		return Recovery{}, nil, err
 	}
+	if workers < 1 || workers > MaxRecoveryWorkers {
+		return Recovery{}, nil, fmt.Errorf(
+			"cdc: recovery workers must be between 1 and %d", MaxRecoveryWorkers,
+		)
+	}
+
+	partialIndex := len(segments)
+	for i, segment := range segments {
+		if !segment.partial {
+			if partialIndex != len(segments) {
+				return Recovery{}, nil, errors.New("cdc: finalized segment follows partial tail")
+			}
+			continue
+		}
+		if partialIndex != len(segments) {
+			return Recovery{}, nil, errors.New("cdc: multiple partial segments")
+		}
+		partialIndex = i
+	}
+
+	totalBytes, err := prepareRecoverySegments(segments)
+	if err != nil {
+		return Recovery{}, nil, err
+	}
+	reporter := newRecoveryProgressReporter(len(segments), totalBytes, progress)
+	defer reporter.finish()
+
+	finalizedSegments := segments[:partialIndex]
+	results := make([]recoverySegmentResult, len(finalizedSegments))
+	if len(finalizedSegments) != 0 {
+		workerCount := min(workers, len(finalizedSegments))
+		jobs := make(chan int)
+		var group sync.WaitGroup
+		group.Add(workerCount)
+		for range workerCount {
+			go func() {
+				defer group.Done()
+				for index := range jobs {
+					segment := finalizedSegments[index]
+					results[index].scan, results[index].err = scanSegmentWithProgress(
+						segment.path, false, 0, 0, nil, reporter.addBytes, segment.size,
+					)
+					if results[index].err == nil {
+						reporter.completeFile()
+					}
+				}
+			}()
+		}
+		for index := range finalizedSegments {
+			jobs <- index
+		}
+		close(jobs)
+		group.Wait()
+	}
+
 	var result Recovery
 	finalized := make([]SegmentRange, 0, len(segments))
 	var previousCommit LSN
 	var previousEnd LSN
-	partialSeen := false
-	for _, segment := range segments {
-		if segment.partial {
-			if partialSeen {
-				return Recovery{}, nil, errors.New("cdc: multiple partial segments")
-			}
-			partialSeen = true
-			result.PartialPath = segment.path
-		} else if partialSeen {
-			return Recovery{}, nil, errors.New("cdc: finalized segment follows partial tail")
+	for index, segment := range finalizedSegments {
+		item := results[index]
+		if item.err != nil {
+			return Recovery{}, nil, item.err
 		}
+		scan := item.scan
+		if scan.frames != 0 {
+			if scan.firstCommitLSN <= previousCommit {
+				return Recovery{}, nil, fmt.Errorf(
+					"cdc: corrupt finalized segment %s at byte 0: non-monotonic commit LSN %x after %x",
+					filepath.Base(segment.path), scan.firstCommitLSN, previousCommit,
+				)
+			}
+			if scan.firstEndLSN <= previousEnd {
+				return Recovery{}, nil, fmt.Errorf(
+					"cdc: corrupt finalized segment %s at byte 0: non-monotonic end LSN %x after %x",
+					filepath.Base(segment.path), scan.firstEndLSN, previousEnd,
+				)
+			}
+			previousCommit = scan.lastCommitLSN
+			previousEnd = scan.lastEndLSN
+		}
+		finalized = append(finalized, SegmentRange{
+			Path:          segment.path,
+			StartCommit:   segment.start,
+			LastCommit:    previousCommit,
+			LastEnd:       previousEnd,
+			ValidatedSize: scan.size,
+		})
+	}
 
-		scan, scanErr := scanSegment(segment.path, segment.partial, previousCommit, previousEnd, nil)
+	if partialIndex < len(segments) {
+		partial := segments[partialIndex]
+		result.PartialPath = partial.path
+		scan, scanErr := scanSegmentWithProgress(
+			partial.path, true, previousCommit, previousEnd, nil, reporter.addBytes, partial.size,
+		)
 		if scanErr != nil {
 			return Recovery{}, nil, scanErr
 		}
-		if !segment.partial {
-			finalized = append(finalized, SegmentRange{
-				Path:          segment.path,
-				StartCommit:   segment.start,
-				LastCommit:    scan.lastCommitLSN,
-				LastEnd:       scan.lastEndLSN,
-				ValidatedSize: scan.size,
-			})
-		}
+		reporter.repairedTail(scan.truncated)
+		reporter.completeFile()
 		previousCommit = scan.lastCommitLSN
 		previousEnd = scan.lastEndLSN
-		result.TruncatedBytes += scan.truncated
+		result.TruncatedBytes = scan.truncated
 	}
 	result.LastCommitLSN = previousCommit
 	result.DurableLSN = previousEnd
 	return result, finalized, nil
 }
 
+func prepareRecoverySegments(segments []segmentFile) (int64, error) {
+	var total int64
+	for index := range segments {
+		segment := &segments[index]
+		info, err := os.Stat(segment.path)
+		if err != nil {
+			return 0, fmt.Errorf("cdc: stat segment %s: %w", filepath.Base(segment.path), err)
+		}
+		if !info.Mode().IsRegular() {
+			return 0, fmt.Errorf("cdc: segment %s is not a regular file", filepath.Base(segment.path))
+		}
+		if info.Size() > (1<<63-1)-total {
+			return 0, errors.New("cdc: segment byte total overflows int64")
+		}
+		segment.size = info.Size()
+		total += info.Size()
+	}
+	return total, nil
+}
+
+type recoveryProgressReporter struct {
+	callback   func(RecoveryProgress)
+	started    time.Time
+	filesTotal int
+	bytesTotal int64
+	filesDone  atomic.Int64
+	bytesDone  atomic.Int64
+	bytesTorn  atomic.Int64
+	nextReport atomic.Int64
+	callbackMu sync.Mutex
+}
+
+func newRecoveryProgressReporter(
+	filesTotal int,
+	bytesTotal int64,
+	callback func(RecoveryProgress),
+) *recoveryProgressReporter {
+	started := time.Now()
+	reporter := &recoveryProgressReporter{
+		callback: callback, started: started, filesTotal: filesTotal, bytesTotal: bytesTotal,
+	}
+	reporter.nextReport.Store(started.Add(recoveryProgressInterval).UnixNano())
+	reporter.report()
+	return reporter
+}
+
+func (r *recoveryProgressReporter) addBytes(count int64) {
+	if count <= 0 {
+		return
+	}
+	for {
+		previous := r.bytesDone.Load()
+		next := previous + count
+		if next < previous || next > r.bytesTotal {
+			next = r.bytesTotal
+		}
+		if r.bytesDone.CompareAndSwap(previous, next) {
+			break
+		}
+	}
+	if r.callback == nil {
+		return
+	}
+	now := time.Now()
+	for {
+		next := r.nextReport.Load()
+		if now.UnixNano() < next {
+			return
+		}
+		if r.nextReport.CompareAndSwap(next, now.Add(recoveryProgressInterval).UnixNano()) {
+			r.report()
+			return
+		}
+	}
+}
+
+func (r *recoveryProgressReporter) completeFile() {
+	r.filesDone.Add(1)
+	r.report()
+}
+
+func (r *recoveryProgressReporter) repairedTail(count int64) {
+	if count > 0 {
+		r.bytesTorn.Add(count)
+	}
+}
+
+func (r *recoveryProgressReporter) finish() {
+	r.report()
+}
+
+func (r *recoveryProgressReporter) report() {
+	if r.callback == nil {
+		return
+	}
+	r.callbackMu.Lock()
+	defer r.callbackMu.Unlock()
+	r.callback(RecoveryProgress{
+		FilesChecked:   int(r.filesDone.Load()),
+		FilesTotal:     r.filesTotal,
+		BytesScanned:   r.bytesDone.Load(),
+		BytesTotal:     r.bytesTotal,
+		BytesTruncated: r.bytesTorn.Load(),
+		Elapsed:        time.Since(r.started),
+	})
+}
+
 type segmentFile struct {
 	path    string
 	start   LSN
 	partial bool
+	size    int64
 }
 
 func listSegments(directory string) ([]segmentFile, error) {
@@ -672,13 +894,27 @@ func parseSegmentName(name string) (LSN, bool, bool) {
 }
 
 type scanResult struct {
-	lastCommitLSN LSN
-	lastEndLSN    LSN
-	size          int64
-	truncated     int64
+	firstCommitLSN LSN
+	firstEndLSN    LSN
+	lastCommitLSN  LSN
+	lastEndLSN     LSN
+	size           int64
+	truncated      int64
+	frames         int64
 }
 
 func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, visit func(Transaction) error) (scanResult, error) {
+	return scanSegmentWithProgress(path, repairTail, previousCommit, previousEnd, visit, nil, -1)
+}
+
+func scanSegmentWithProgress(
+	path string,
+	repairTail bool,
+	previousCommit, previousEnd LSN,
+	visit func(Transaction) error,
+	onRead func(int64),
+	expectedSize int64,
+) (scanResult, error) {
 	flags := os.O_RDONLY
 	if repairTail {
 		flags = os.O_RDWR
@@ -692,6 +928,16 @@ func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, 
 	if err != nil {
 		return scanResult{}, fmt.Errorf("cdc: stat segment %s: %w", filepath.Base(path), err)
 	}
+	if expectedSize >= 0 && info.Size() != expectedSize {
+		return scanResult{}, fmt.Errorf(
+			"cdc: segment %s changed before recovery validation: size is %d, expected %d",
+			filepath.Base(path), info.Size(), expectedSize,
+		)
+	}
+	var reader io.Reader = file
+	if onRead != nil {
+		reader = recoveryCountingReader{reader: file, onRead: onRead}
+	}
 
 	result := scanResult{lastCommitLSN: previousCommit, lastEndLSN: previousEnd}
 	payload := make([]byte, 0, 64<<10)
@@ -700,7 +946,7 @@ func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, 
 	var invalid error
 	for {
 		frameStart := result.size
-		n, readErr := io.ReadFull(file, header[:])
+		n, readErr := io.ReadFull(reader, header[:])
 		if readErr == io.EOF {
 			break
 		}
@@ -719,7 +965,7 @@ func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, 
 		expected := binary.LittleEndian.Uint32(header[4:8])
 		var tx Transaction
 		if visit == nil {
-			tx, readErr = scanTransactionMetadata(file, length, expected, streamBuffer)
+			tx, readErr = scanTransactionMetadata(reader, length, expected, streamBuffer)
 			if readErr != nil {
 				invalid = readErr
 				result.size = frameStart
@@ -731,7 +977,7 @@ func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, 
 			} else {
 				payload = payload[:int(length)]
 			}
-			if _, readErr = io.ReadFull(file, payload); readErr != nil {
+			if _, readErr = io.ReadFull(reader, payload); readErr != nil {
 				invalid = fmt.Errorf("short frame payload: %w", readErr)
 				result.size = frameStart
 				break
@@ -759,9 +1005,14 @@ func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, 
 			result.size = frameStart
 			break
 		}
+		if result.frames == 0 {
+			result.firstCommitLSN = tx.CommitLSN
+			result.firstEndLSN = tx.EndLSN
+		}
 		result.lastCommitLSN = tx.CommitLSN
 		result.lastEndLSN = tx.EndLSN
 		result.size += int64(frameHeaderSize) + int64(length)
+		result.frames++
 		if visit != nil {
 			if err := visit(tx); err != nil {
 				return result, err
@@ -770,6 +1021,11 @@ func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, 
 	}
 
 	if invalid == nil {
+		if expectedSize >= 0 {
+			if err := requireUnchangedRecoverySize(file, path, info.Size()); err != nil {
+				return scanResult{}, err
+			}
+		}
 		if repairTail {
 			if err := file.Sync(); err != nil {
 				return scanResult{}, fmt.Errorf("cdc: fsync recovered segment %s: %w", filepath.Base(path), err)
@@ -779,6 +1035,11 @@ func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, 
 	}
 	if !repairTail {
 		return scanResult{}, fmt.Errorf("cdc: corrupt finalized segment %s at byte %d: %w", filepath.Base(path), result.size, invalid)
+	}
+	if expectedSize >= 0 {
+		if err := requireUnchangedRecoverySize(file, path, info.Size()); err != nil {
+			return scanResult{}, err
+		}
 	}
 	result.truncated = info.Size() - result.size
 	if err := file.Truncate(result.size); err != nil {
@@ -790,8 +1051,35 @@ func scanSegment(path string, repairTail bool, previousCommit, previousEnd LSN, 
 	return result, nil
 }
 
+func requireUnchangedRecoverySize(file *os.File, path string, expected int64) error {
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("cdc: restat segment %s: %w", filepath.Base(path), err)
+	}
+	if info.Size() != expected {
+		return fmt.Errorf(
+			"cdc: segment %s changed during recovery validation: size is %d, expected %d",
+			filepath.Base(path), info.Size(), expected,
+		)
+	}
+	return nil
+}
+
+type recoveryCountingReader struct {
+	reader io.Reader
+	onRead func(int64)
+}
+
+func (r recoveryCountingReader) Read(buffer []byte) (int, error) {
+	read, err := r.reader.Read(buffer)
+	if read > 0 {
+		r.onRead(int64(read))
+	}
+	return read, err
+}
+
 func scanTransactionMetadata(
-	file *os.File,
+	reader io.Reader,
 	length uint32,
 	expected uint32,
 	buffer []byte,
@@ -802,7 +1090,7 @@ func scanTransactionMetadata(
 	}
 	checksum := crc32.New(castagnoliTable)
 	var metadata [metadataBytes]byte
-	if _, err := io.ReadFull(file, metadata[:]); err != nil {
+	if _, err := io.ReadFull(reader, metadata[:]); err != nil {
 		return Transaction{}, fmt.Errorf("short frame payload: %w", err)
 	}
 	_, _ = checksum.Write(metadata[:])
@@ -812,7 +1100,7 @@ func scanTransactionMetadata(
 		if chunk > remaining {
 			chunk = remaining
 		}
-		if _, err := io.ReadFull(file, buffer[:int(chunk)]); err != nil {
+		if _, err := io.ReadFull(reader, buffer[:int(chunk)]); err != nil {
 			return Transaction{}, fmt.Errorf("short frame payload: %w", err)
 		}
 		_, _ = checksum.Write(buffer[:int(chunk)])

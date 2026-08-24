@@ -238,6 +238,51 @@ func cdcBinaryMode(tables []pgcopy.Table, sourceMajor, targetMajor int) bool {
 	return cdc.PGOutputBinarySafe(relations)
 }
 
+func cdcRecoveryProgress(output io.Writer) func(cdc.RecoveryProgress) {
+	return func(progress cdc.RecoveryProgress) {
+		_, _ = fmt.Fprintln(output, formatCDCRecoveryProgress(progress))
+	}
+}
+
+func formatCDCRecoveryProgress(progress cdc.RecoveryProgress) string {
+	rate := float64(0)
+	if progress.Elapsed > 0 {
+		rate = float64(progress.BytesScanned) / progress.Elapsed.Seconds()
+	}
+	eta := "measuring"
+	remaining := progress.BytesTotal - progress.BytesScanned
+	if progress.FilesChecked == progress.FilesTotal {
+		eta = "0s"
+	} else if rate > 0 && remaining > 0 {
+		etaDuration := time.Duration(float64(remaining) / rate * float64(time.Second))
+		eta = etaDuration.Round(time.Second).String()
+	}
+	repair := ""
+	if progress.BytesTruncated > 0 {
+		repair = fmt.Sprintf(" · %s invalid tail repaired", formatCDCRecoveryBytes(progress.BytesTruncated))
+	}
+	return fmt.Sprintf(
+		"CDC recovery: %d/%d files checked · %s/%s scanned%s · %.1f MiB/s · ETA %s",
+		progress.FilesChecked,
+		progress.FilesTotal,
+		formatCDCRecoveryBytes(progress.BytesScanned),
+		formatCDCRecoveryBytes(progress.BytesTotal),
+		repair,
+		rate/float64(1<<20),
+		eta,
+	)
+}
+
+func formatCDCRecoveryBytes(bytes int64) string {
+	if bytes < 1<<20 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes >= 1<<30 {
+		return fmt.Sprintf("%.1f GiB", float64(bytes)/float64(1<<30))
+	}
+	return fmt.Sprintf("%.1f MiB", float64(bytes)/float64(1<<20))
+}
+
 func persistCDCBinaryMode(ctx context.Context, store *state.Store, binary bool) error {
 	return store.CompleteStep(ctx, "cdc.binary", strconv.FormatBool(binary))
 }
@@ -455,7 +500,10 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	}
 
 	cdcDir := filepath.Join(cfg.Dir, "cdc")
-	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{Directory: cdcDir})
+	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{
+		Directory:        cdcDir,
+		RecoveryProgress: cdcRecoveryProgress(a.progressOutput()),
+	})
 	if err != nil {
 		return err
 	}
@@ -658,7 +706,10 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 		return errors.New("snapshot metadata does not match durable migration state")
 	}
 	cdcDir := filepath.Join(cfg.Dir, "cdc")
-	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{Directory: cdcDir})
+	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{
+		Directory:        cdcDir,
+		RecoveryProgress: cdcRecoveryProgress(a.progressOutput()),
+	})
 	if err != nil {
 		return err
 	}

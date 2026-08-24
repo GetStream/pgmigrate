@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GetStream/pgmigrate/internal/cdc"
 	"github.com/GetStream/pgmigrate/internal/config"
@@ -310,6 +311,54 @@ func TestStreamGenerationAndBinaryModeAreStable(t *testing.T) {
 	custom := []copy.Table{{Columns: []copy.Column{{TypeOID: 16384}}}}
 	if cdcBinaryMode(custom, 17, 17) {
 		t.Fatal("custom type selected binary CDC")
+	}
+}
+
+func TestFormatCDCRecoveryProgress(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		progress cdc.RecoveryProgress
+		want     string
+	}{
+		{
+			name: "measuring",
+			progress: cdc.RecoveryProgress{
+				FilesTotal: 4, BytesTotal: 4 << 30,
+			},
+			want: "CDC recovery: 0/4 files checked · 0 B/4.0 GiB scanned · 0.0 MiB/s · ETA measuring",
+		},
+		{
+			name: "rate and ETA",
+			progress: cdc.RecoveryProgress{
+				FilesChecked: 2, FilesTotal: 4,
+				BytesScanned: 2 << 30, BytesTotal: 4 << 30, Elapsed: 2 * time.Second,
+			},
+			want: "CDC recovery: 2/4 files checked · 2.0 GiB/4.0 GiB scanned · 1024.0 MiB/s · ETA 2s",
+		},
+		{
+			name: "complete",
+			progress: cdc.RecoveryProgress{
+				FilesChecked: 4, FilesTotal: 4,
+				BytesScanned: 4 << 30, BytesTotal: 4 << 30, Elapsed: 4 * time.Second,
+			},
+			want: "CDC recovery: 4/4 files checked · 4.0 GiB/4.0 GiB scanned · 1024.0 MiB/s · ETA 0s",
+		},
+		{
+			name: "repaired tail is explicit",
+			progress: cdc.RecoveryProgress{
+				FilesChecked: 1, FilesTotal: 1,
+				BytesScanned: 8, BytesTotal: 1024, BytesTruncated: 1016, Elapsed: time.Second,
+			},
+			want: "CDC recovery: 1/1 files checked · 8 B/1024 B scanned · 1016 B invalid tail repaired · 0.0 MiB/s · ETA 0s",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := formatCDCRecoveryProgress(test.progress); got != test.want {
+				t.Fatalf("formatCDCRecoveryProgress() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 

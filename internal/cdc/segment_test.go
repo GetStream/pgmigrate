@@ -10,7 +10,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestWriterSyncAdvancesCompleteTransactionBoundary(t *testing.T) {
@@ -764,6 +767,237 @@ func TestRecoveryRejectsCorruptFinalizedSegment(t *testing.T) {
 	}
 }
 
+func TestParallelRecoveryMatchesSerialAndReportsMonotonicProgress(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: dir, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for lsn := LSN(0x10); lsn <= 0x80; lsn += 0x10 {
+		transaction := testTransaction(lsn)
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	serial, serialRecovery, err := OpenWriter(WriterConfig{
+		Directory: dir, RotationBytes: 1, RecoveryWorkers: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCatalog := serial.SegmentCatalog().snapshot()
+	if err := serial.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		callbackActive atomic.Int32
+		callbackRaced  atomic.Bool
+		progressMu     sync.Mutex
+		progress       []RecoveryProgress
+	)
+	parallel, parallelRecovery, err := OpenWriter(WriterConfig{
+		Directory:       dir,
+		RotationBytes:   1,
+		RecoveryWorkers: MaxRecoveryWorkers,
+		RecoveryProgress: func(current RecoveryProgress) {
+			if callbackActive.Add(1) != 1 {
+				callbackRaced.Store(true)
+			}
+			// Make overlapping worker completions contend for the callback. The
+			// callback contract still requires them to be serialized.
+			time.Sleep(2 * time.Millisecond)
+			progressMu.Lock()
+			progress = append(progress, current)
+			progressMu.Unlock()
+			callbackActive.Add(-1)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parallel.Close()
+	if callbackRaced.Load() {
+		t.Fatal("recovery progress callback ran concurrently")
+	}
+	if !reflect.DeepEqual(parallelRecovery, serialRecovery) {
+		t.Fatalf("parallel recovery = %#v, serial = %#v", parallelRecovery, serialRecovery)
+	}
+	if got := parallel.SegmentCatalog().snapshot(); !reflect.DeepEqual(got, wantCatalog) {
+		t.Fatalf("parallel catalog = %#v, serial = %#v", got, wantCatalog)
+	}
+
+	progressMu.Lock()
+	snapshots := append([]RecoveryProgress(nil), progress...)
+	progressMu.Unlock()
+	if len(snapshots) < len(wantCatalog)+2 {
+		t.Fatalf("progress snapshots = %d, want initial, per-file, and final reports", len(snapshots))
+	}
+	for index, current := range snapshots {
+		if current.FilesTotal != len(wantCatalog) {
+			t.Fatalf("progress[%d] files total = %d, want %d", index, current.FilesTotal, len(wantCatalog))
+		}
+		if current.BytesScanned > current.BytesTotal {
+			t.Fatalf("progress[%d] scanned %d > total %d", index, current.BytesScanned, current.BytesTotal)
+		}
+		if index == 0 {
+			continue
+		}
+		previous := snapshots[index-1]
+		if current.FilesChecked < previous.FilesChecked ||
+			current.BytesScanned < previous.BytesScanned || current.Elapsed < previous.Elapsed {
+			t.Fatalf("progress regressed from %#v to %#v", previous, current)
+		}
+	}
+	last := snapshots[len(snapshots)-1]
+	if last.FilesChecked != last.FilesTotal || last.BytesScanned != last.BytesTotal {
+		t.Fatalf("final progress = %#v, want all files and bytes", last)
+	}
+}
+
+func TestParallelRecoveryRejectsAnyFinalizedCorruptionBeforeRepairingPartial(t *testing.T) {
+	for _, corruptIndex := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("segment %d", corruptIndex), func(t *testing.T) {
+			dir, finalized, partial := finalizedWithTornPartial(t)
+			before, err := os.ReadFile(partial)
+			if err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.OpenFile(finalized[corruptIndex].path, os.O_WRONLY, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.WriteAt([]byte{0xff}, frameHeaderSize); err != nil {
+				_ = file.Close()
+				t.Fatal(err)
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			var reports []RecoveryProgress
+			_, _, err = OpenWriter(WriterConfig{
+				Directory: dir, RecoveryWorkers: MaxRecoveryWorkers,
+				RecoveryProgress: func(progress RecoveryProgress) {
+					reports = append(reports, progress)
+				},
+			})
+			if err == nil || !strings.Contains(err.Error(), filepath.Base(finalized[corruptIndex].path)) {
+				t.Fatalf("parallel recovery error = %v, want corrupted segment name", err)
+			}
+			after, readErr := os.ReadFile(partial)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatal("parallel finalized-segment failure repaired the partial tail")
+			}
+			last := reports[len(reports)-1]
+			if last.FilesChecked >= last.FilesTotal {
+				t.Fatalf("failed validation reported every file checked: %#v", last)
+			}
+		})
+	}
+}
+
+func TestParallelRecoveryEnforcesCrossSegmentOrdering(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		first  Transaction
+		second Transaction
+		want   string
+	}{
+		{
+			name:   "commit LSN",
+			first:  transactionWithLSNs(0x20, 0x30),
+			second: transactionWithLSNs(0x10, 0x40),
+			want:   "non-monotonic commit LSN",
+		},
+		{
+			name:   "end LSN",
+			first:  transactionWithLSNs(0x10, 0x50),
+			second: transactionWithLSNs(0x20, 0x30),
+			want:   "non-monotonic end LSN",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeFinalizedTransaction(t, dir, 0x10, test.first)
+			writeFinalizedTransaction(t, dir, 0x20, test.second)
+			_, _, err := OpenWriter(WriterConfig{
+				Directory: dir, RecoveryWorkers: MaxRecoveryWorkers,
+			})
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("parallel recovery error = %v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestParallelRecoveryRepairsTornPartialAfterFinalizedSegments(t *testing.T) {
+	t.Parallel()
+	dir, _, partial := finalizedWithTornPartial(t)
+	info, err := os.Stat(partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tornSize := info.Size()
+
+	var reports []RecoveryProgress
+	writer, recovery, err := OpenWriter(WriterConfig{
+		Directory: dir, RecoveryWorkers: MaxRecoveryWorkers,
+		RecoveryProgress: func(progress RecoveryProgress) {
+			reports = append(reports, progress)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovery.LastCommitLSN != 0x40 || recovery.DurableLSN != 0x41 || recovery.TruncatedBytes != 4 {
+		t.Fatalf("parallel recovery = %#v, want commit/end 40/41 and four truncated bytes", recovery)
+	}
+	if last := reports[len(reports)-1]; last.BytesTruncated != 4 || last.FilesChecked != last.FilesTotal {
+		t.Fatalf("repaired-tail progress = %#v", last)
+	}
+	info, err = os.Stat(partial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != tornSize-4 {
+		t.Fatalf("repaired partial size = %d, want %d", info.Size(), tornSize-4)
+	}
+	next := testTransaction(0x50)
+	if err := writer.Append(&next); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	transactions, err := ReadTransactionsAfter(dir, 0, writer.DurableEndLSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := commitLSNs(transactions), []LSN{0x10, 0x20, 0x30, 0x40, 0x50}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("commit LSNs after repair = %x, want %x", got, want)
+	}
+}
+
+func TestOpenWriterValidatesRecoveryWorkerLimit(t *testing.T) {
+	t.Parallel()
+	for _, workers := range []int{-1, MaxRecoveryWorkers + 1} {
+		if _, _, err := OpenWriter(WriterConfig{
+			Directory: t.TempDir(), RecoveryWorkers: workers,
+		}); err == nil || !strings.Contains(err.Error(), "0 uses the default") {
+			t.Errorf("OpenWriter workers=%d error = %v", workers, err)
+		}
+	}
+}
+
 func TestPruneKeepsOneSafetySegment(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -889,6 +1123,76 @@ func BenchmarkSegmentAppend(b *testing.B) {
 	b.StopTimer()
 	if err := writer.Close(); err != nil {
 		b.Fatal(err)
+	}
+}
+
+func finalizedWithTornPartial(t *testing.T) (string, []segmentFile, string) {
+	t.Helper()
+	dir := t.TempDir()
+	writer, _, err := OpenWriter(WriterConfig{Directory: dir, RotationBytes: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, lsn := range []LSN{0x10, 0x20, 0x30} {
+		transaction := testTransaction(lsn)
+		if err := writer.Append(&transaction); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writer, _, err = OpenWriter(WriterConfig{
+		Directory: dir, RotationBytes: int64(^uint64(0) >> 1), RecoveryWorkers: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tail := testTransaction(0x40)
+	if err := writer.Append(&tail); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	partial := onlySegment(t, dir, ".seg.partial")
+	file, err := os.OpenFile(partial, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write([]byte{1, 2, 3, 4}); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	segments, err := listSegments(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finalized := segments[:len(segments)-1]
+	if len(finalized) != 3 || !segments[len(segments)-1].partial {
+		t.Fatalf("fixture segments = %#v", segments)
+	}
+	return dir, finalized, partial
+}
+
+func transactionWithLSNs(commit, end LSN) Transaction {
+	transaction := testTransaction(commit)
+	transaction.EndLSN = end
+	return transaction
+}
+
+func writeFinalizedTransaction(t *testing.T, dir string, start LSN, transaction Transaction) {
+	t.Helper()
+	payload, err := MarshalTransaction(&transaction)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%016x.seg", uint64(start)))
+	if err := os.WriteFile(path, encodedFrame(payload), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 

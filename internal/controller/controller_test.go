@@ -698,6 +698,12 @@ func TestIndexContainsControllerProgressUI(t *testing.T) {
 	for _, want := range []string{
 		"pgmigrate controller", "Object completion", "lifecycleBar", "Stop migration",
 		"confirmDialog", "data-action=\"run\" disabled", "no rows compared",
+		"latestCDCRecovery", "CDC files checked", "CDC validation read throughput",
+		"Validating durable CDC segments before reconnecting source capture and target replay.",
+		"replayTrendWarmupSeconds=15", "trend and ETA after", "resetReplaySamplesForOperation",
+		"new migration operation · collecting a clean sample", "assertCDCRecoveryParser",
+		"1016 B invalid tail repaired", "CDC recovery progress parser self-test failed",
+		"['indexes','catchup','follow','drained','cutover'].includes(phase)",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("index does not contain %q", want)
