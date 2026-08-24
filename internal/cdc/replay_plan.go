@@ -66,6 +66,23 @@ func buildReplayPlanForGeneration(
 	transactions []Transaction,
 	relations []map[uint32]*targetRelation,
 ) (replayPlan, error) {
+	return buildReplayPlanForGenerationVersion(
+		streamID, generation, startGeneration, startLSN, laneCount,
+		transactions, relations, replayClaimPlanVersion,
+	)
+}
+
+func buildReplayPlanForGenerationVersion(
+	streamID, generation, startGeneration string,
+	startLSN LSN,
+	laneCount int,
+	transactions []Transaction,
+	relations []map[uint32]*targetRelation,
+	planVersion int,
+) (replayPlan, error) {
+	if planVersion < replayClaimMinimumPlanVersion || planVersion > replayClaimPlanVersion {
+		return replayPlan{}, fmt.Errorf("cdc: unsupported replay claim plan version %d", planVersion)
+	}
 	if streamID == "" || generation == "" || startGeneration == "" ||
 		laneCount < 1 || len(transactions) == 0 ||
 		len(relations) != len(transactions) {
@@ -81,7 +98,7 @@ func buildReplayPlanForGeneration(
 		if fingerprint, exists := relationFingerprints[relation]; exists {
 			return fingerprint
 		}
-		fingerprint := targetRelationReplayFingerprint(relation)
+		fingerprint := targetRelationReplayFingerprintVersion(relation, planVersion)
 		relationFingerprints[relation] = fingerprint
 		return fingerprint
 	}
@@ -141,8 +158,8 @@ func buildReplayPlanForGeneration(
 			for changeIndex := range transaction.Changes {
 				change := &transaction.Changes[changeIndex]
 				target := resolved[change.RelationOID]
-				key, safe, err := replayChangeKey(
-					target, fingerprintFor(target), change,
+				key, safe, err := replayChangeKeyForVersion(
+					planVersion, target, fingerprintFor(target), change,
 				)
 				if err != nil {
 					return replayPlan{}, err
@@ -219,7 +236,7 @@ func buildReplayPlanForGeneration(
 		StartLSN:        startLSN,
 		EndLSN:          transactions[len(transactions)-1].EndLSN,
 		CatalogDigest:   finishReplayHash(catalogHasher),
-		PlanVersion:     replayClaimPlanVersion,
+		PlanVersion:     planVersion,
 		LaneCount:       laneCount,
 		Transactions:    transactionsApplied,
 		Changes:         changesApplied,
@@ -342,7 +359,23 @@ func replayPlanWorkTransactions(works []replayClaimWork) int64 {
 	return result
 }
 
-func replayChangeKey(
+func replayChangeKeyForVersion(
+	planVersion int,
+	relation *targetRelation,
+	relationFingerprint [sha256.Size]byte,
+	change *Change,
+) ([sha256.Size]byte, bool, error) {
+	if planVersion == 2 {
+		return replayChangeKeyV2(relation, relationFingerprint, change)
+	}
+	return replayChangeKey(relation, relationFingerprint, change)
+}
+
+// replayChangeKeyV2 reconstructs claims written by v58 exactly. Keep this
+// frozen until every plan-version-2 claim has been finalized: a rolling restart
+// may otherwise reinterpret an in-flight claim and either reject safe resume or
+// repeat already committed work.
+func replayChangeKeyV2(
 	relation *targetRelation,
 	relationFingerprint [sha256.Size]byte,
 	change *Change,
@@ -372,7 +405,7 @@ func replayChangeKey(
 			return [sha256.Size]byte{}, false, err
 		}
 	case ChangeUpdate:
-		if !canPrimaryKeyUpsert(relation, change) {
+		if !canPrimaryKeyUpsertV2(relation, change) {
 			return [sha256.Size]byte{}, false, nil
 		}
 		tuple = change.New
@@ -412,6 +445,147 @@ func replayChangeKey(
 		writeReplayHashBytes(hasher, datum.Data)
 	}
 	return finishReplayHash(hasher), true, nil
+}
+
+func replayChangeKey(
+	relation *targetRelation,
+	relationFingerprint [sha256.Size]byte,
+	change *Change,
+) ([sha256.Size]byte, bool, error) {
+	if relation == nil || change == nil || !relation.capabilities.relationOrderedLane {
+		return [sha256.Size]byte{}, false, nil
+	}
+	if !replayLanePayloadSafe(relation, change) {
+		return [sha256.Size]byte{}, false, nil
+	}
+	var tuple *Tuple
+	switch change.Kind {
+	case ChangeInsert:
+		tuple = change.New
+		if err := validateTuple(relation, tuple, ChangeInsert); err != nil {
+			return [sha256.Size]byte{}, false, err
+		}
+	case ChangeUpdate:
+		tuple = change.New
+		if err := validateTuple(relation, tuple, ChangeUpdate); err != nil {
+			return [sha256.Size]byte{}, false, err
+		}
+	case ChangeDelete:
+		tuple = change.Old
+		if err := validateTuple(relation, tuple, ChangeDelete); err != nil {
+			return [sha256.Size]byte{}, false, err
+		}
+	default:
+		return [sha256.Size]byte{}, false, nil
+	}
+
+	// A non-primary UNIQUE/exclusion index can make different primary-key rows
+	// conflict, and some otherwise-side-effect-free relations do not expose a
+	// canonical primary key at all. Give every such write the same table key.
+	// This serializes that table in source order while still allowing unrelated
+	// tables to run concurrently. Multi-table source transactions carry every
+	// relation key and are unioned atomically by the component planner.
+	if !relation.capabilities.relationLane || relation.capabilities.crossKeyConflicts {
+		return replayRelationLaneKey(relation, relationFingerprint)
+	}
+
+	primary := primaryKeyColumns(relation)
+	if len(primary) == 0 {
+		return [sha256.Size]byte{}, false, nil
+	}
+	for _, column := range primary {
+		if !column.replayKeySafe {
+			return [sha256.Size]byte{}, false, nil
+		}
+	}
+
+	switch change.Kind {
+	case ChangeUpdate:
+		// Ordering eligibility depends only on a present, stable primary key.
+		// Non-key UnchangedToast values select a different DML shape but cannot
+		// make two primary-key rows conflict, so they must not create a global
+		// serial barrier.
+		if !canShardUpdateByPrimaryKey(relation, change) {
+			return replayRelationLaneKey(relation, relationFingerprint)
+		}
+	case ChangeDelete:
+		deletePrimary, safe := primaryKeyDeleteColumns(relation)
+		if !safe || !sameTargetColumns(primary, deletePrimary) {
+			return replayRelationLaneKey(relation, relationFingerprint)
+		}
+	}
+	if tuple == nil {
+		return [sha256.Size]byte{}, false, nil
+	}
+
+	hasher := newReplayClaimHasher("pgmigrate-replay-lane-v1")
+	writeReplayHashBytes(hasher, relationFingerprint[:])
+	for _, column := range primary {
+		if column.sourceIndex < 0 || column.sourceIndex >= len(*tuple) {
+			return [sha256.Size]byte{}, false, nil
+		}
+		datum := (*tuple)[column.sourceIndex]
+		if datum.Kind == DatumNull || datum.Kind == DatumUnchangedToast {
+			return [sha256.Size]byte{}, false, nil
+		}
+		if !replayKeyDatumSafe(column.oid, datum.Kind) {
+			return [sha256.Size]byte{}, false, nil
+		}
+		if _, err := datumParamForColumn(relation, column, datum, change.Kind); err != nil {
+			return [sha256.Size]byte{}, false, err
+		}
+		writeReplayHashInt(hasher, int64(datum.Kind))
+		writeReplayHashBytes(hasher, datum.Data)
+	}
+	return finishReplayHash(hasher), true, nil
+}
+
+func replayRelationLaneKey(
+	relation *targetRelation,
+	relationFingerprint [sha256.Size]byte,
+) ([sha256.Size]byte, bool, error) {
+	if relation == nil || !relation.capabilities.relationOrderedLane {
+		return [sha256.Size]byte{}, false, nil
+	}
+	hasher := newReplayClaimHasher("pgmigrate-replay-relation-lane-v1")
+	writeReplayHashBytes(hasher, relationFingerprint[:])
+	return finishReplayHash(hasher), true, nil
+}
+
+func canShardUpdateByPrimaryKey(relation *targetRelation, change *Change) bool {
+	if relation == nil || change == nil || change.New == nil ||
+		len(*change.New) != len(relation.source.Columns) {
+		return false
+	}
+	primary := primaryKeyColumns(relation)
+	if len(primary) == 0 {
+		return false
+	}
+	for _, column := range primary {
+		if column.sourceIndex < 0 || column.sourceIndex >= len(*change.New) {
+			return false
+		}
+		newDatum := (*change.New)[column.sourceIndex]
+		if newDatum.Kind == DatumNull || newDatum.Kind == DatumUnchangedToast {
+			return false
+		}
+	}
+	if change.Old == nil {
+		identifiedPrimary, safe := primaryKeyDeleteColumns(relation)
+		return safe && sameTargetColumns(primary, identifiedPrimary)
+	}
+	if len(*change.Old) != len(relation.source.Columns) {
+		return false
+	}
+	for _, column := range primary {
+		oldDatum := (*change.Old)[column.sourceIndex]
+		newDatum := (*change.New)[column.sourceIndex]
+		if oldDatum.Kind == DatumNull || oldDatum.Kind == DatumUnchangedToast ||
+			!tupleDatumEqual(oldDatum, newDatum) {
+			return false
+		}
+	}
+	return true
 }
 
 func replayLanePayloadSafe(relation *targetRelation, change *Change) bool {
@@ -589,6 +763,13 @@ func replayPlanDigest(
 }
 
 func targetRelationReplayFingerprint(relation *targetRelation) [sha256.Size]byte {
+	return targetRelationReplayFingerprintVersion(relation, replayClaimPlanVersion)
+}
+
+func targetRelationReplayFingerprintVersion(
+	relation *targetRelation,
+	planVersion int,
+) [sha256.Size]byte {
 	hasher := newReplayClaimHasher("pgmigrate-target-relation-v1")
 	if relation == nil {
 		return finishReplayHash(hasher)
@@ -604,6 +785,10 @@ func targetRelationReplayFingerprint(relation *targetRelation) [sha256.Size]byte
 	}
 	writeReplayHashBool(hasher, relation.overrideIdentity)
 	writeReplayHashBool(hasher, relation.capabilities.relationLane)
+	if planVersion >= 3 {
+		writeReplayHashBool(hasher, relation.capabilities.relationOrderedLane)
+		writeReplayHashBool(hasher, relation.capabilities.primaryKeyArbiter)
+	}
 	writeReplayHashBool(hasher, relation.capabilities.keyedSetDML)
 	writeReplayHashBool(hasher, relation.capabilities.binaryCopy)
 	writeReplayHashBool(hasher, relation.capabilities.textCopyStage)

@@ -378,7 +378,7 @@ func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
 	t.Parallel()
 	relation := &targetRelation{
 		quoted:       `"shard_schema"."messages"`,
-		capabilities: targetRelationCapabilities{keyedSetDML: true},
+		capabilities: targetRelationCapabilities{primaryKeyArbiter: true, keyedSetDML: true},
 		columns: []targetColumn{
 			{name: "id", quoted: `"id"`, sourceIndex: 0, key: true, primary: true, primaryPos: 2},
 			{name: "app_pk", quoted: `"app_pk"`, sourceIndex: 1, key: true, primary: true, primaryPos: 1},
@@ -410,7 +410,7 @@ func TestPrimaryKeyUpsertRequiresCompleteStableRow(t *testing.T) {
 	t.Parallel()
 	relation := &targetRelation{
 		source:       Relation{Columns: []Column{{Name: "id"}, {Name: "body"}}},
-		capabilities: targetRelationCapabilities{keyedSetDML: true},
+		capabilities: targetRelationCapabilities{primaryKeyArbiter: true, keyedSetDML: true},
 		columns: []targetColumn{
 			{name: "id", sourceIndex: 0, primary: true},
 			{name: "body", sourceIndex: 1},
@@ -432,6 +432,14 @@ func TestPrimaryKeyUpsertRequiresCompleteStableRow(t *testing.T) {
 	changedKey[0] = TupleDatum{Kind: DatumText, Data: []byte("8")}
 	if canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &changedKey}) {
 		t.Fatal("primary-key-changing update used the conflict-upsert path")
+	}
+
+	relation.capabilities.primaryKeyArbiter = false
+	if canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &complete}) {
+		t.Fatal("deferrable primary key used the conflict-upsert path")
+	}
+	if !canPrimaryKeyUpsertV2(relation, &Change{Old: &oldTuple, New: &complete}) {
+		t.Fatal("plan-v2 reconstruction no longer preserves its legacy lane admission")
 	}
 }
 

@@ -965,6 +965,31 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			value text NOT NULL UNIQUE
 		);
 		CREATE TABLE public.pipeline_update_batch_duplicates (id integer NOT NULL, value text);
+		CREATE TABLE public.pipeline_builtin_indexes (id integer PRIMARY KEY, value text NOT NULL);
+		CREATE INDEX pipeline_builtin_indexes_expression
+			ON public.pipeline_builtin_indexes ((lower(value)));
+		CREATE INDEX pipeline_builtin_indexes_partial
+			ON public.pipeline_builtin_indexes (value) WHERE value <> '';
+		CREATE FUNCTION public.pipeline_custom_index_predicate(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> '';
+		CREATE TABLE public.pipeline_custom_index (id integer PRIMARY KEY, value text NOT NULL);
+		CREATE INDEX pipeline_custom_index_partial
+			ON public.pipeline_custom_index (value)
+			WHERE public.pipeline_custom_index_predicate(value);
+		CREATE UNLOGGED TABLE public.pipeline_unlogged (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE TABLE public.pipeline_generated_only (
+			value integer GENERATED ALWAYS AS (1) STORED
+		);
+		CREATE TABLE public.pipeline_deferrable_primary (
+			id integer NOT NULL,
+			value text NOT NULL,
+			CONSTRAINT pipeline_deferrable_primary_pkey
+				PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED
+		);
 		CREATE TABLE public.pipeline_copy (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_progress_guard (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_epoch_a (id integer PRIMARY KEY, value text);
@@ -1087,7 +1112,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !plain.capabilities.relationLane {
+		if !plain.capabilities.relationLane || !plain.capabilities.relationOrderedLane {
 			t.Fatal("plain built-in relation was not eligible for relation-lane replay")
 		}
 		checkedSource := relation(1191, "pipeline_batch_checked", 25)
@@ -1095,7 +1120,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if checked.capabilities.relationLane {
+		if checked.capabilities.relationLane || checked.capabilities.relationOrderedLane {
 			t.Fatal("checked relation was eligible for relation-lane replay")
 		}
 		selectiveSource := selectiveRelation(1193)
@@ -1113,7 +1138,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 		if uniqueIndexed.capabilities.relationLane || uniqueIndexed.capabilities.keyedSetDML ||
-			uniqueIndexed.capabilities.selectiveUpdates {
+			uniqueIndexed.capabilities.relationOrderedLane || uniqueIndexed.capabilities.selectiveUpdates {
 			t.Fatalf("unique partial indexed relation capabilities=%+v", uniqueIndexed.capabilities)
 		}
 		customSource := stageRelation(1192, "pipeline_stage")
@@ -1121,10 +1146,131 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if custom.capabilities.relationLane || !custom.capabilities.keyedSetDML ||
+		if custom.capabilities.relationLane || custom.capabilities.relationOrderedLane ||
+			!custom.capabilities.keyedSetDML ||
 			custom.capabilities.binaryCopy || !custom.capabilities.textCopyStage ||
 			!custom.capabilities.selectiveUpdates {
 			t.Fatalf("custom relation capabilities=%+v", custom.capabilities)
+		}
+		simpleUniqueSource := relation(1196, "pipeline_update_unique", 25)
+		simpleUnique, err := relationCache.resolve(ctx, conn, &simpleUniqueSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !simpleUnique.capabilities.relationLane ||
+			!simpleUnique.capabilities.relationOrderedLane ||
+			!simpleUnique.capabilities.crossKeyConflicts {
+			t.Fatalf("simple unique relation capabilities=%+v", simpleUnique.capabilities)
+		}
+		noPrimarySource := relation(1197, "pipeline_update_batch_duplicates", 25)
+		noPrimary, err := relationCache.resolve(ctx, conn, &noPrimarySource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if noPrimary.capabilities.relationLane || !noPrimary.capabilities.relationOrderedLane {
+			t.Fatalf("no-primary relation capabilities=%+v", noPrimary.capabilities)
+		}
+		builtInIndexSource := relation(1199, "pipeline_builtin_indexes", 25)
+		builtInIndex, err := relationCache.resolve(ctx, conn, &builtInIndexSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !builtInIndex.capabilities.relationLane ||
+			!builtInIndex.capabilities.relationOrderedLane {
+			t.Fatalf("built-in expression/partial index capabilities=%+v", builtInIndex.capabilities)
+		}
+		customIndexSource := relation(1200, "pipeline_custom_index", 25)
+		customIndex, err := relationCache.resolve(ctx, conn, &customIndexSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !customIndex.capabilities.relationLane || customIndex.capabilities.relationOrderedLane {
+			t.Fatalf("custom expression dependency capabilities=%+v", customIndex.capabilities)
+		}
+		unloggedSource := relation(1202, "pipeline_unlogged", 25)
+		unlogged, err := relationCache.resolve(ctx, conn, &unloggedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unlogged.capabilities.relationOrderedLane {
+			t.Fatalf("unlogged relation capabilities=%+v", unlogged.capabilities)
+		}
+		generatedOnlySource := Relation{
+			OID: 1203, Namespace: "public", Name: "pipeline_generated_only", ReplicaIdentity: 'd',
+			Columns: []Column{{Name: "value", Type: pgtype.Int4OID}},
+		}
+		generatedOnly, err := relationCache.resolve(
+			ctx, conn, &generatedOnlySource, loadTargetRelation,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if generatedOnly.capabilities.relationOrderedLane {
+			t.Fatalf("generated-only relation capabilities=%+v", generatedOnly.capabilities)
+		}
+		deferrableSource := relation(1204, "pipeline_deferrable_primary", 25)
+		deferrable, err := relationCache.resolve(ctx, conn, &deferrableSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deferrable.capabilities.primaryKeyArbiter {
+			t.Fatalf("deferrable primary key capabilities=%+v", deferrable.capabilities)
+		}
+		oldDeferrable := Tuple{text("1"), text("old")}
+		newDeferrable := Tuple{text("1"), text("new")}
+		deferrableUpdate := Change{Kind: ChangeUpdate, Old: &oldDeferrable, New: &newDeferrable}
+		if canPrimaryKeyUpsert(deferrable, &deferrableUpdate) {
+			t.Fatal("deferrable primary key was admitted as an ON CONFLICT arbiter")
+		}
+		if !canPrimaryKeyUpsertV2(deferrable, &deferrableUpdate) {
+			t.Fatal("deferrable primary key changed plan-v2 lane reconstruction")
+		}
+	})
+
+	t.Run("exclusion indexes remain global serial barriers", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `
+			CREATE EXTENSION IF NOT EXISTS btree_gist;
+			CREATE TABLE public.pipeline_exclusion (
+				id integer PRIMARY KEY,
+				guarded integer NOT NULL,
+				EXCLUDE USING gist (guarded WITH =)
+			)
+		`); err != nil {
+			t.Skipf("server lacks btree_gist exclusion support: %v", err)
+		}
+		source := relation(1198, "pipeline_exclusion", 23)
+		source.Columns[1].Name = "guarded"
+		loaded, err := relationCache.resolve(ctx, conn, &source, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !loaded.capabilities.crossKeyConflicts || loaded.capabilities.relationOrderedLane {
+			t.Fatalf("exclusion relation capabilities=%+v", loaded.capabilities)
+		}
+	})
+
+	t.Run("trusted relocated btree_gin opclass remains lane safe", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `
+			CREATE SCHEMA pipeline_btree_gin;
+			CREATE EXTENSION btree_gin WITH SCHEMA pipeline_btree_gin;
+			CREATE TABLE public.pipeline_trusted_gin (
+				id integer PRIMARY KEY,
+				guarded bigint NOT NULL
+			);
+			CREATE INDEX pipeline_trusted_gin_guarded
+				ON public.pipeline_trusted_gin
+				USING gin (guarded pipeline_btree_gin.int8_ops);
+		`); err != nil {
+			t.Skipf("server lacks relocatable btree_gin support: %v", err)
+		}
+		source := relation(1201, "pipeline_trusted_gin", 20)
+		source.Columns[1].Name = "guarded"
+		loaded, err := relationCache.resolve(ctx, conn, &source, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !loaded.capabilities.relationLane || !loaded.capabilities.relationOrderedLane {
+			t.Fatalf("trusted btree_gin relation capabilities=%+v", loaded.capabilities)
 		}
 	})
 

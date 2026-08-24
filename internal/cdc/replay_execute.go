@@ -76,26 +76,19 @@ func (a *Applier) executeReplayPlan(
 	if err := validateReplayPlanExecution(plan, transactions); err != nil {
 		return err
 	}
-	for _, step := range plan.Steps {
+	for stepIndex := 0; stepIndex < len(plan.Steps); {
+		step := plan.Steps[stepIndex]
 		if step.SerialTransaction >= 0 {
-			work, exists := replayPlanWork(plan, step.Index, 0)
-			if !exists || work.Kind != replayWorkSerial {
-				return fmt.Errorf("cdc: replay serial step %d has no exact work manifest", step.Index)
+			end := stepIndex + 1
+			for end < len(plan.Steps) && plan.Steps[end].SerialTransaction >= 0 {
+				end++
 			}
-			transactionIndex := step.SerialTransaction
-			if transactionIndex < 0 || transactionIndex >= len(transactions) {
-				return fmt.Errorf("cdc: replay serial step %d has invalid transaction", step.Index)
-			}
-			if err := a.executeReplayWork(
-				ctx, workers[0], plan.Claim, work,
-				func(replay *applyPipeline) error {
-					return a.queueTransactionChanges(
-						replay, relations[transactionIndex], &transactions[transactionIndex], nil,
-					)
-				},
+			if err := a.executeSerialReplayWorkGroup(
+				ctx, workers[0], plan, plan.Steps[stepIndex:end], transactions, relations,
 			); err != nil {
 				return err
 			}
+			stepIndex = end
 			continue
 		}
 
@@ -146,6 +139,7 @@ func (a *Applier) executeReplayPlan(
 		if err := group.Wait(); err != nil {
 			return err
 		}
+		stepIndex++
 	}
 	if a.config.beforeReplayFinalize != nil {
 		if err := a.config.beforeReplayFinalize(plan.Claim); err != nil {
@@ -159,6 +153,100 @@ func (a *Applier) executeReplayPlan(
 		collector := newSampleCollector(a.config.Sampler, &transactions[i])
 		collector.addAll(transactions[i].Changes)
 		collector.flush()
+	}
+	return nil
+}
+
+// executeSerialReplayWorkGroup retains exact source order but amortizes the
+// target transaction and synchronous durability boundary across a contiguous
+// serial run. DML and every per-source-transaction receipt commit together, so
+// a crash exposes either the entire uncommitted suffix or none of it. This is
+// the same atomic envelope the legacy bounded batch path used, without changing
+// the durable claim format or weakening replay fencing.
+func (a *Applier) executeSerialReplayWorkGroup(
+	ctx context.Context,
+	worker *applyWorker,
+	plan replayPlan,
+	steps []replayPlanStep,
+	transactions []Transaction,
+	relations []map[uint32]*targetRelation,
+) error {
+	works := make([]replayClaimWork, len(steps))
+	for index, step := range steps {
+		work, exists := replayPlanWork(plan, step.Index, 0)
+		if !exists || work.Kind != replayWorkSerial {
+			return fmt.Errorf("cdc: replay serial step %d has no exact work manifest", step.Index)
+		}
+		transactionIndex := step.SerialTransaction
+		if transactionIndex < 0 || transactionIndex >= len(transactions) {
+			return fmt.Errorf("cdc: replay serial step %d has invalid transaction", step.Index)
+		}
+		works[index] = work
+	}
+
+	committed, err := beginSerialReplayWorkGroup(ctx, worker.conn, plan.Claim, works)
+	if err != nil {
+		return err
+	}
+	allCommitted := true
+	for _, value := range committed {
+		allCommitted = allCommitted && value
+	}
+	if allCommitted {
+		return nil
+	}
+
+	replay := newApplyPipeline(ctx, worker.conn.PgConn(), worker.statements)
+	replay.syncWindow = applyBatchPipelineWindow
+	for index, step := range steps {
+		if committed[index] {
+			continue
+		}
+		transactionIndex := step.SerialTransaction
+		if err := a.queueTransactionChanges(
+			replay, relations[transactionIndex], &transactions[transactionIndex], nil,
+		); err != nil {
+			return errors.Join(err, replay.abort())
+		}
+		replay.queueUnprepared(
+			replayWorkCompletionSQL,
+			replayWorkCompletionParams(plan.Claim, works[index]),
+			applyExpectation{
+				description: "commit exact serial replay work receipt", expectedRows: 1,
+			},
+		)
+	}
+	if err := replay.sync(); err != nil {
+		return errors.Join(err, replay.abort())
+	}
+	if replay.conn.TxStatus() != 'T' {
+		return errors.Join(fmt.Errorf(
+			"cdc: target transaction status after serial replay group is %q, want %q",
+			replay.conn.TxStatus(), 'T',
+		), replay.abort())
+	}
+	replay.commit()
+	if err := replay.sync(); err != nil {
+		return errors.Join(err, replay.abort())
+	}
+	if replay.conn.TxStatus() != 'I' {
+		return errors.Join(fmt.Errorf(
+			"cdc: target transaction status after serial replay group commit is %q, want %q",
+			replay.conn.TxStatus(), 'I',
+		), replay.abort())
+	}
+	if err := replay.close(); err != nil {
+		return err
+	}
+	if a.config.afterReplayWork != nil {
+		for index, work := range works {
+			if committed[index] {
+				continue
+			}
+			if err := a.config.afterReplayWork(plan.Claim, work); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

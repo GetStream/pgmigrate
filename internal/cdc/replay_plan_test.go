@@ -324,6 +324,7 @@ func TestReplayPlanSerializesWholeUnsafeTransactionBetweenEpochs(t *testing.T) {
 	safe := replayTestRelation(43, "safe_items")
 	unsafe := replayTestRelation(44, "unique_items")
 	unsafe.capabilities.crossKeyConflicts = true
+	unsafe.capabilities.relationOrderedLane = false
 
 	transactions := []Transaction{
 		replayTestTransaction(300, safe, Change{
@@ -369,6 +370,225 @@ func TestReplayPlanSerializesWholeUnsafeTransactionBetweenEpochs(t *testing.T) {
 	if got := replayPlanWorkChanges(plan.Works); got != 4 || plan.Claim.Changes != 4 ||
 		plan.Claim.Transactions != 3 {
 		t.Fatalf("claim counters work=%d changes=%d tx=%d", got, plan.Claim.Changes, plan.Claim.Transactions)
+	}
+}
+
+func TestReplayPlanKeepsSafeCrossKeyRelationInOneOrderedLane(t *testing.T) {
+	t.Parallel()
+	relation := replayTestRelation(45, "unique_items")
+	relation.capabilities.crossKeyConflicts = true
+	transactions := []Transaction{
+		replayTestTransaction(400, relation, Change{
+			RelationOID: relation.source.OID, Kind: ChangeInsert, New: replayTuple("a", "one"),
+		}),
+		replayTestTransaction(402, relation, Change{
+			RelationOID: relation.source.OID, Kind: ChangeInsert, New: replayTuple("b", "two"),
+		}),
+	}
+	resolved := []map[uint32]*targetRelation{
+		{relation.source.OID: relation}, {relation.source.OID: relation},
+	}
+	plan, err := buildReplayPlan("stream", "generation", 30, 8, transactions, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].SerialTransaction >= 0 ||
+		len(plan.Steps[0].Lanes) != 1 ||
+		!slices.Equal(plan.Steps[0].Lanes[0].TransactionIndexes, []int{0, 1}) {
+		t.Fatalf("cross-key relation lost table-local source order: %#v", plan.Steps)
+	}
+}
+
+func TestReplayPlanRelationLaneUnionsMultiTableTransactions(t *testing.T) {
+	t.Parallel()
+	withoutPrimary := replayTestRelation(55, "append_log")
+	withoutPrimary.capabilities.relationLane = false
+	left := replayTestRelation(56, "left_items")
+	right := replayTestRelation(57, "right_items")
+	transactions := []Transaction{
+		{
+			CommitLSN: 410, EndLSN: 411, CommitTime: time.Unix(410, 0).UTC(),
+			Relations: []Relation{withoutPrimary.source, left.source},
+			Changes: []Change{
+				{RelationOID: withoutPrimary.source.OID, Kind: ChangeInsert, New: replayTuple("log-a", "one")},
+				{RelationOID: left.source.OID, Kind: ChangeInsert, New: replayTuple("left", "one")},
+			},
+		},
+		{
+			CommitLSN: 412, EndLSN: 413, CommitTime: time.Unix(412, 0).UTC(),
+			Relations: []Relation{withoutPrimary.source, right.source},
+			Changes: []Change{
+				{RelationOID: withoutPrimary.source.OID, Kind: ChangeInsert, New: replayTuple("log-b", "two")},
+				{RelationOID: right.source.OID, Kind: ChangeInsert, New: replayTuple("right", "two")},
+			},
+		},
+	}
+	resolved := []map[uint32]*targetRelation{
+		{withoutPrimary.source.OID: withoutPrimary, left.source.OID: left},
+		{withoutPrimary.source.OID: withoutPrimary, right.source.OID: right},
+	}
+	plan, err := buildReplayPlan("stream", "generation", 30, 8, transactions, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Steps) != 1 || len(plan.Steps[0].Lanes) != 1 ||
+		!slices.Equal(plan.Steps[0].Lanes[0].TransactionIndexes, []int{0, 1}) {
+		t.Fatalf("relation lane did not preserve multi-table transaction order: %#v", plan.Steps)
+	}
+}
+
+func TestReplayPlanUpdateWithUnchangedToastStillShardsByStablePrimaryKey(t *testing.T) {
+	t.Parallel()
+	relation := replayTestRelation(46, "toast_items")
+	oldTuple := replayTuple("stable", "old")
+	newTuple := Tuple{
+		{Kind: DatumText, Data: []byte("stable")},
+		{Kind: DatumUnchangedToast},
+	}
+	transaction := replayTestTransaction(500, relation, Change{
+		RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: oldTuple, New: &newTuple,
+	})
+	resolved := []map[uint32]*targetRelation{{relation.source.OID: relation}}
+	plan, err := buildReplayPlan("stream", "generation", 40, 8, []Transaction{transaction}, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].SerialTransaction >= 0 || len(plan.Steps[0].Lanes) != 1 {
+		t.Fatalf("non-key unchanged TOAST created a serial barrier: %#v", plan.Steps)
+	}
+
+	legacy, err := buildReplayPlanForGenerationVersion(
+		"stream", "generation", "generation", 40, 8,
+		[]Transaction{transaction}, resolved, 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(legacy.Steps) != 1 || legacy.Steps[0].SerialTransaction != 0 {
+		t.Fatalf("plan v2 no longer reconstructs its legacy TOAST barrier: %#v", legacy.Steps)
+	}
+}
+
+func TestReplayPlanDoesNotShardChangedPrimaryKeyUpdate(t *testing.T) {
+	t.Parallel()
+	relation := replayTestRelation(51, "changed_key_items")
+	transactions := []Transaction{
+		replayTestTransaction(510, relation, Change{
+			RelationOID: relation.source.OID, Kind: ChangeUpdate,
+			Old: replayTuple("before-a", "value"), New: replayTuple("after-a", "value"),
+		}),
+		replayTestTransaction(512, relation, Change{
+			RelationOID: relation.source.OID, Kind: ChangeUpdate,
+			Old: replayTuple("before-b", "value"), New: replayTuple("after-b", "value"),
+		}),
+	}
+	plan, err := buildReplayPlan(
+		"stream", "generation", 40, 8, transactions,
+		[]map[uint32]*targetRelation{
+			{relation.source.OID: relation}, {relation.source.OID: relation},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Steps) != 1 || len(plan.Steps[0].Lanes) != 1 ||
+		!slices.Equal(plan.Steps[0].Lanes[0].TransactionIndexes, []int{0, 1}) {
+		t.Fatalf("changed primary keys escaped table-local source order: %#v", plan.Steps)
+	}
+}
+
+func TestReplayUpdateWithoutOldTupleRequiresReplicaIdentityPrimaryKey(t *testing.T) {
+	t.Parallel()
+	relation := replayTestRelation(58, "nil_old_items")
+	fingerprint := targetRelationReplayFingerprint(relation)
+	left := Change{
+		RelationOID: relation.source.OID, Kind: ChangeUpdate,
+		New: replayTuple("left", "one"),
+	}
+	right := Change{
+		RelationOID: relation.source.OID, Kind: ChangeUpdate,
+		New: replayTuple("right", "two"),
+	}
+	leftKey, leftSafe, err := replayChangeKey(relation, fingerprint, &left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightKey, rightSafe, err := replayChangeKey(relation, fingerprint, &right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !leftSafe || !rightSafe || leftKey == rightKey {
+		t.Fatal("replica-identity primary keys did not shard nil-old updates independently")
+	}
+
+	alternateIdentity := replayTestRelation(59, "alternate_identity_items")
+	alternateIdentity.source.Columns[0].Flags = 0
+	alternateIdentity.columns[0].key = false
+	alternateFingerprint := targetRelationReplayFingerprint(alternateIdentity)
+	left.RelationOID = alternateIdentity.source.OID
+	right.RelationOID = alternateIdentity.source.OID
+	leftKey, leftSafe, err = replayChangeKey(alternateIdentity, alternateFingerprint, &left)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rightKey, rightSafe, err = replayChangeKey(alternateIdentity, alternateFingerprint, &right)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !leftSafe || !rightSafe || leftKey != rightKey {
+		t.Fatal("alternate replica identity did not fall back to one table-local lane")
+	}
+}
+
+func TestReplayPlanV2FingerprintIgnoresV3RelationLaneCapability(t *testing.T) {
+	t.Parallel()
+	left := replayTestRelation(52, "compat_items")
+	right := replayTestRelation(52, "compat_items")
+	right.capabilities.relationOrderedLane = false
+	right.capabilities.primaryKeyArbiter = false
+	if targetRelationReplayFingerprintVersion(left, 2) !=
+		targetRelationReplayFingerprintVersion(right, 2) {
+		t.Fatal("plan v2 fingerprint included a plan v3 capability")
+	}
+	if targetRelationReplayFingerprintVersion(left, 3) ==
+		targetRelationReplayFingerprintVersion(right, 3) {
+		t.Fatal("plan v3 fingerprint omitted relation-ordered lane safety")
+	}
+}
+
+func TestFreshFragmentedReplayPlanUsesBoundedOrderedFallback(t *testing.T) {
+	t.Parallel()
+	safe := replayTestRelation(53, "safe_items")
+	barrier := replayTestRelation(54, "barrier_items")
+	barrier.capabilities.relationLane = false
+	barrier.capabilities.relationOrderedLane = false
+	transactions := []Transaction{
+		replayTestTransaction(520, safe, Change{
+			RelationOID: safe.source.OID, Kind: ChangeInsert, New: replayTuple("a", "one"),
+		}),
+		replayTestTransaction(522, barrier, Change{
+			RelationOID: barrier.source.OID, Kind: ChangeInsert, New: replayTuple("b", "two"),
+		}),
+		replayTestTransaction(524, safe, Change{
+			RelationOID: safe.source.OID, Kind: ChangeInsert, New: replayTuple("c", "three"),
+		}),
+	}
+	resolved := []map[uint32]*targetRelation{
+		{safe.source.OID: safe}, {barrier.source.OID: barrier}, {safe.source.OID: safe},
+	}
+	plan, err := buildReplayPlan("stream", "generation", 40, 8, transactions, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Steps) != 3 || !replayPlanHasSerialWork(plan) {
+		t.Fatalf("fixture is not fragmented parallel/serial work: %#v", plan.Steps)
+	}
+	if shouldUseConcurrentReplayPlan(nil, plan) {
+		t.Fatal("fresh fragmented plan would create a multi-commit concurrent claim")
+	}
+	resume := plan.Claim
+	if !shouldUseConcurrentReplayPlan(&resume, plan) {
+		t.Fatal("existing exact claim would not resume its durable manifest")
 	}
 }
 
@@ -474,9 +694,10 @@ func TestReplayPlanSerializesPrimaryKeyChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(plan.Steps) != 1 || plan.Steps[0].SerialTransaction != 0 ||
-		len(plan.Works) != 1 || plan.Works[0].Kind != replayWorkSerial {
-		t.Fatalf("primary key change was parallelized: %#v", plan)
+	if len(plan.Steps) != 1 || plan.Steps[0].SerialTransaction >= 0 ||
+		len(plan.Steps[0].Lanes) != 1 || len(plan.Works) != 1 ||
+		plan.Works[0].Kind != replayWorkParallelLane {
+		t.Fatalf("primary key change did not use one relation-ordered lane: %#v", plan)
 	}
 }
 
@@ -518,7 +739,9 @@ func replayTestRelation(oid uint32, name string) *targetRelation {
 	return &targetRelation{
 		source: source, quoted: `"public"."` + name + `"`,
 		capabilities: targetRelationCapabilities{
-			relationLane: true, keyedSetDML: true, binaryCopy: true, textCopyStage: true,
+			relationLane: true, relationOrderedLane: true,
+			primaryKeyArbiter: true, keyedSetDML: true,
+			binaryCopy: true, textCopyStage: true,
 		},
 		columns: []targetColumn{
 			{

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync/atomic"
 	"testing"
 
@@ -65,9 +66,14 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 		)
 		resolved[i] = map[uint32]*targetRelation{relation.source.OID: loaded}
 	}
-	plan, err := buildReplayPlan(streamID, generation, 0, 8, transactions, resolved)
+	plan, err := buildReplayPlanForGenerationVersion(
+		streamID, generation, generation, 0, 8, transactions, resolved, 2,
+	)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if plan.Claim.PlanVersion != 2 {
+		t.Fatalf("legacy resume fixture plan version=%d, want 2", plan.Claim.PlanVersion)
 	}
 	if !plan.HasParallel || len(plan.Works) < 2 {
 		t.Fatalf("fixture did not produce parallel work: %#v", plan.Steps)
@@ -145,6 +151,18 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 			t.Fatalf("source transaction %d committed only %d/2 rows", i, pairRows)
 		}
 	}
+	reconstructed, err := buildReplayPlanForGenerationVersion(
+		streamID, generation, generation, 0, 8, transactions, resolved, 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayClaimsEqual(reconstructed.Claim, claim) ||
+		!slices.Equal(reconstructed.Works, plan.Works) {
+		t.Fatal("new executor did not reconstruct the exact active plan-version-2 claim")
+	}
+	reconstructed.Claim = claim
+	plan = reconstructed
 
 	// A fresh process with fewer physical workers must reconstruct the same
 	// logical lane plan, skip exact committed INSERT lanes, finish the rest, and
@@ -235,6 +253,157 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 				t.Fatalf("row %d/%s value=%q, want %q", i, suffix, value, want)
 			}
 		}
+	}
+}
+
+func TestPG17ReplayClaimCommitsContiguousSerialWorkAndReceiptsAtomically(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	control := target.Connect(t)
+	ctx := context.Background()
+	if _, err := control.Exec(ctx, `
+		CREATE TABLE public.serial_claim_items (
+			id text PRIMARY KEY,
+			value text NOT NULL CHECK (value <> '')
+		)
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	const streamID = "serial-claim-group-resume"
+	const generation = "serial-claim-group-resume-v1"
+	if err := EnsureStreamProgressIdentity(ctx, control, StreamIdentityConfig{
+		StreamID: streamID, Generation: generation,
+		FreshSetup: true, TargetHasCopiedData: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureReplayClaimTables(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureApplySession(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+
+	relation := replayTestRelation(9_004, "serial_claim_items")
+	loaded, err := loadTargetRelation(ctx, control, &relation.source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.capabilities.relationLane {
+		t.Fatal("CHECK-constrained fixture unexpectedly admitted parallel replay")
+	}
+	const transactionCount = 128
+	transactions := make([]Transaction, transactionCount)
+	resolved := make([]map[uint32]*targetRelation, transactionCount)
+	for index := range transactions {
+		transactions[index] = replayTestTransaction(
+			LSN(2_000+index*2), relation,
+			Change{
+				RelationOID: relation.source.OID, Kind: ChangeInsert,
+				New: replayTuple(fmt.Sprintf("id-%03d", index), fmt.Sprintf("value-%03d", index)),
+			},
+		)
+		resolved[index] = map[uint32]*targetRelation{relation.source.OID: loaded}
+	}
+	plan, err := buildReplayPlan(streamID, generation, 0, 8, transactions, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Steps) != transactionCount || len(plan.Works) != transactionCount ||
+		!replayPlanHasSerialWork(plan) {
+		t.Fatalf("fixture plan is not one contiguous serial run: steps=%d works=%d", len(plan.Steps), len(plan.Works))
+	}
+	claim, err := ensureReplayClaim(ctx, control, plan.Claim, plan.Works)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Claim = claim
+	lastWork := plan.Works[len(plan.Works)-1]
+	if _, err := control.Exec(ctx, `
+		UPDATE `+replayClaimWorkTable+`
+		SET committed_at = clock_timestamp()
+		WHERE claim_id = $1 AND step_index = $2 AND work_index = $3
+	`, claim.ID, lastWork.Step, lastWork.Work); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := beginSerialReplayWorkGroup(ctx, control, claim, plan.Works); err == nil {
+		t.Fatal("serial replay accepted a committed suffix after an uncommitted gap")
+	}
+	if _, err := control.Exec(ctx, `
+		UPDATE `+replayClaimWorkTable+`
+		SET committed_at = NULL
+		WHERE claim_id = $1 AND step_index = $2 AND work_index = $3
+	`, claim.ID, lastWork.Step, lastWork.Work); err != nil {
+		t.Fatal(err)
+	}
+
+	// Model a v58 interruption after its first per-transaction receipt. The new
+	// grouped executor must retain that exact prefix and atomically commit only
+	// the uncommitted suffix.
+	firstWork := plan.Works[0]
+	firstTransaction := plan.Steps[0].SerialTransaction
+	predecessor := &Applier{config: ApplierConfig{
+		StreamID: streamID, StreamGeneration: generation,
+	}}
+	firstWorker := &applyWorker{
+		conn: control, statements: newApplyStatementCache(applyStatementCacheCapacity),
+	}
+	if err := predecessor.executeReplayWork(
+		ctx, firstWorker, claim, firstWork,
+		func(replay *applyPipeline) error {
+			return predecessor.queueTransactionChanges(
+				replay, resolved[firstTransaction], &transactions[firstTransaction], nil,
+			)
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	interrupted := errors.New("test: stop after atomically committed serial group")
+	var callbacks atomic.Int32
+	applier := &Applier{config: ApplierConfig{
+		StreamID: streamID, StreamGeneration: generation,
+		afterReplayWork: func(replayClaim, replayClaimWork) error {
+			if callbacks.Add(1) == 1 {
+				return interrupted
+			}
+			return nil
+		},
+	}}
+	workers := []*applyWorker{firstWorker}
+	if err := applier.executeReplayPlan(ctx, workers, plan, transactions, resolved); !errors.Is(err, interrupted) {
+		t.Fatalf("serial replay interruption=%v, want %v", err, interrupted)
+	}
+	assertReplayProgress(t, control, streamID, 0, 0, 0)
+	storedWorks, err := readReplayClaimWorks(ctx, control, claim.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, work := range storedWorks {
+		if work.CommittedAt == nil {
+			t.Fatalf("serial work %d/%d was not committed with its group", work.Step, work.Work)
+		}
+	}
+	var visibleRows int
+	if err := control.QueryRow(ctx, "SELECT count(*) FROM public.serial_claim_items").Scan(&visibleRows); err != nil {
+		t.Fatal(err)
+	}
+	if visibleRows != transactionCount {
+		t.Fatalf("serial group exposed %d rows, want %d", visibleRows, transactionCount)
+	}
+
+	// A fresh executor skips every exact receipt and only publishes the durable
+	// claim totals. No DML is repeated after the post-commit interruption.
+	resumed := &Applier{config: ApplierConfig{StreamID: streamID, StreamGeneration: generation}}
+	if err := resumed.executeReplayPlan(ctx, workers, plan, transactions, resolved); err != nil {
+		t.Fatal(err)
+	}
+	assertReplayProgress(t, control, streamID, plan.Claim.EndLSN, transactionCount, transactionCount)
+	if err := control.QueryRow(ctx, "SELECT count(*) FROM public.serial_claim_items").Scan(&visibleRows); err != nil {
+		t.Fatal(err)
+	}
+	if visibleRows != transactionCount {
+		t.Fatalf("resumed serial group exposed %d rows, want %d", visibleRows, transactionCount)
 	}
 }
 

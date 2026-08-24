@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	replayClaimPlanVersion = 2
-	replayClaimTable       = "pgmigrate_internal.cdc_replay_claims"
-	replayClaimWorkTable   = "pgmigrate_internal.cdc_replay_claim_work"
+	replayClaimPlanVersion        = 3
+	replayClaimMinimumPlanVersion = 2
+	replayClaimTable              = "pgmigrate_internal.cdc_replay_claims"
+	replayClaimWorkTable          = "pgmigrate_internal.cdc_replay_claim_work"
 )
 
 type replayWorkKind string
@@ -215,7 +216,7 @@ func decodeReplayClaim(
 	claim.EndLSN = LSN(endLSN)
 	copy(claim.Digest[:], digest)
 	copy(claim.CatalogDigest[:], catalogDigest)
-	if claim.PlanVersion != replayClaimPlanVersion {
+	if claim.PlanVersion < replayClaimMinimumPlanVersion || claim.PlanVersion > replayClaimPlanVersion {
 		return fmt.Errorf("cdc: unsupported replay claim plan version %d", claim.PlanVersion)
 	}
 	if claim.StartGeneration == "" || claim.LaneCount < 1 || claim.ExpectedWork < 0 ||
@@ -637,6 +638,132 @@ func beginReplayClaimWork(
 		return true, nil
 	}
 	return false, nil
+}
+
+// beginSerialReplayWorkGroup locks one contiguous run of serial work in a
+// single target transaction. The durable manifest deliberately remains one
+// receipt per source transaction: older binaries can resume the same claim,
+// while a newer executor can commit the ordered DML and every exact receipt
+// together. A previously committed prefix is valid when an older executor was
+// interrupted between serial work rows; a committed suffix after an
+// uncommitted row would violate source order and is rejected.
+func beginSerialReplayWorkGroup(
+	ctx context.Context,
+	conn *pgx.Conn,
+	claim replayClaim,
+	works []replayClaimWork,
+) ([]bool, error) {
+	if len(works) == 0 {
+		return nil, errors.New("cdc: serial replay work group is empty")
+	}
+	for index, work := range works {
+		if work.Kind != replayWorkSerial || work.Work != 0 || work.Lane != -1 ||
+			(index != 0 && work.Step != works[index-1].Step+1) {
+			return nil, errors.New("cdc: serial replay work group is not contiguous")
+		}
+	}
+	if _, err := conn.Exec(ctx, "BEGIN"); err != nil {
+		return nil, classifyApplyError(nil, 0, fmt.Errorf("cdc: begin serial replay work group: %w", err))
+	}
+	rollback := func() {
+		_, _ = conn.Exec(context.Background(), "ROLLBACK")
+	}
+
+	rows, err := conn.Query(ctx, `
+		SELECT work.step_index, work.work_index, work.work_kind, work.lane_index,
+		       work.work_digest, work.expected_transactions,
+		       work.expected_changes, work.committed_at
+		FROM `+replayClaimWorkTable+` AS work
+		JOIN `+replayClaimTable+` AS claim USING (claim_id)
+		JOIN `+streamIdentityTable+` AS identity USING (stream_id)
+		WHERE work.claim_id = $1
+		  AND work.step_index BETWEEN $2 AND $3
+		  AND work.work_index = 0
+		  AND claim.claim_digest = $4
+		  AND claim.stream_generation = $5
+		  AND identity.base_generation = claim.stream_generation
+		  AND identity.stream_generation = claim.fence_generation
+		  AND NOT EXISTS (
+		    SELECT 1
+		    FROM `+replayClaimWorkTable+` AS prior
+		    WHERE prior.claim_id = work.claim_id
+		      AND prior.step_index < $2
+		      AND prior.committed_at IS NULL
+		  )
+		ORDER BY work.step_index
+		FOR UPDATE OF work
+	`, claim.ID, works[0].Step, works[len(works)-1].Step, claim.Digest[:], claim.Generation)
+	if err != nil {
+		rollback()
+		return nil, fmt.Errorf("cdc: lock serial replay work group: %w", err)
+	}
+
+	committed := make([]bool, len(works))
+	index := 0
+	for rows.Next() {
+		if index >= len(works) {
+			rows.Close()
+			rollback()
+			return nil, errors.New("cdc: serial replay work group returned unexpected work")
+		}
+		var stored replayClaimWork
+		var kind string
+		var digest []byte
+		if err := rows.Scan(
+			&stored.Step, &stored.Work, &kind, &stored.Lane, &digest,
+			&stored.ExpectedTransactions, &stored.ExpectedChanges, &stored.CommittedAt,
+		); err != nil {
+			rows.Close()
+			rollback()
+			return nil, fmt.Errorf("cdc: scan serial replay work group: %w", err)
+		}
+		stored.Kind = replayWorkKind(kind)
+		if len(digest) != sha256.Size {
+			rows.Close()
+			rollback()
+			return nil, errors.New("cdc: locked serial replay work has an invalid digest")
+		}
+		copy(stored.Digest[:], digest)
+		expected := works[index]
+		if stored.Step != expected.Step || stored.Work != expected.Work ||
+			stored.Kind != expected.Kind || stored.Lane != expected.Lane ||
+			stored.Digest != expected.Digest ||
+			stored.ExpectedTransactions != expected.ExpectedTransactions ||
+			stored.ExpectedChanges != expected.ExpectedChanges {
+			rows.Close()
+			rollback()
+			return nil, errors.New("cdc: locked serial replay work does not match its reconstructed manifest")
+		}
+		committed[index] = stored.CommittedAt != nil
+		index++
+	}
+	readErr := rows.Err()
+	rows.Close()
+	if readErr != nil {
+		rollback()
+		return nil, fmt.Errorf("cdc: read serial replay work group: %w", readErr)
+	}
+	if index != len(works) {
+		rollback()
+		return nil, fmt.Errorf(
+			"cdc: locked %d serial replay work rows, expected %d", index, len(works),
+		)
+	}
+	seenUncommitted := false
+	allCommitted := true
+	for _, isCommitted := range committed {
+		if !isCommitted {
+			seenUncommitted = true
+			allCommitted = false
+		} else if seenUncommitted {
+			rollback()
+			return nil, errors.New("cdc: serial replay work has a committed suffix after an uncommitted row")
+		}
+	}
+	if allCommitted {
+		rollback()
+	}
+	return committed, nil
 }
 
 const replayWorkCompletionSQL = `

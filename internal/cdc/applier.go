@@ -551,11 +551,21 @@ type targetRelation struct {
 // Keeping these decisions independent prevents one slow relation from forcing
 // every otherwise-independent relation in a catch-up batch onto the scalar path.
 type targetRelationCapabilities struct {
-	relationLane     bool
-	keyedSetDML      bool
-	binaryCopy       bool
-	textCopyStage    bool
-	selectiveUpdates bool
+	// relationLane permits hashing independent primary-key rows across target
+	// sessions. relationOrderedLane is the strictly weaker guarantee that every
+	// write for this relation may share one relation-scoped lane. The latter
+	// keeps non-PK UNIQUE/exclusion conflicts and tables without a canonical PK
+	// in source order without turning them into a global replay barrier.
+	relationLane        bool
+	relationOrderedLane bool
+	// primaryKeyArbiter is true only when PostgreSQL can use the target primary
+	// key as an ON CONFLICT arbiter. DEFERRABLE primary keys still identify rows
+	// and order replay safely, but PostgreSQL rejects them as conflict arbiters.
+	primaryKeyArbiter bool
+	keyedSetDML       bool
+	binaryCopy        bool
+	textCopyStage     bool
+	selectiveUpdates  bool
 	// crossKeyConflicts is true when distinct primary-key rows can conflict
 	// through an ordinary non-primary UNIQUE or exclusion index. Such a relation
 	// remains safe for set DML inside one target transaction, but is not eligible
@@ -738,17 +748,24 @@ func (a *Applier) applyTransactionBatchWithWorkers(
 		if resume != nil {
 			startGeneration = resume.StartGeneration
 		}
-		plan, err := buildReplayPlanForGeneration(
+		planVersion := replayClaimPlanVersion
+		if resume != nil {
+			planVersion = resume.PlanVersion
+		}
+		plan, err := buildReplayPlanForGenerationVersion(
 			a.config.StreamID, a.config.StreamGeneration, startGeneration, progress,
-			laneCount, transactions, relations,
+			laneCount, transactions, relations, planVersion,
 		)
 		if err != nil {
 			return false, progress, errors.Join(err, cleanupTransactionBatch(transactions))
 		}
-		// Unsafe source transactions are explicit serial barriers in the durable
-		// plan. Never send them through the legacy relation regrouping fallback,
-		// even when the surrounding safe work happens to hash to one lane.
-		if resume != nil || plan.HasParallel || replayPlanHasSerialWork(plan) {
+		// A fresh batch containing any true serial barrier stays on the proven
+		// one-transaction relation-batched path below. Turning alternating safe
+		// epochs and barriers into a concurrent claim creates hundreds of tiny
+		// synchronous commits and is strictly worse than that bounded fallback.
+		// An existing claim must always reconstruct and finish its exact manifest,
+		// including plan-version-2 claims left by an older binary.
+		if shouldUseConcurrentReplayPlan(resume, plan) {
 			if resume != nil && !replayClaimsEqual(plan.Claim, *resume) {
 				return false, progress, errors.Join(
 					errors.New("cdc: reconstructed replay claim digest does not match target claim"),
@@ -843,6 +860,10 @@ func (a *Applier) applyTransactionBatchWithWorkers(
 		collector.flush()
 	}
 	return true, transactions[len(transactions)-1].EndLSN, nil
+}
+
+func shouldUseConcurrentReplayPlan(resume *replayClaim, plan replayPlan) bool {
+	return resume != nil || (plan.HasParallel && !replayPlanHasSerialWork(plan))
 }
 
 type relationBatchedChange struct {
@@ -1138,6 +1159,12 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		       coalesce(primary_key.position, 0) AS primary_key_position,
 		       coalesce(primary_key.catalog_safe, false) AS replay_key_catalog_safe,
 		       EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_index primary_arbiter
+		         WHERE primary_arbiter.indrelid = c.oid
+		           AND primary_arbiter.indisprimary
+		           AND primary_arbiter.indimmediate
+		       ) AS primary_key_arbiter,
+		       EXISTS (
 		         SELECT 1 FROM pg_catalog.pg_index conflict_index
 		         WHERE conflict_index.indrelid = c.oid
 		           AND (conflict_index.indisunique OR conflict_index.indisexclusion)
@@ -1155,6 +1182,94 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		           AND (cross_key_index.indisunique OR cross_key_index.indisexclusion)
 		           AND NOT cross_key_index.indisprimary
 		       ) AS cross_key_conflicts,
+		       c.relpersistence = 'p'
+		       AND NOT c.relhassubclass
+		       AND NOT c.relispartition
+		       AND c.relam = (
+		         SELECT heap_am.oid FROM pg_catalog.pg_am heap_am WHERE heap_am.amname = 'heap'
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_attribute generated_attribute
+		         WHERE generated_attribute.attrelid = c.oid
+		           AND generated_attribute.attnum > 0
+		           AND NOT generated_attribute.attisdropped
+		           AND generated_attribute.attgenerated <> ''
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_index exclusion_index
+		         WHERE exclusion_index.indrelid = c.oid
+		           AND exclusion_index.indisexclusion
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1
+		         FROM pg_catalog.pg_index maintained_index
+		         JOIN LATERAL unnest(
+		           maintained_index.indclass::oid[],
+		           maintained_index.indcollation::oid[]
+		         ) WITH ORDINALITY
+		           AS maintained_entry(opclass_oid, collation_oid, ordinality) ON
+		             maintained_entry.ordinality <= maintained_index.indnkeyatts
+		         JOIN pg_catalog.pg_opclass maintained_opclass
+		           ON maintained_opclass.oid = maintained_entry.opclass_oid
+		         JOIN pg_catalog.pg_namespace maintained_opclass_namespace
+		           ON maintained_opclass_namespace.oid = maintained_opclass.opcnamespace
+		         LEFT JOIN pg_catalog.pg_collation maintained_collation
+		           ON maintained_collation.oid = maintained_entry.collation_oid
+		         LEFT JOIN pg_catalog.pg_namespace maintained_collation_namespace
+		           ON maintained_collation_namespace.oid = maintained_collation.collnamespace
+		         WHERE maintained_index.indrelid = c.oid
+		           AND (
+		             (
+		               maintained_opclass_namespace.nspname <> 'pg_catalog'
+		               AND NOT EXISTS (
+		                 SELECT 1
+		                 FROM pg_catalog.pg_depend extension_dependency
+		                 JOIN pg_catalog.pg_extension trusted_extension
+		                   ON extension_dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+		                  AND trusted_extension.oid = extension_dependency.refobjid
+		                 WHERE extension_dependency.classid = 'pg_catalog.pg_opclass'::regclass
+		                   AND extension_dependency.objid = maintained_opclass.oid
+		                   AND extension_dependency.deptype = 'e'
+		                   AND trusted_extension.extname = 'btree_gin'
+		               )
+		             )
+		             OR (
+		               maintained_entry.collation_oid <> 0
+		               AND (
+		                 maintained_collation_namespace.nspname <> 'pg_catalog'
+		                 OR NOT maintained_collation.collisdeterministic
+		               )
+		             )
+		           )
+		       )
+		       AND NOT EXISTS (
+		         SELECT 1
+		         FROM pg_catalog.pg_index dependency_index
+		         JOIN pg_catalog.pg_depend dependency
+		           ON dependency.classid = 'pg_catalog.pg_class'::regclass
+		          AND dependency.objid = dependency_index.indexrelid
+		         LEFT JOIN pg_catalog.pg_proc dependency_function
+		           ON dependency.refclassid = 'pg_catalog.pg_proc'::regclass
+		          AND dependency_function.oid = dependency.refobjid
+		         LEFT JOIN pg_catalog.pg_namespace dependency_function_namespace
+		           ON dependency_function_namespace.oid = dependency_function.pronamespace
+		         LEFT JOIN pg_catalog.pg_operator dependency_operator
+		           ON dependency.refclassid = 'pg_catalog.pg_operator'::regclass
+		          AND dependency_operator.oid = dependency.refobjid
+		         LEFT JOIN pg_catalog.pg_namespace dependency_operator_namespace
+		           ON dependency_operator_namespace.oid = dependency_operator.oprnamespace
+		         WHERE dependency_index.indrelid = c.oid
+		           AND (
+		             (
+		               dependency_function.oid IS NOT NULL
+		               AND dependency_function_namespace.nspname <> 'pg_catalog'
+		             )
+		             OR (
+		               dependency_operator.oid IS NOT NULL
+		               AND dependency_operator_namespace.nspname <> 'pg_catalog'
+		             )
+		           )
+		       ) AS relation_ordered_lane_safe,
 		       c.relkind = 'r'
 		         AND NOT c.relrowsecurity
 		         AND NOT c.relforcerowsecurity
@@ -1229,27 +1344,38 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		source: *source,
 		quoted: pgx.Identifier{source.Namespace, source.Name}.Sanitize(),
 		capabilities: targetRelationCapabilities{
-			relationLane:  true,
-			keyedSetDML:   true,
-			binaryCopy:    true,
-			textCopyStage: true,
+			relationLane:        true,
+			relationOrderedLane: true,
+			primaryKeyArbiter:   true,
+			keyedSetDML:         true,
+			binaryCopy:          true,
+			textCopyStage:       true,
 		},
 	}
 	hasSelectiveUpdates := false
 	for rows.Next() {
 		var column targetColumn
-		var replayKeyCatalogSafe, setDMLSafe, builtIn, lanePayloadSafe bool
-		var selectiveUpdates, crossKeyConflicts bool
+		var replayKeyCatalogSafe, primaryKeyArbiter, setDMLSafe, builtIn, lanePayloadSafe bool
+		var selectiveUpdates, crossKeyConflicts, relationOrderedLaneSafe bool
 		var heapBytes, heapBlocksRead, heapBlocksHit int64
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
 			&column.generated, &column.notNull, &column.primaryPos, &replayKeyCatalogSafe,
-			&column.conflicting, &selectiveUpdates, &crossKeyConflicts, &setDMLSafe,
+			&primaryKeyArbiter,
+			&column.conflicting, &selectiveUpdates, &crossKeyConflicts,
+			&relationOrderedLaneSafe, &setDMLSafe,
 			&builtIn, &lanePayloadSafe, &heapBytes,
 			&heapBlocksRead, &heapBlocksHit,
 		); err != nil {
 			return nil, err
 		}
+		// This is a relation-level admission decision repeated on every catalog
+		// row. Apply it even when the target has only generated columns; those
+		// columns are intentionally skipped by the writable-column gates below.
+		result.capabilities.relationOrderedLane =
+			result.capabilities.relationOrderedLane && relationOrderedLaneSafe
+		result.capabilities.primaryKeyArbiter =
+			result.capabilities.primaryKeyArbiter && primaryKeyArbiter
 		// Generated columns are omitted from every target INSERT/UPDATE column
 		// list and maintained by PostgreSQL. Their own non-writability must not
 		// disable set DML or selective updates for the writable relation columns.
@@ -1258,8 +1384,10 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 			// but payload type input must also be free of user-defined side effects.
 			// Built-ins and enums (including enum arrays) satisfy that invariant;
 			// domains and arbitrary extension/base types retain serial source order.
-			result.capabilities.relationLane =
-				result.capabilities.relationLane && setDMLSafe && lanePayloadSafe
+			laneSafe := setDMLSafe && lanePayloadSafe
+			result.capabilities.relationLane = result.capabilities.relationLane && laneSafe
+			result.capabilities.relationOrderedLane =
+				result.capabilities.relationOrderedLane && laneSafe
 			result.capabilities.keyedSetDML = result.capabilities.keyedSetDML && setDMLSafe
 			result.capabilities.binaryCopy = result.capabilities.binaryCopy && setDMLSafe && builtIn
 			result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe
@@ -2505,9 +2633,25 @@ func applyInsertArrayChunk(
 // avoids a compare-first target read and avoids UPDATE ... FROM plans whose
 // join order can select an unrelated secondary index on very large tables.
 func canPrimaryKeyUpsert(relation *targetRelation, change *Change) bool {
+	return canPrimaryKeyUpsertForPlan(relation, change, true)
+}
+
+// canPrimaryKeyUpsertV2 freezes the scheduler admission used by plan version
+// 2. A newer executor may use the legacy UPDATE shape for an uncommitted work
+// row, but it must reconstruct the exact v2 lane manifest before doing so.
+func canPrimaryKeyUpsertV2(relation *targetRelation, change *Change) bool {
+	return canPrimaryKeyUpsertForPlan(relation, change, false)
+}
+
+func canPrimaryKeyUpsertForPlan(
+	relation *targetRelation,
+	change *Change,
+	requireImmediateArbiter bool,
+) bool {
 	if relation == nil || change == nil || change.New == nil ||
 		len(*change.New) != len(relation.source.Columns) || len(relation.columns) == 0 ||
-		!relation.capabilities.keyedSetDML {
+		!relation.capabilities.keyedSetDML ||
+		(requireImmediateArbiter && !relation.capabilities.primaryKeyArbiter) {
 		return false
 	}
 	primary := primaryKeyColumns(relation)
