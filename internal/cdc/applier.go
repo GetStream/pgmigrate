@@ -2347,6 +2347,29 @@ func appendSelectiveIdentityScalarParams(
 	return params, positions, nil
 }
 
+func appendDeleteIdentityScalarParams(
+	params []rawParam,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	changes []Change,
+) ([]rawParam, [][]int, error) {
+	positions := make([][]int, len(changes))
+	for row := range changes {
+		positions[row] = make([]int, len(identityColumns))
+		for i, column := range identityColumns {
+			param, err := datumParamForColumn(
+				relation, column, (*changes[row].Old)[column.sourceIndex], ChangeDelete,
+			)
+			if err != nil {
+				return nil, nil, err
+			}
+			params = append(params, param)
+			positions[row][i] = len(params)
+		}
+	}
+	return params, positions, nil
+}
+
 // writeSelectiveTargetRowsCTE forces PostgreSQL to collect all exact
 // replica-identity matches into a bitmap before it touches the heap. A nested
 // loop issues one synchronous random heap read per WAL row, which is
@@ -3229,6 +3252,9 @@ func applyDeletes(replay *applyPipeline, relation *targetRelation, changes []Cha
 	}
 
 	chunkRows := applyArrayChunkRows
+	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+		chunkRows = applySelectiveProbeChunkRows
+	}
 	for start := 0; start < len(changes); {
 		firstKey, err := batchDeleteIdentityKey(relation, identityColumns, &changes[start])
 		if err != nil {
@@ -3366,12 +3392,14 @@ func applyDeleteValueChunk(
 	sql.WriteString(relation.quoted)
 	sql.WriteString(" AS pgmigrate_target USING (VALUES ")
 	params := make([]rawParam, 0, len(changes)*len(identityColumns))
+	identityParamPositions := make([][]int, len(changes))
 	for row := range changes {
 		if row != 0 {
 			sql.WriteByte(',')
 		}
 		fmt.Fprintf(&sql, "(%d", row)
-		for _, column := range identityColumns {
+		identityParamPositions[row] = make([]int, len(identityColumns))
+		for i, column := range identityColumns {
 			param, err := datumParamForColumn(
 				relation, column, (*changes[row].Old)[column.sourceIndex], ChangeDelete,
 			)
@@ -3379,6 +3407,7 @@ func applyDeleteValueChunk(
 				return err
 			}
 			params = append(params, param)
+			identityParamPositions[row][i] = len(params)
 			fmt.Fprintf(&sql, ",$%d", len(params))
 		}
 		sql.WriteByte(')')
@@ -3389,6 +3418,13 @@ func applyDeleteValueChunk(
 	}
 	sql.WriteString(") WHERE ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+		sql.WriteString(" AND (")
+		writeExactIdentityDisjunction(
+			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
+		)
+		sql.WriteByte(')')
+	}
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
 	return replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeDelete,
@@ -3418,12 +3454,23 @@ func applyDeleteArrayChunk(
 		}
 		params = append(params, param)
 	}
+	batchParamCount := len(params)
+	var identityParamPositions [][]int
+	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+		var err error
+		params, identityParamPositions, err = appendDeleteIdentityScalarParams(
+			params, relation, identityColumns, changes,
+		)
+		if err != nil {
+			return true, err
+		}
+	}
 
 	var sql strings.Builder
 	sql.WriteString("DELETE FROM ")
 	sql.WriteString(relation.quoted)
 	sql.WriteString(" AS pgmigrate_target USING unnest(")
-	for i := range params {
+	for i := 0; i < batchParamCount; i++ {
 		if i != 0 {
 			sql.WriteByte(',')
 		}
@@ -3438,6 +3485,13 @@ func applyDeleteArrayChunk(
 	}
 	sql.WriteString(",ordinal) WHERE ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	if len(identityParamPositions) != 0 {
+		sql.WriteString(" AND (")
+		writeExactIdentityDisjunction(
+			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
+		)
+		sql.WriteByte(')')
+	}
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal - 1")
 	return true, replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeDelete,

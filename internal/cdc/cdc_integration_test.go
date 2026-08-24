@@ -1032,6 +1032,38 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if values != "other-array" {
 			t.Fatalf("selective array value=%q", values)
 		}
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO public.pipeline_selective_update
+				(id, indexed_value, other_value, unique_a, unique_b)
+			VALUES (3, 'indexed-three', 'other-three', 'e', 'f')
+		`); err != nil {
+			t.Fatal(err)
+		}
+		deleteTransaction := Transaction{
+			CommitLSN: 414, EndLSN: 415, Relations: []Relation{source},
+			Changes: []Change{
+				{
+					RelationOID: source.OID, Kind: ChangeDelete,
+					Old: tuple(text("2"), text("indexed-new"), text("other-two"), text("c-new"), text("d-new")),
+				},
+				{
+					RelationOID: source.OID, Kind: ChangeDelete,
+					Old: tuple(text("3"), text("indexed-three"), text("other-three"), text("e"), text("f")),
+				},
+			},
+		}
+		if err := apply("pipeline-selective-delete-array", &deleteTransaction); err != nil {
+			t.Fatal(err)
+		}
+		var remaining int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*) FROM public.pipeline_selective_update
+		`).Scan(&remaining); err != nil {
+			t.Fatal(err)
+		}
+		if remaining != 1 {
+			t.Fatalf("selective rows after bitmap delete=%d, want 1", remaining)
+		}
 		if _, err := conn.Exec(ctx, "SELECT pg_stat_force_next_flush()"); err != nil {
 			t.Fatal(err)
 		}
