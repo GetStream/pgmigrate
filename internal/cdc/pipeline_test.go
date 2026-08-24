@@ -328,6 +328,7 @@ func TestPrimaryKeyUpsertUsesExactCompositePrimaryKey(t *testing.T) {
 func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
 	t.Parallel()
 	relation := &targetRelation{
+		quoted:       `"shard_schema"."messages"`,
 		capabilities: targetRelationCapabilities{keyedSetDML: true},
 		columns: []targetColumn{
 			{name: "id", quoted: `"id"`, sourceIndex: 0, key: true, primary: true, primaryPos: 2},
@@ -342,9 +343,12 @@ func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
 		t.Fatalf("delete primary key order = %v, want [app_pk id]", got)
 	}
 	var sql strings.Builder
-	writeBatchIdentityPredicate(&sql, primary, "identity_", 0)
-	if got := sql.String(); !strings.Contains(got, `ROW(pgmigrate_target."app_pk",pgmigrate_target."id")`) {
-		t.Fatalf("delete predicate does not follow the target primary key: %q", got)
+	writeDeleteIdentityPredicate(&sql, relation, primary, "identity_", 0)
+	want := `pgmigrate_target.ctid=(SELECT pgmigrate_lookup.ctid FROM "shard_schema"."messages" AS pgmigrate_lookup ` +
+		`WHERE pgmigrate_lookup."app_pk"=pgmigrate_batch.identity_0 AND ` +
+		`pgmigrate_lookup."id"=pgmigrate_batch.identity_1 OFFSET 0)`
+	if got := sql.String(); got != want {
+		t.Fatalf("delete predicate = %q, want forced target primary key %q", got, want)
 	}
 
 	relation.columns[1].key = false

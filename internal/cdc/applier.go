@@ -3782,6 +3782,33 @@ func primaryKeyDeleteColumns(relation *targetRelation) ([]targetColumn, bool) {
 	return primary, true
 }
 
+func deleteUsesTargetPrimaryKey(relation *targetRelation, identityColumns []targetColumn) bool {
+	primary, safe := primaryKeyDeleteColumns(relation)
+	if !safe || len(primary) != len(identityColumns) {
+		return false
+	}
+	for i := range primary {
+		if primary[i].name != identityColumns[i].name {
+			return false
+		}
+	}
+	return true
+}
+
+func writeDeleteIdentityPredicate(
+	sql *strings.Builder,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	prefix string,
+	offset int,
+) {
+	if deleteUsesTargetPrimaryKey(relation, identityColumns) {
+		writeCompositeIdentityCTIDPredicate(sql, relation, identityColumns, prefix, offset)
+		return
+	}
+	writeBatchIdentityPredicate(sql, identityColumns, prefix, offset)
+}
+
 func batchDeleteIdentityKey(
 	relation *targetRelation,
 	identityColumns []targetColumn,
@@ -3869,7 +3896,7 @@ func applyDeleteTextStage(
 	sql.WriteString(" AS pgmigrate_target USING ")
 	sql.WriteString(stage)
 	sql.WriteString(" AS pgmigrate_batch WHERE ")
-	writeBatchIdentityPredicate(&sql, identityColumns, "column_", 0)
+	writeDeleteIdentityPredicate(&sql, relation, identityColumns, "column_", 0)
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
 	return true, replay.queue(sql.String(), nil, applyExpectation{
 		relation: relation, kind: ChangeDelete,
@@ -3914,8 +3941,9 @@ func applyDeleteValueChunk(
 		fmt.Fprintf(&sql, ",identity_%d", i)
 	}
 	sql.WriteString(") WHERE ")
-	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
-	if useExactIdentityMembership(relation, identityColumns) {
+	writeDeleteIdentityPredicate(&sql, relation, identityColumns, "identity_", 0)
+	if useExactIdentityMembership(relation, identityColumns) &&
+		!deleteUsesTargetPrimaryKey(relation, identityColumns) {
 		sql.WriteString(" AND (")
 		writeExactIdentityDisjunction(
 			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
@@ -3953,7 +3981,8 @@ func applyDeleteArrayChunk(
 	}
 	batchParamCount := len(params)
 	var identityParamPositions [][]int
-	if useExactIdentityMembership(relation, identityColumns) {
+	if useExactIdentityMembership(relation, identityColumns) &&
+		!deleteUsesTargetPrimaryKey(relation, identityColumns) {
 		var err error
 		params, identityParamPositions, err = appendDeleteIdentityScalarParams(
 			params, relation, identityColumns, changes,
@@ -3981,7 +4010,7 @@ func applyDeleteArrayChunk(
 		fmt.Fprintf(&sql, "identity_%d", i)
 	}
 	sql.WriteString(",ordinal) WHERE ")
-	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	writeDeleteIdentityPredicate(&sql, relation, identityColumns, "identity_", 0)
 	if len(identityParamPositions) != 0 {
 		sql.WriteString(" AND (")
 		writeExactIdentityDisjunction(
