@@ -432,6 +432,23 @@ if [ "$driver" = controller ]; then
             fi
             sleep 1
         done
+        recovered_controller_status=$(controller_status)
+        case "$recovered_controller_status" in
+            *'"fresh_snapshot_required":false'*) ;;
+            *) echo "fresh-snapshot recovery remained classified as requiring another restart" >&2
+               printf '%s\n' "$recovered_controller_status" >&2
+               exit 1 ;;
+        esac
+        case "$recovered_controller_status" in
+            *'"failure":'*) echo "fresh-snapshot recovery retained the superseded failed attempt" >&2
+               printf '%s\n' "$recovered_controller_status" >&2
+               exit 1 ;;
+        esac
+        case "$recovered_controller_status" in
+            *'"id":"cdc-divergence"'*) echo "fresh-snapshot recovery retained the superseded divergence blocker" >&2
+               printf '%s\n' "$recovered_controller_status" >&2
+               exit 1 ;;
+        esac
         resumed_stats=$(target_sql -Atqc "
             SELECT transactions_applied::text || '|' || rows_applied::text
             FROM pgmigrate_internal.replication_progress
