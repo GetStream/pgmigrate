@@ -16,6 +16,7 @@ import (
 
 	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // Tools names the PostgreSQL client programs. Empty values use PATH defaults.
@@ -509,6 +510,15 @@ func (s Service) Clean(ctx context.Context, targetURI, archive string) error {
 			continue
 		}
 		if _, err := conn.Exec(ctx, statement); err != nil {
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "3F000") {
+				// A guarded fresh-snapshot restart removes selected tables before
+				// processing the archive, because inherited partition constraints
+				// cannot be dropped independently. ALTER TABLE cleanup statements
+				// for those already-removed relations are therefore expected and
+				// preserve Clean's intended idempotence.
+				continue
+			}
 			return fmt.Errorf("execute archive cleanup statement: %w", err)
 		}
 	}

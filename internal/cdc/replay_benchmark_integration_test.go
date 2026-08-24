@@ -46,8 +46,15 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 	transactionCount := benchmarkPositiveIntEnv(
 		t, "PGMIGRATE_CDC_BENCH_TRANSACTIONS", cdcReplayBenchmarkTransactions,
 	)
+	// Array-bearing updates make a row-change count alone misleading: one
+	// decoded change can carry substantially more WAL than the original fixture.
+	// Keep both gates so replay must sustain high operation throughput and high
+	// byte throughput instead of passing by making each synthetic row tiny.
 	minimumRate := benchmarkPositiveFloatEnv(
-		t, "PGMIGRATE_CDC_BENCH_MIN_CHANGES_PER_SECOND", 200_000,
+		t, "PGMIGRATE_CDC_BENCH_MIN_CHANGES_PER_SECOND", 140_000,
+	)
+	minimumMiBRate := benchmarkPositiveFloatEnv(
+		t, "PGMIGRATE_CDC_BENCH_MIN_MIB_PER_SECOND", 75,
 	)
 	accountCount := 20_000
 	accountCount = benchmarkPositiveIntEnv(
@@ -339,16 +346,24 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 	}
 
 	rate := float64(expectedChanges) / elapsed.Seconds()
+	walMiB := float64(markerLSN-startLSN) / float64(1<<20)
+	walMiBRate := walMiB / elapsed.Seconds()
 	t.Logf(
-		"cdc_replay changes=%d source_transactions=%d accounts=%d barrier_every=%d replay_workers=%d replay_batch_bytes=%d replay_batch_changes=%d elapsed=%s changes_per_second=%.0f target=%.0f",
+		"cdc_replay changes=%d source_transactions=%d accounts=%d barrier_every=%d replay_workers=%d replay_batch_bytes=%d replay_batch_changes=%d elapsed=%s changes_per_second=%.0f changes_target=%.0f wal=%.1f_MiB wal_apply=%.1f_MiB/s wal_target=%.1f_MiB/s",
 		expectedChanges, transactionCount, accountCount, barrierEvery,
 		replayWorkers, replayBatchBytes, replayBatchChanges,
-		elapsed.Round(time.Millisecond), rate, minimumRate,
+		elapsed.Round(time.Millisecond), rate, minimumRate, walMiB, walMiBRate, minimumMiBRate,
 	)
 	if rate < minimumRate {
 		t.Fatalf(
 			"CDC replay throughput %.0f changes/s is below the %.0f changes/s target",
 			rate, minimumRate,
+		)
+	}
+	if walMiBRate < minimumMiBRate {
+		t.Fatalf(
+			"CDC replay WAL throughput %.1f MiB/s is below the %.1f MiB/s target",
+			walMiBRate, minimumMiBRate,
 		)
 	}
 }
@@ -388,6 +403,7 @@ func cdcReplayFixtureSQL(accountCount, sessionCount int) string {
 			balance bigint NOT NULL,
 			revision integer NOT NULL,
 			metadata jsonb NOT NULL,
+			labels text[] NOT NULL,
 			updated_at timestamptz NOT NULL
 		);
 		CREATE INDEX accounts_tenant_revision_idx
@@ -467,6 +483,7 @@ func cdcReplayFixtureSQL(accountCount, sessionCount int) string {
 		       100000 + id * 17,
 		       0,
 		       jsonb_build_object('segment', id %% 7, 'seed', md5(id::text)),
+		       ARRAY['seed', (id %% 11)::text],
 		       TIMESTAMPTZ '2026-01-01 00:00:00+00' + id * interval '1 second'
 		FROM generate_series(1, %d) AS id;
 
@@ -503,6 +520,7 @@ const cdcReplayWorkloadSQL = `
 		SET balance = account.balance + (($1::bigint % 17) - 8),
 		    revision = account.revision + 1,
 		    metadata = jsonb_set(account.metadata, '{last_batch}', to_jsonb($1::bigint), true),
+		    labels = ARRAY['updated', ($1::bigint % 17)::text],
 		    updated_at = TIMESTAMPTZ '2026-03-01 00:00:00+00' +
 			    $1::bigint * interval '1 millisecond'
 		FROM generate_series(1, 4) AS item

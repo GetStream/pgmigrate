@@ -45,9 +45,10 @@ type Action func(context.Context, config.Config, io.Writer) error
 // Actions are the deliberately limited operations exposed by the controller.
 // Cutover and sequence advancement are intentionally absent.
 type Actions struct {
-	Preflight Action
-	Run       Action
-	Verify    Action
+	Preflight       Action
+	Run             Action
+	RestartBaseCopy Action
+	Verify          Action
 }
 
 // Options configures a controller Server.
@@ -235,6 +236,7 @@ type statusResponse struct {
 	ReplayClaim           *replayClaimView         `json:"replay_claim,omitempty"`
 	Findings              []findingView            `json:"findings,omitempty"`
 	Failure               *failureView             `json:"failure,omitempty"`
+	FreshSnapshotRequired bool                     `json:"fresh_snapshot_required"`
 	Operations            map[string]operationView `json:"operations"`
 	ConnectionsConfigured bool                     `json:"connections_configured"`
 	TokenRequired         bool                     `json:"token_required"`
@@ -257,8 +259,9 @@ func New(options Options) (*Server, error) {
 		return nil, err
 	}
 	options.Config = loadedConfig
-	if options.Actions.Preflight == nil || options.Actions.Run == nil || options.Actions.Verify == nil {
-		return nil, errors.New("preflight, run, and verify controller actions are required")
+	if options.Actions.Preflight == nil || options.Actions.Run == nil ||
+		options.Actions.RestartBaseCopy == nil || options.Actions.Verify == nil {
+		return nil, errors.New("preflight, run, restart-base-copy, and verify controller actions are required")
 	}
 	configGeneration, err := newConfigurationGeneration()
 	if err != nil {
@@ -472,8 +475,16 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 			Phase: attempt.Phase, Signature: attempt.Signature, Detail: attempt.Detail,
 			Consecutive: attempt.Consecutive, ObservedAt: attempt.ObservedAt,
 		}
+		response.FreshSnapshotRequired = freshSnapshotRequiredFailure(attempt.Detail)
 	}
 	writeJSON(w, http.StatusOK, response)
+}
+
+func freshSnapshotRequiredFailure(detail string) bool {
+	detail = strings.ToLower(detail)
+	missing := strings.Contains(detail, "does not exist") || strings.Contains(detail, "is missing")
+	return missing && (strings.Contains(detail, "replication slot") ||
+		strings.Contains(detail, "source publication"))
 }
 
 func replayPhase(phase state.Phase) bool {
@@ -836,9 +847,10 @@ func (s *Server) action(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	action, ok := map[string]Action{
-		"preflight": s.actions.Preflight,
-		"run":       s.actions.Run,
-		"verify":    s.actions.Verify,
+		"preflight":         s.actions.Preflight,
+		"run":               s.actions.Run,
+		"restart-base-copy": s.actions.RestartBaseCopy,
+		"verify":            s.actions.Verify,
 	}[name]
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown controller action")
@@ -889,6 +901,12 @@ func (s *Server) validateLifecycle(ctx context.Context, action string) error {
 		if migration.Phase == state.PhaseComplete {
 			return errors.New("migration is already complete")
 		}
+	case "restart-base-copy":
+		switch migration.Phase {
+		case state.PhaseIndexes, state.PhaseCatchup, state.PhaseFollow:
+		default:
+			return fmt.Errorf("fresh-snapshot restart is unavailable in %s phase", migration.Phase)
+		}
 	case "verify":
 		if migration.Phase != state.PhaseFollow {
 			return fmt.Errorf("verification requires follow phase; migration is in %s", migration.Phase)
@@ -924,7 +942,9 @@ func (s *Server) start(name string, revision string, action Action) (operationVi
 		otherSlot = "migration"
 	}
 	other := s.operations[otherSlot]
-	if other.active() && !(name == "verify" && other.Name == "run") {
+	verificationAlongsideReplay := name == "verify" &&
+		(other.Name == "run" || other.Name == "restart-base-copy")
+	if other.active() && !verificationAlongsideReplay {
 		return operationView{}, fmt.Errorf("%s cannot start while %s is %s", name, other.Name, other.State)
 	}
 	s.nextID++

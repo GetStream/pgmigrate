@@ -81,6 +81,45 @@ func TestResetBaseCopyForcesFreshSnapshotState(t *testing.T) {
 	}
 }
 
+func TestResetForFreshSnapshotIsLimitedToSafePostCopyPhases(t *testing.T) {
+	for _, test := range []struct {
+		phase Phase
+		ok    bool
+	}{
+		{phase: PhaseCopy},
+		{phase: PhaseIndexes, ok: true},
+		{phase: PhaseCatchup, ok: true},
+		{phase: PhaseFollow, ok: true},
+		{phase: PhaseDrained},
+		{phase: PhaseCutover},
+		{phase: PhaseComplete},
+	} {
+		t.Run(string(test.phase), func(t *testing.T) {
+			ctx := context.Background()
+			store, err := Open(ctx, t.TempDir(), testFingerprints)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			for _, phase := range []Phase{PhaseSetup, PhaseSchema, PhaseCopy, PhaseIndexes, PhaseCatchup, PhaseFollow, PhaseDrained, PhaseCutover, PhaseComplete} {
+				if err := store.TransitionPhase(ctx, phase); err != nil {
+					t.Fatal(err)
+				}
+				if phase == test.phase {
+					break
+				}
+			}
+			err = store.ResetForFreshSnapshot(ctx)
+			if test.ok && err != nil {
+				t.Fatalf("ResetForFreshSnapshot() error = %v", err)
+			}
+			if !test.ok && err == nil {
+				t.Fatal("ResetForFreshSnapshot() unexpectedly succeeded")
+			}
+		})
+	}
+}
+
 func TestTargetCleanupRequestCanBeDurablyCleared(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, t.TempDir(), testFingerprints)

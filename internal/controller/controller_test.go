@@ -53,7 +53,7 @@ func TestControllerStartupLeavesMigrationDirectoryUntouched(t *testing.T) {
 	}
 	server, err := New(Options{
 		Config:  config.Config{Dir: migrationDir},
-		Actions: Actions{Preflight: action, Run: action, Verify: action},
+		Actions: Actions{Preflight: action, Run: action, RestartBaseCopy: action, Verify: action},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -144,9 +144,10 @@ func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
 		}
 	}
 	server := newTestServer(t, config.Config{Dir: dir}, "", Actions{
-		Preflight: func(context.Context, config.Config, io.Writer) error { return nil },
-		Run:       blocking(runStarted),
-		Verify:    blocking(verifyStarted),
+		Preflight:       func(context.Context, config.Config, io.Writer) error { return nil },
+		Run:             blocking(runStarted),
+		RestartBaseCopy: func(context.Context, config.Config, io.Writer) error { return nil },
+		Verify:          blocking(verifyStarted),
 	})
 
 	if got := requestAction(t, server, "run", server.configurationViewSnapshot().Revision, ""); got.Code != http.StatusAccepted {
@@ -165,6 +166,40 @@ func TestRunAndVerifyCanBeControlledConcurrently(t *testing.T) {
 	}
 	if got := request(t, server, http.MethodPost, "/api/actions/stop-migration", "stop-migration", ""); got.Code != http.StatusAccepted {
 		t.Fatalf("stop migration status = %d, body = %s", got.Code, got.Body.String())
+	}
+	waitForState(t, server, "verification", "stopped")
+	waitForState(t, server, "migration", "stopped")
+}
+
+func TestFreshSnapshotReplayAndVerifyCanBeControlledConcurrently(t *testing.T) {
+	dir := t.TempDir()
+	initializeStateAt(t, dir, state.PhaseFollow)
+	restartStarted := make(chan struct{})
+	verifyStarted := make(chan struct{})
+	blocking := func(started chan<- struct{}) Action {
+		return func(ctx context.Context, _ config.Config, _ io.Writer) error {
+			close(started)
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	}
+	actions := noOpActions()
+	actions.RestartBaseCopy = blocking(restartStarted)
+	actions.Verify = blocking(verifyStarted)
+	server := newTestServer(t, config.Config{Dir: dir}, "", actions)
+	revision := server.configurationViewSnapshot().Revision
+	if got := requestAction(t, server, "restart-base-copy", revision, ""); got.Code != http.StatusAccepted {
+		t.Fatalf("restart status = %d, body = %s", got.Code, got.Body.String())
+	}
+	waitChannel(t, restartStarted)
+	if got := requestAction(t, server, "verify", revision, ""); got.Code != http.StatusAccepted {
+		t.Fatalf("verify status = %d, body = %s", got.Code, got.Body.String())
+	}
+	waitChannel(t, verifyStarted)
+	for _, slot := range []string{"verification", "migration"} {
+		if got := request(t, server, http.MethodPost, "/api/actions/stop-"+slot, "stop-"+slot, ""); got.Code != http.StatusAccepted {
+			t.Fatalf("stop %s status = %d, body = %s", slot, got.Code, got.Body.String())
+		}
 	}
 	waitForState(t, server, "verification", "stopped")
 	waitForState(t, server, "migration", "stopped")
@@ -230,13 +265,53 @@ func TestLifecycleGuardsControllerActions(t *testing.T) {
 		dir := t.TempDir()
 		initializeStateAt(t, dir, state.PhaseComplete)
 		server := newTestServer(t, config.Config{Dir: dir}, "", noOpActions())
-		for _, action := range []string{"preflight", "run", "verify"} {
+		for _, action := range []string{"preflight", "run", "restart-base-copy", "verify"} {
 			got := requestAction(t, server, action, server.configurationViewSnapshot().Revision, "")
 			if got.Code != http.StatusConflict {
 				t.Errorf("%s status = %d, body = %s", action, got.Code, got.Body.String())
 			}
 		}
 	})
+
+	for _, test := range []struct {
+		phase state.Phase
+		want  int
+	}{
+		{phase: state.PhasePreflight, want: http.StatusConflict},
+		{phase: state.PhaseCopy, want: http.StatusConflict},
+		{phase: state.PhaseIndexes, want: http.StatusAccepted},
+		{phase: state.PhaseCatchup, want: http.StatusAccepted},
+		{phase: state.PhaseFollow, want: http.StatusAccepted},
+		{phase: state.PhaseDrained, want: http.StatusConflict},
+		{phase: state.PhaseCutover, want: http.StatusConflict},
+	} {
+		t.Run("fresh snapshot restart "+string(test.phase), func(t *testing.T) {
+			dir := t.TempDir()
+			initializeStateAt(t, dir, test.phase)
+			server := newTestServer(t, config.Config{Dir: dir}, "", noOpActions())
+			got := requestAction(t, server, "restart-base-copy", server.configurationViewSnapshot().Revision, "")
+			if got.Code != test.want {
+				t.Fatalf("restart-base-copy in %s status = %d, want %d, body = %s", test.phase, got.Code, test.want, got.Body.String())
+			}
+		})
+	}
+}
+
+func TestFreshSnapshotRequiredFailureClassification(t *testing.T) {
+	for _, test := range []struct {
+		detail string
+		want   bool
+	}{
+		{detail: `cdc receiver: ERROR: replication slot "pgmigrate_slot_1" does not exist`, want: true},
+		{detail: `source replication slot is missing: "pgmigrate_slot_1"`, want: true},
+		{detail: `source publication is missing: "pgmigrate_pub_1"`, want: true},
+		{detail: "cdc divergence applying update change"},
+		{detail: "source publication table membership does not match"},
+	} {
+		if got := freshSnapshotRequiredFailure(test.detail); got != test.want {
+			t.Errorf("freshSnapshotRequiredFailure(%q) = %v, want %v", test.detail, got, test.want)
+		}
+	}
 }
 
 func TestTokenAndConfirmationAreRequired(t *testing.T) {
@@ -766,6 +841,11 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		"base-copy snapshot is no longer reusable",
 		"copied bytes shown above are historical",
 		"Restart base copy from a fresh snapshot?",
+		`data-action="restart-base-copy"`,
+		"Restart from fresh snapshot",
+		"Restart the entire migration from a fresh production snapshot?",
+		"cannot be resumed without a data gap",
+		"Restart losslessly",
 		"The old snapshot and its partial copy cannot be reused.",
 		"resets snapshot-bound CDC state",
 		"Resume continues from durable",
@@ -818,7 +898,7 @@ func newTestServer(t *testing.T, cfg config.Config, token string, actions Action
 
 func noOpActions() Actions {
 	action := func(context.Context, config.Config, io.Writer) error { return nil }
-	return Actions{Preflight: action, Run: action, Verify: action}
+	return Actions{Preflight: action, Run: action, RestartBaseCopy: action, Verify: action}
 }
 
 func request(t *testing.T, server *Server, method, target, confirmation, token string) *httptest.ResponseRecorder {

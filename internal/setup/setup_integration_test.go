@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -241,6 +242,60 @@ func TestPG17RecoverStaleSetupSafely(t *testing.T) {
 	}
 	assertArtifactsExist(t, ctx, control, slotForeignPublication, slotForeign)
 	dropStaleArtifacts(t, ctx, control, slotForeignPublication, slotForeign)
+}
+
+func TestPG17ValidateResumeFailsClosedBeforeLocalRecovery(t *testing.T) {
+	instance := pgtest.Start(t, 17)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	control := instance.Connect(t)
+	if _, err := control.Exec(ctx, "CREATE TABLE resume_source (id integer PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	cfg := setup.Config{
+		SourceDSN:   instance.URI,
+		TargetDSN:   instance.URI,
+		Dir:         t.TempDir(),
+		MigrationID: "resume-source",
+		Tables:      []setup.Table{{Schema: "public", Name: "resume_source"}},
+	}
+	holder, err := setup.Run(ctx, cfg, &snapshotState{})
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	snapshot := holder.Snapshot
+	if err := holder.Close(ctx); err != nil {
+		t.Fatalf("close snapshot holder: %v", err)
+	}
+	t.Cleanup(func() {
+		dropStaleArtifacts(t, context.Background(), control, snapshot.Publication, snapshot.Slot)
+	})
+
+	if err := setup.ValidateResume(ctx, cfg, snapshot); err != nil {
+		t.Fatalf("validate intact resume objects: %v", err)
+	}
+	if _, err := control.Exec(ctx, "SELECT pg_catalog.pg_drop_replication_slot($1)", snapshot.Slot); err != nil {
+		t.Fatalf("drop fixture slot: %v", err)
+	}
+	err = setup.ValidateResume(ctx, cfg, snapshot)
+	if err == nil {
+		t.Fatal("resume validation accepted a missing source slot")
+	}
+	if !strings.Contains(err.Error(), snapshot.Slot) ||
+		!strings.Contains(err.Error(), "recreating it would skip an unprovable WAL gap") ||
+		!strings.Contains(err.Error(), "fresh base copy is required") {
+		t.Fatalf("missing-slot error = %q", err)
+	}
+	var publicationExists bool
+	if err := control.QueryRow(ctx,
+		"SELECT EXISTS(SELECT FROM pg_catalog.pg_publication WHERE pubname=$1)",
+		snapshot.Publication,
+	).Scan(&publicationExists); err != nil {
+		t.Fatal(err)
+	}
+	if !publicationExists {
+		t.Fatal("resume validation mutated the surviving source publication")
+	}
 }
 
 func createStaleArtifacts(

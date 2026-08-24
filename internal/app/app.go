@@ -431,7 +431,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	if hadState && (migration.Phase == state.PhaseIndexes || migration.Phase == state.PhaseCatchup ||
 		migration.Phase == state.PhaseFollow || migration.Phase == state.PhaseDrained ||
 		migration.Phase == state.PhaseCutover) {
-		return a.resumePostCopy(ctx, cfg, store, migration)
+		return a.resumePostCopy(ctx, cfg, store, migration, tables)
 	}
 	if migration.Phase == state.PhaseSetup || migration.Phase == state.PhaseSchema || migration.Phase == state.PhaseCopy {
 		if err := guardRepeatedBaseCopyFailure(ctx, cfg, store, migration); err != nil {
@@ -688,7 +688,108 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	return err
 }
 
-func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state.Store, migration state.Migration) error {
+// RestartBaseCopy is the explicit lossless recovery path for a post-copy run
+// whose source logical slot has disappeared. It refuses to reset a reusable
+// stream: creating a new slot under an old snapshot would silently skip WAL,
+// while resetting a healthy stream would discard valid durable work.
+func (a App) RestartBaseCopy(ctx context.Context, cfg config.Config) error {
+	if err := prepareFreshSnapshotRestart(ctx, cfg); err != nil {
+		return err
+	}
+	fmt.Fprintln(a.progressOutput(), "fresh-snapshot restart: old pgmigrate-owned stream and target base state removed; starting a new lossless snapshot")
+	return a.Run(ctx, cfg)
+}
+
+func prepareFreshSnapshotRestart(ctx context.Context, cfg config.Config) error {
+	filter, err := loadFilter(cfg.TableFilter)
+	if err != nil {
+		return err
+	}
+	fingerprint, err := sourceFingerprint(ctx, cfg.Source)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Dir, "state.db")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("fresh-snapshot restart requires an existing migration")
+		}
+		return fmt.Errorf("inspect durable migration state: %w", err)
+	}
+	store, err := state.Open(ctx, cfg.Dir, state.Fingerprints{Source: fingerprint, Filter: filter.Fingerprint()})
+	if err != nil {
+		return err
+	}
+	migration, err := store.Migration(ctx)
+	if err != nil {
+		store.Close()
+		return err
+	}
+	switch migration.Phase {
+	case state.PhaseIndexes, state.PhaseCatchup, state.PhaseFollow:
+	default:
+		store.Close()
+		return fmt.Errorf("fresh-snapshot restart is unavailable in %s phase", migration.Phase)
+	}
+	recordedTables, err := store.ListTables(ctx)
+	if err != nil {
+		store.Close()
+		return err
+	}
+	if len(recordedTables) == 0 {
+		store.Close()
+		return errors.New("fresh-snapshot restart requires a durable table inventory")
+	}
+	tables := make([]pgcopy.Table, len(recordedTables))
+	for index, table := range recordedTables {
+		tables[index] = pgcopy.Table{
+			OID: table.OID, Schema: table.Schema, Name: table.Name,
+			EstimatedRows: table.EstimatedRows, Bytes: table.Bytes,
+		}
+	}
+	snapshot, err := readSnapshot(cfg.Dir)
+	if errors.Is(err, os.ErrNotExist) {
+		publication, _ := setup.Names(migration.SourceFingerprint, migrationID(cfg.Dir))
+		snapshot = setup.Snapshot{
+			SourceFingerprint: migration.SourceFingerprint,
+			Publication:       publication,
+			Slot:              migration.SlotName,
+			Name:              migration.SnapshotName,
+			ConsistentPoint:   migration.ConsistentPoint,
+		}
+	} else if err != nil {
+		store.Close()
+		return fmt.Errorf("read durable snapshot before restart: %w", err)
+	}
+	resumeErr := setup.ValidateResume(ctx, setup.Config{
+		SourceDSN: cfg.Source,
+		Tables:    toSetup(tables),
+	}, snapshot)
+	if resumeErr == nil {
+		store.Close()
+		return errors.New("source replication slot is reusable; resume the migration instead of restarting the base copy")
+	}
+	if !errors.Is(resumeErr, setup.ErrResumeSlotMissing) &&
+		!errors.Is(resumeErr, setup.ErrResumePublicationMissing) {
+		store.Close()
+		return fmt.Errorf("refuse fresh-snapshot restart without a proven missing source CDC object: %w", resumeErr)
+	}
+	if err := resetInterruptedBaseCopy(ctx, cfg, store, tables, migration); err != nil {
+		store.Close()
+		return fmt.Errorf("restart base copy from a fresh snapshot: %w", err)
+	}
+	if err := store.Close(); err != nil {
+		return fmt.Errorf("close reset migration state: %w", err)
+	}
+	return nil
+}
+
+func (a App) resumePostCopy(
+	ctx context.Context,
+	cfg config.Config,
+	store *state.Store,
+	migration state.Migration,
+	tables []pgcopy.Table,
+) error {
 	if err := validateTargetIdentity(ctx, cfg, store); err != nil {
 		return err
 	}
@@ -712,6 +813,12 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 	}
 	if snapshot.Slot != migration.SlotName || snapshot.ConsistentPoint != migration.ConsistentPoint {
 		return errors.New("snapshot metadata does not match durable migration state")
+	}
+	if err := setup.ValidateResume(ctx, setup.Config{
+		SourceDSN: cfg.Source,
+		Tables:    toSetup(tables),
+	}, snapshot); err != nil {
+		return fmt.Errorf("validate source CDC stream before local recovery: %w", err)
 	}
 	cdcDir := filepath.Join(cfg.Dir, "cdc")
 	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{
@@ -2002,15 +2109,6 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 	if err := restoreReplicaIdentities(ctx, cfg.Source, store); err != nil {
 		return err
 	}
-	archive := filepath.Join(cfg.Dir, "dump", "schema.dump")
-	if _, err := os.Stat(archive); err == nil {
-		service := schema.Service{Tools: schema.Tools{Restore: cfg.PGRestorePath}}
-		if err := service.Clean(ctx, cfg.Target, archive); err != nil {
-			return fmt.Errorf("clean prior schema archive: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
 	schemas := map[string]bool{}
 	for _, table := range tables {
 		schemas[table.Schema] = true
@@ -2031,6 +2129,20 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 		if _, err := target.Exec(ctx, "DROP TABLE "+pgx.Identifier{table.Schema, table.Name}.Sanitize()+" CASCADE"); err != nil {
 			return err
 		}
+	}
+	// pg_restore emits inherited partition constraint drops before its table
+	// drops. PostgreSQL rejects those while the partition still exists, so remove
+	// the already ownership-validated migration tables first. The archive cleanup
+	// then removes the remaining functions, types, comments, and public-schema
+	// objects with IF EXISTS semantics.
+	archive := filepath.Join(cfg.Dir, "dump", "schema.dump")
+	if _, err := os.Stat(archive); err == nil {
+		service := schema.Service{Tools: schema.Tools{Restore: cfg.PGRestorePath}}
+		if err := service.Clean(ctx, cfg.Target, archive); err != nil {
+			return fmt.Errorf("clean prior schema archive: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	for name := range schemas {
 		if name == "public" {
@@ -2063,9 +2175,10 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 		}
 	}
 	_, _ = target.Exec(ctx, "DROP SCHEMA IF EXISTS pgmigrate_internal CASCADE")
-	if err := store.ResetBaseCopy(ctx); err != nil {
-		return err
-	}
+	// Keep the post-copy phase durable until every snapshot-bound file has been
+	// removed and its empty directories recreated. If the pod dies anywhere
+	// before ResetBaseCopy commits, retrying this cleanup is idempotent. Once the
+	// state says preflight, no stale snapshot, dump, or CDC segment can survive.
 	for _, path := range []string{filepath.Join(cfg.Dir, "snapshot.json"), filepath.Join(cfg.Dir, "dump"), filepath.Join(cfg.Dir, "cdc")} {
 		if err := os.RemoveAll(path); err != nil {
 			return err
@@ -2076,7 +2189,10 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 			return err
 		}
 	}
-	return nil
+	if migration.Phase == state.PhaseIndexes || migration.Phase == state.PhaseCatchup || migration.Phase == state.PhaseFollow {
+		return store.ResetForFreshSnapshot(ctx)
+	}
+	return store.ResetBaseCopy(ctx)
 }
 
 func recordTargetIdentity(ctx context.Context, targetDSN, sourceFingerprint, filterFingerprint, streamID, generation string) error {

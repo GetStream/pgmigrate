@@ -151,9 +151,10 @@ func newControllerCommand(cfg *config.Config) *cobra.Command {
 				Token:   token,
 				Out:     cmd.OutOrStdout(),
 				Actions: controller.Actions{
-					Preflight: controllerWorkerAction("preflight"),
-					Run:       controllerWorkerAction("run"),
-					Verify:    controllerWorkerAction("verify"),
+					Preflight:       controllerWorkerAction("preflight"),
+					Run:             controllerWorkerAction("run"),
+					RestartBaseCopy: controllerWorkerAction("restart-base-copy"),
+					Verify:          controllerWorkerAction("verify"),
 				},
 			})
 			if err != nil {
@@ -235,6 +236,11 @@ func newControllerWorkerCommand() *cobra.Command {
 					return err
 				}
 				return application.Run(cmd.Context(), cfg)
+			case "restart-base-copy":
+				if err := validateDatabaseConfig(cfg); err != nil {
+					return err
+				}
+				return application.RestartBaseCopy(cmd.Context(), cfg)
 			case "verify":
 				if err := cfg.ValidateConnections(); err != nil {
 					return err

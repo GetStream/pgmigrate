@@ -12,13 +12,37 @@ import (
 // supported recovery for setup/schema/copy after the exporting process dies;
 // callers must first remove the old source and target objects.
 func (s *Store) ResetBaseCopy(ctx context.Context) error {
+	return s.resetSnapshotState(ctx, func(phase Phase) error {
+		if phaseOrder[phase] > phaseOrder[PhaseCopy] {
+			return fmt.Errorf("base-copy reset is only allowed through copy phase (current %s)", phase)
+		}
+		return nil
+	})
+}
+
+// ResetForFreshSnapshot forgets all state derived from a completed base-copy
+// snapshot after the caller has independently proved that its logical stream
+// is unrecoverable and removed the migration-owned source and target objects.
+// It deliberately excludes drained, cutover, and complete migrations.
+func (s *Store) ResetForFreshSnapshot(ctx context.Context) error {
+	return s.resetSnapshotState(ctx, func(phase Phase) error {
+		switch phase {
+		case PhaseIndexes, PhaseCatchup, PhaseFollow:
+			return nil
+		default:
+			return fmt.Errorf("fresh-snapshot reset is unavailable in %s phase", phase)
+		}
+	})
+}
+
+func (s *Store) resetSnapshotState(ctx context.Context, validate func(Phase) error) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var phase Phase
 		if err := tx.QueryRowContext(ctx, "SELECT phase FROM migration WHERE id=1").Scan(&phase); err != nil {
 			return fmt.Errorf("read reset phase: %w", err)
 		}
-		if phaseOrder[phase] > phaseOrder[PhaseCopy] {
-			return fmt.Errorf("base-copy reset is only allowed through copy phase (current %s)", phase)
+		if err := validate(phase); err != nil {
+			return err
 		}
 		for _, statement := range []string{
 			"DELETE FROM verify_tables", "DELETE FROM constraints", "DELETE FROM indexes",

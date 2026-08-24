@@ -368,26 +368,98 @@ if [ "$driver" = controller ]; then
         sleep 1
     done
 
-    controller_action run
-    sleep 1
-    state=$(controller_operation_state migration)
-    if [ "$state" != running ]; then
-        echo "resumed replay worker is $state, want running" >&2
-        controller_status >&2 || true
-        exit 1
+    if [ "${PGMIGRATE_TEST_DROP_SLOT_RESTART:-0}" = 1 ]; then
+        lost_slot=$(source_sql -Atqc "
+            SELECT slot_name FROM pg_catalog.pg_replication_slots
+            WHERE slot_name LIKE 'pgmigrate_slot_%'
+            ORDER BY slot_name LIMIT 1
+        ")
+        if [ -z "$lost_slot" ]; then
+            echo "test logical slot was not found" >&2
+            exit 1
+        fi
+        source_sql -Atqc "SELECT pg_catalog.pg_drop_replication_slot('$lost_slot')" >/dev/null
+
+        # A normal resume must fail closed before scanning the local CDC queue;
+        # recreating this slot at the current WAL position would lose writes.
+        controller_action run
+        deadline=$(( $(date +%s) + timeout ))
+        while [ "$(controller_operation_state migration)" != failed ]; do
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "timed out waiting for missing-slot resume to fail" >&2
+                controller_status >&2 || true
+                exit 1
+            fi
+            sleep 1
+        done
+        lost_status=$(controller_status)
+        case "$lost_status" in
+            *'"fresh_snapshot_required":true'*) ;;
+            *) echo "controller did not classify the lost stream for fresh-snapshot recovery" >&2
+               printf '%s\n' "$lost_status" >&2
+               exit 1 ;;
+        esac
+
+        controller_action restart-base-copy
+        deadline=$(( $(date +%s) + timeout ))
+        fresh_slot_seen=0
+        while :; do
+            state=$(controller_operation_state migration)
+            case "$state" in
+                failed|stopped|succeeded)
+                    echo "fresh-snapshot restart became $state before follow" >&2
+                    controller_status >&2 || true
+                    exit 1 ;;
+            esac
+            status=$("$binary" status --dir "$migration_dir" --json 2>/dev/null || true)
+            slot_count=$(source_sql -Atqc "
+                SELECT count(*) FROM pg_catalog.pg_replication_slots
+                WHERE slot_name='$lost_slot'
+            ")
+            if [ "$slot_count" -eq 1 ]; then
+                fresh_slot_seen=1
+            fi
+            case "$status" in
+                *'"phase":"follow"'*|*'"phase": "follow"'*)
+                    if [ "$fresh_slot_seen" -eq 1 ]; then
+                        break
+                    fi ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+                echo "timed out waiting for fresh-snapshot restart to reach follow" >&2
+                controller_status >&2 || true
+                exit 1
+            fi
+            sleep 1
+        done
+        resumed_stats=$(target_sql -Atqc "
+            SELECT transactions_applied::text || '|' || rows_applied::text
+            FROM pgmigrate_internal.replication_progress
+            LIMIT 1
+        ")
+        echo "controller rejected the lost slot and restarted losslessly at $resumed_stats"
+    else
+        controller_action run
+        sleep 1
+        state=$(controller_operation_state migration)
+        if [ "$state" != running ]; then
+            echo "resumed replay worker is $state, want running" >&2
+            controller_status >&2 || true
+            exit 1
+        fi
+        resumed_stats=$(target_sql -Atqc "
+            SELECT transactions_applied::text || '|' || rows_applied::text
+            FROM pgmigrate_internal.replication_progress
+            LIMIT 1
+        ")
+        resumed_txns=${resumed_stats%%|*}
+        resumed_rows=${resumed_stats#*|}
+        if [ "$resumed_txns" -lt "$replay_txns" ] || [ "$resumed_rows" -lt "$replay_rows" ]; then
+            echo "replay counters regressed across worker resume: $replay_stats -> $resumed_stats" >&2
+            exit 1
+        fi
+        echo "controller survived replay worker kill; resumed at $resumed_stats"
     fi
-    resumed_stats=$(target_sql -Atqc "
-        SELECT transactions_applied::text || '|' || rows_applied::text
-        FROM pgmigrate_internal.replication_progress
-        LIMIT 1
-    ")
-    resumed_txns=${resumed_stats%%|*}
-    resumed_rows=${resumed_stats#*|}
-    if [ "$resumed_txns" -lt "$replay_txns" ] || [ "$resumed_rows" -lt "$replay_rows" ]; then
-        echo "replay counters regressed across worker resume: $replay_stats -> $resumed_stats" >&2
-        exit 1
-    fi
-    echo "controller survived replay worker kill; resumed at $resumed_stats"
 fi
 
 # Verification while the source is still taking writes. A row read from a live
