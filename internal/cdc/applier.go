@@ -2919,6 +2919,15 @@ func applyUpdateTextStage(
 	if len(changes) < minimumTextCopyStageRows || !relation.capabilities.textCopyStage {
 		return false, nil
 	}
+	// The text stage can only express the composite identity as paired range
+	// bounds against stage columns. On a large, cold heap that shape can make
+	// PostgreSQL spend minutes scanning candidates before it finds the exact
+	// primary-key rows. The array and VALUES paths append the scalar exact-key
+	// membership guard used by selective bitmap replay, so retain those paths
+	// for precisely the relations where the guard is required.
+	if relation.capabilities.selectiveUpdates && useSelectiveBitmap(relation) {
+		return false, nil
+	}
 	stageColumns := make([]targetColumn, 0, len(setColumns)+len(identityColumns))
 	for _, columnIndex := range setColumns {
 		stageColumns = append(stageColumns, relation.columns[columnIndex])

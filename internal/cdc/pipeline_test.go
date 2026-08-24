@@ -220,6 +220,25 @@ func TestSelectiveBitmapUsesTargetCacheEvidence(t *testing.T) {
 	}
 }
 
+func TestSelectiveColdUpdateSkipsTextStageWithoutExactIdentityGuard(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		heapBytes: selectiveBitmapMinHeapBytes,
+		capabilities: targetRelationCapabilities{
+			selectiveUpdates: true,
+			textCopyStage:    true,
+		},
+	}
+	changes := make([]Change, minimumTextCopyStageRows)
+	applied, err := applyUpdateTextStage(nil, relation, nil, nil, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("cold selective update used text staging without an exact identity membership guard")
+	}
+}
+
 func TestBatchIdentityPredicateKeepsSingleColumnEquality(t *testing.T) {
 	t.Parallel()
 	var sql strings.Builder
