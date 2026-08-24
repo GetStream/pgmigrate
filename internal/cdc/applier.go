@@ -425,6 +425,8 @@ type targetRelation struct {
 	source           Relation
 	quoted           string
 	heapBytes        int64
+	heapBlocksRead   int64
+	heapBlocksHit    int64
 	columns          []targetColumn
 	mappedColumns    []targetColumn
 	generatedColumns []targetColumn
@@ -982,11 +984,14 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		             AND (index_row.indexprs IS NOT NULL OR index_row.indpred IS NOT NULL)
 		         ) AS set_dml_safe,
 		       t.oid < 16384 AS built_in_type,
-		       pg_catalog.pg_relation_size(c.oid) AS heap_bytes
+		       pg_catalog.pg_relation_size(c.oid) AS heap_bytes,
+		       coalesce(io.heap_blks_read, 0) AS heap_blocks_read,
+		       coalesce(io.heap_blks_hit, 0) AS heap_blocks_hit
 		FROM pg_catalog.pg_attribute a
 		JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
 		JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 		JOIN pg_catalog.pg_type t ON t.oid = a.atttypid
+		LEFT JOIN pg_catalog.pg_statio_all_tables io ON io.relid = c.oid
 		WHERE n.nspname = $1 AND c.relname = $2
 		  AND a.attnum > 0 AND NOT a.attisdropped
 		ORDER BY a.attnum
@@ -1009,11 +1014,12 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 	for rows.Next() {
 		var column targetColumn
 		var setDMLSafe, builtIn, selectiveUpdates bool
-		var heapBytes int64
+		var heapBytes, heapBlocksRead, heapBlocksHit int64
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
 			&column.generated, &column.notNull, &column.conflicting,
 			&selectiveUpdates, &setDMLSafe, &builtIn, &heapBytes,
+			&heapBlocksRead, &heapBlocksHit,
 		); err != nil {
 			return nil, err
 		}
@@ -1023,6 +1029,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		result.capabilities.textCopyStage = result.capabilities.textCopyStage && setDMLSafe
 		hasSelectiveUpdates = hasSelectiveUpdates || selectiveUpdates
 		result.heapBytes = heapBytes
+		result.heapBlocksRead = heapBlocksRead
+		result.heapBlocksHit = heapBlocksHit
 		if column.identity == "a" {
 			result.overrideIdentity = true
 		}
@@ -1873,7 +1881,24 @@ const (
 	applyArrayChunkRows          = 8192
 	applySelectiveProbeChunkRows = 512
 	selectiveBitmapMinHeapBytes  = 1 << 30
+	selectiveDirectMinHeapBlocks = 1_000_000
 )
+
+// useSelectiveBitmap separates cold, restored heaps from hot application
+// tables. BitmapOr avoids one synchronous random heap read per WAL row on a
+// cold multi-hundred-GB relation, but its OR planning and materialization are
+// needless work when the target heap is already resident. PostgreSQL's own I/O
+// counters make that distinction without naming tables or guessing from size.
+func useSelectiveBitmap(relation *targetRelation) bool {
+	if relation.heapBytes < selectiveBitmapMinHeapBytes {
+		return false
+	}
+	totalBlocks := relation.heapBlocksRead + relation.heapBlocksHit
+	if totalBlocks >= selectiveDirectMinHeapBlocks && relation.heapBlocksRead <= totalBlocks/100 {
+		return false
+	}
+	return true
+}
 
 func applyInsertCopy(
 	replay *applyPipeline,
@@ -2171,7 +2196,7 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 		chunkRows := applyArrayChunkRows
 		if relation.capabilities.selectiveUpdates {
 			chunkRows = updateChunkRows(len(setColumns) + len(identityColumns))
-			if relation.heapBytes >= selectiveBitmapMinHeapBytes && chunkRows > applySelectiveProbeChunkRows {
+			if useSelectiveBitmap(relation) && chunkRows > applySelectiveProbeChunkRows {
 				chunkRows = applySelectiveProbeChunkRows
 			}
 		}
@@ -2474,7 +2499,7 @@ func inspectSelectiveUpdateMasks(
 	batchParamCount := len(params)
 	var sql strings.Builder
 	targetRows := relation.quoted
-	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+	if useSelectiveBitmap(relation) {
 		var identityParamPositions [][]int
 		params, identityParamPositions, err = appendSelectiveIdentityScalarParams(
 			params, relation, identityColumns, changes,
@@ -2612,7 +2637,7 @@ func inspectSelectiveUpdateMasksValues(
 	}
 	var sql strings.Builder
 	targetRows := relation.quoted
-	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+	if useSelectiveBitmap(relation) {
 		writeSelectiveTargetRowsCTE(
 			&sql, relation, identityColumns, setColumns, identityParamPositions,
 		)
@@ -3020,7 +3045,7 @@ func applyUpdateValueChunk(
 	}
 	sql.WriteString(") WHERE ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
-	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+	if useSelectiveBitmap(relation) {
 		sql.WriteString(" AND (")
 		writeExactIdentityDisjunction(
 			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
@@ -3078,7 +3103,7 @@ func applyUpdateArrayChunk(
 	}
 	batchParamCount := len(params)
 	var identityParamPositions [][]int
-	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+	if useSelectiveBitmap(relation) {
 		var err error
 		params, identityParamPositions, err = appendSelectiveIdentityScalarParams(
 			params, relation, identityColumns, changes,
@@ -3252,7 +3277,7 @@ func applyDeletes(replay *applyPipeline, relation *targetRelation, changes []Cha
 	}
 
 	chunkRows := applyArrayChunkRows
-	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+	if useSelectiveBitmap(relation) {
 		chunkRows = applySelectiveProbeChunkRows
 	}
 	for start := 0; start < len(changes); {
@@ -3418,7 +3443,7 @@ func applyDeleteValueChunk(
 	}
 	sql.WriteString(") WHERE ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
-	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+	if useSelectiveBitmap(relation) {
 		sql.WriteString(" AND (")
 		writeExactIdentityDisjunction(
 			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
@@ -3456,7 +3481,7 @@ func applyDeleteArrayChunk(
 	}
 	batchParamCount := len(params)
 	var identityParamPositions [][]int
-	if relation.heapBytes >= selectiveBitmapMinHeapBytes {
+	if useSelectiveBitmap(relation) {
 		var err error
 		params, identityParamPositions, err = appendDeleteIdentityScalarParams(
 			params, relation, identityColumns, changes,

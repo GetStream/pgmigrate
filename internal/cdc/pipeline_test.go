@@ -183,6 +183,43 @@ func TestSelectiveTargetRowsCTEUsesExactIdentityEquality(t *testing.T) {
 	}
 }
 
+func TestSelectiveBitmapUsesTargetCacheEvidence(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		relation targetRelation
+		want     bool
+	}{
+		"small heap uses direct primary-key probes": {
+			relation: targetRelation{heapBytes: selectiveBitmapMinHeapBytes - 1},
+		},
+		"large heap without enough evidence stays conservative": {
+			relation: targetRelation{heapBytes: selectiveBitmapMinHeapBytes},
+			want:     true,
+		},
+		"large cold heap uses bitmap reads": {
+			relation: targetRelation{
+				heapBytes:      selectiveBitmapMinHeapBytes,
+				heapBlocksRead: 600_000, heapBlocksHit: 400_000,
+			},
+			want: true,
+		},
+		"large resident heap keeps direct primary-key probes": {
+			relation: targetRelation{
+				heapBytes:      selectiveBitmapMinHeapBytes,
+				heapBlocksRead: 1_000, heapBlocksHit: selectiveDirectMinHeapBlocks,
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := useSelectiveBitmap(&test.relation); got != test.want {
+				t.Fatalf("useSelectiveBitmap() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestBatchIdentityPredicateKeepsSingleColumnEquality(t *testing.T) {
 	t.Parallel()
 	var sql strings.Builder
