@@ -806,6 +806,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			mood public.pipeline_stage_mood NOT NULL,
 			note text
 		);
+		CREATE INDEX pipeline_stage_note_partial
+			ON public.pipeline_stage ((lower(note))) WHERE note IS NOT NULL;
 		CREATE TABLE public.pipeline_stage_duplicates (
 			id public.pipeline_stage_key NOT NULL,
 			value text
@@ -942,7 +944,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 		if custom.capabilities.relationLane || !custom.capabilities.keyedSetDML ||
-			custom.capabilities.binaryCopy || !custom.capabilities.textCopyStage {
+			custom.capabilities.binaryCopy || !custom.capabilities.textCopyStage ||
+			!custom.capabilities.selectiveUpdates {
 			t.Fatalf("custom relation capabilities=%+v", custom.capabilities)
 		}
 	})
@@ -1208,7 +1211,9 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}
 		applied, next, err := applyBatch("pipeline-stage-missing", 0, []Transaction{transaction})
 		var divergence *DivergenceError
-		if !errors.As(err, &divergence) || !strings.Contains(err.Error(), "identity ordinal 63") {
+		if !errors.As(err, &divergence) ||
+			(!strings.Contains(err.Error(), "identity ordinal 63") &&
+				!strings.Contains(err.Error(), "selective inspection did not match source row 63")) {
 			t.Fatalf("missing staged match error=%v", err)
 		}
 		if applied || next != 0 {

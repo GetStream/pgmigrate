@@ -1049,8 +1049,14 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	// Selective updates only require keyed set DML inside the transaction's
+	// original source-order position. Custom types can make a relation unsafe
+	// for a cross-transaction lane because they need typed/text transport, but
+	// they do not make the compare-first update itself unsafe. Coupling this to
+	// relationLane caused complete-row pgoutput tuples on enum-bearing tables to
+	// rewrite every partial/expression index even when only one column changed.
 	result.capabilities.selectiveUpdates =
-		hasSelectiveUpdates && result.capabilities.relationLane
+		hasSelectiveUpdates && result.capabilities.keyedSetDML
 	if len(result.columns) == 0 && len(result.generatedColumns) == 0 {
 		// Naming the absent relation matters most for a partition: publishing a
 		// partitioned table streams changes identified by the partition, so a
