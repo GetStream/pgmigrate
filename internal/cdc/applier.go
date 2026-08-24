@@ -1900,6 +1900,17 @@ func useSelectiveBitmap(relation *targetRelation) bool {
 	return true
 }
 
+// useExactIdentityMembership requires a scalar exact-key guard whenever the
+// paired row bounds are not sufficient to keep planning bounded. Composite
+// identities need that guard regardless of cache temperature; on single-key
+// cold heaps it also enables BitmapOr page ordering.
+func useExactIdentityMembership(
+	relation *targetRelation,
+	identityColumns []targetColumn,
+) bool {
+	return len(identityColumns) > 1 || useSelectiveBitmap(relation)
+}
+
 func applyInsertCopy(
 	replay *applyPipeline,
 	relation *targetRelation,
@@ -2196,7 +2207,7 @@ func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Cha
 		chunkRows := applyArrayChunkRows
 		if relation.capabilities.selectiveUpdates {
 			chunkRows = updateChunkRows(len(setColumns) + len(identityColumns))
-			if useSelectiveBitmap(relation) && chunkRows > applySelectiveProbeChunkRows {
+			if useExactIdentityMembership(relation, identityColumns) && chunkRows > applySelectiveProbeChunkRows {
 				chunkRows = applySelectiveProbeChunkRows
 			}
 		}
@@ -2499,7 +2510,7 @@ func inspectSelectiveUpdateMasks(
 	batchParamCount := len(params)
 	var sql strings.Builder
 	targetRows := relation.quoted
-	if useSelectiveBitmap(relation) {
+	if useExactIdentityMembership(relation, identityColumns) {
 		var identityParamPositions [][]int
 		params, identityParamPositions, err = appendSelectiveIdentityScalarParams(
 			params, relation, identityColumns, changes,
@@ -2637,7 +2648,7 @@ func inspectSelectiveUpdateMasksValues(
 	}
 	var sql strings.Builder
 	targetRows := relation.quoted
-	if useSelectiveBitmap(relation) {
+	if useExactIdentityMembership(relation, identityColumns) {
 		writeSelectiveTargetRowsCTE(
 			&sql, relation, identityColumns, setColumns, identityParamPositions,
 		)
@@ -2925,7 +2936,7 @@ func applyUpdateTextStage(
 	// primary-key rows. The array and VALUES paths append the scalar exact-key
 	// membership guard used by selective bitmap replay, so retain those paths
 	// for precisely the relations where the guard is required.
-	if relation.capabilities.selectiveUpdates && useSelectiveBitmap(relation) {
+	if relation.capabilities.selectiveUpdates && useExactIdentityMembership(relation, identityColumns) {
 		return false, nil
 	}
 	stageColumns := make([]targetColumn, 0, len(setColumns)+len(identityColumns))
@@ -3054,7 +3065,7 @@ func applyUpdateValueChunk(
 	}
 	sql.WriteString(") WHERE ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
-	if useSelectiveBitmap(relation) {
+	if useExactIdentityMembership(relation, identityColumns) {
 		sql.WriteString(" AND (")
 		writeExactIdentityDisjunction(
 			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
@@ -3112,7 +3123,7 @@ func applyUpdateArrayChunk(
 	}
 	batchParamCount := len(params)
 	var identityParamPositions [][]int
-	if useSelectiveBitmap(relation) {
+	if useExactIdentityMembership(relation, identityColumns) {
 		var err error
 		params, identityParamPositions, err = appendSelectiveIdentityScalarParams(
 			params, relation, identityColumns, changes,
@@ -3286,7 +3297,7 @@ func applyDeletes(replay *applyPipeline, relation *targetRelation, changes []Cha
 	}
 
 	chunkRows := applyArrayChunkRows
-	if useSelectiveBitmap(relation) {
+	if useExactIdentityMembership(relation, identityColumns) {
 		chunkRows = applySelectiveProbeChunkRows
 	}
 	for start := 0; start < len(changes); {
@@ -3384,7 +3395,9 @@ func applyDeleteTextStage(
 	changes []Change,
 ) (bool, error) {
 	if len(changes) < minimumTextCopyStageRows ||
-		!relation.capabilities.textCopyStage || !textCopyStagePreferred(identityColumns) {
+		!relation.capabilities.textCopyStage ||
+		useExactIdentityMembership(relation, identityColumns) ||
+		!textCopyStagePreferred(identityColumns) {
 		return false, nil
 	}
 	values := make([]TupleDatum, 0, len(changes)*len(identityColumns))
@@ -3452,7 +3465,7 @@ func applyDeleteValueChunk(
 	}
 	sql.WriteString(") WHERE ")
 	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
-	if useSelectiveBitmap(relation) {
+	if useExactIdentityMembership(relation, identityColumns) {
 		sql.WriteString(" AND (")
 		writeExactIdentityDisjunction(
 			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
@@ -3490,7 +3503,7 @@ func applyDeleteArrayChunk(
 	}
 	batchParamCount := len(params)
 	var identityParamPositions [][]int
-	if useSelectiveBitmap(relation) {
+	if useExactIdentityMembership(relation, identityColumns) {
 		var err error
 		params, identityParamPositions, err = appendDeleteIdentityScalarParams(
 			params, relation, identityColumns, changes,

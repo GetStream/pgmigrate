@@ -220,17 +220,26 @@ func TestSelectiveBitmapUsesTargetCacheEvidence(t *testing.T) {
 	}
 }
 
-func TestSelectiveColdUpdateSkipsTextStageWithoutExactIdentityGuard(t *testing.T) {
+func TestSelectiveCompositeUpdateSkipsTextStageWithoutExactIdentityGuard(t *testing.T) {
 	t.Parallel()
 	relation := &targetRelation{
-		heapBytes: selectiveBitmapMinHeapBytes,
+		heapBytes:      selectiveBitmapMinHeapBytes,
+		heapBlocksRead: 1_000,
+		heapBlocksHit:  selectiveDirectMinHeapBlocks,
 		capabilities: targetRelationCapabilities{
 			selectiveUpdates: true,
 			textCopyStage:    true,
 		},
 	}
+	identityColumns := []targetColumn{{quoted: `"app_pk"`}, {quoted: `"id"`}}
+	if useSelectiveBitmap(relation) {
+		t.Fatal("test relation must exercise the cache-resident path")
+	}
+	if !useExactIdentityMembership(relation, identityColumns) {
+		t.Fatal("composite identity did not require exact membership")
+	}
 	changes := make([]Change, minimumTextCopyStageRows)
-	applied, err := applyUpdateTextStage(nil, relation, nil, nil, changes)
+	applied, err := applyUpdateTextStage(nil, relation, identityColumns, nil, changes)
 	if err != nil {
 		t.Fatal(err)
 	}
