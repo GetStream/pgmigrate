@@ -425,6 +425,164 @@ func TestPG17ReplayClaimV3ReconstructsAfterV4CatalogTightening(t *testing.T) {
 	}
 }
 
+func TestPG17ReplayClaimV4ReconstructsAfterV5UnaccentAdmission(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	control := target.Connect(t)
+	ctx := context.Background()
+	if _, err := control.Exec(ctx, `CREATE SCHEMA claim_v5_unaccent`); err != nil {
+		t.Fatalf("create unaccent fixture schema: %v", err)
+	}
+	if _, err := control.Exec(ctx,
+		`CREATE EXTENSION unaccent WITH SCHEMA claim_v5_unaccent`,
+	); err != nil {
+		t.Skipf("server lacks relocatable unaccent support: %v", err)
+	}
+	if _, err := control.Exec(ctx, `
+		CREATE TEXT SEARCH CONFIGURATION public.claim_v5_unaccent_config
+			(COPY = pg_catalog.simple);
+		ALTER TEXT SEARCH CONFIGURATION public.claim_v5_unaccent_config
+			ALTER MAPPING FOR word, hword, hword_part
+			WITH claim_v5_unaccent.unaccent, pg_catalog.simple;
+		CREATE TABLE public.claim_v4_items (
+			id text PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE INDEX claim_v4_items_search
+			ON public.claim_v4_items USING gin
+			(to_tsvector('public.claim_v5_unaccent_config'::regconfig, value));
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	const streamID = "plan-v4-unaccent-resume"
+	const generation = "plan-v4-unaccent-resume-v1"
+	if err := EnsureStreamProgressIdentity(ctx, control, StreamIdentityConfig{
+		StreamID: streamID, Generation: generation,
+		FreshSetup: true, TargetHasCopiedData: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureReplayClaimTables(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	if err := configureApplySession(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+
+	relation := replayTestRelation(9_006, "claim_v4_items")
+	loaded, err := loadTargetRelation(ctx, control, &relation.source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !loaded.capabilities.relationLane ||
+		!loaded.capabilities.relationOrderedLane ||
+		loaded.capabilities.relationOrderedLaneV4 {
+		t.Fatalf("v4 compatibility fixture capabilities=%+v", loaded.capabilities)
+	}
+
+	const transactionCount = 32
+	transactions := make([]Transaction, transactionCount)
+	resolved := make([]map[uint32]*targetRelation, transactionCount)
+	for index := range transactions {
+		transactions[index] = replayTestTransaction(
+			LSN(5_000+index*2), relation,
+			Change{
+				RelationOID: relation.source.OID, Kind: ChangeInsert,
+				New: replayTuple(fmt.Sprintf("id-%03d", index), fmt.Sprintf("value-%03d", index)),
+			},
+		)
+		resolved[index] = map[uint32]*targetRelation{relation.source.OID: loaded}
+	}
+	plan, err := buildReplayPlanForGenerationVersion(
+		streamID, generation, generation, 0, 8, transactions, resolved, 4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if plan.Claim.PlanVersion != 4 || !replayPlanHasSerialWork(plan) {
+		t.Fatalf("v4 compatibility fixture plan=%#v claim=%+v", plan.Steps, plan.Claim)
+	}
+	freshV5, err := buildReplayPlanForGenerationVersion(
+		streamID, generation, generation, 0, 8, transactions, resolved, 5,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !freshV5.HasParallel || replayPlanHasSerialWork(freshV5) {
+		t.Fatalf("v5 did not admit trusted unaccent lanes: %#v", freshV5.Steps)
+	}
+
+	claim, err := ensureReplayClaim(ctx, control, plan.Claim, plan.Works)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Claim = claim
+	workers, err := openApplyWorkers(
+		ctx, control, newApplyStatementCache(applyStatementCacheCapacity), target.URI, 4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	interrupted := errors.New("test: interrupt plan-v4 claim after durable serial group")
+	first := &Applier{config: ApplierConfig{
+		StreamID: streamID, StreamGeneration: generation,
+		afterReplayWork: func(replayClaim, replayClaimWork) error {
+			return interrupted
+		},
+	}}
+	if err := first.executeReplayPlan(
+		ctx, workers, plan, transactions, resolved,
+	); !errors.Is(err, interrupted) {
+		t.Fatalf("plan-v4 interruption=%v, want %v", err, interrupted)
+	}
+	closeApplyWorkers(workers[1:])
+	assertReplayProgress(t, control, streamID, 0, 0, 0)
+
+	reconstructed, err := buildReplayPlanForGenerationVersion(
+		streamID, generation, generation, 0, 8, transactions, resolved, 4,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !replayClaimsEqual(reconstructed.Claim, claim) ||
+		!slices.Equal(reconstructed.Works, plan.Works) {
+		t.Fatal("v5 binary did not reconstruct the exact active plan-version-4 claim")
+	}
+	reconstructed.Claim = claim
+	resumeControl, err := postgres.Connect(ctx, target.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resumeControl.Close(context.Background())
+	if err := configureApplySession(ctx, resumeControl); err != nil {
+		t.Fatal(err)
+	}
+	resumeWorkers, err := openApplyWorkers(
+		ctx, resumeControl, newApplyStatementCache(applyStatementCacheCapacity), target.URI, 3,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeApplyWorkers(resumeWorkers[1:])
+	resumed := &Applier{config: ApplierConfig{StreamID: streamID, StreamGeneration: generation}}
+	if err := resumed.executeReplayPlan(
+		ctx, resumeWorkers, reconstructed, transactions, resolved,
+	); err != nil {
+		t.Fatal(err)
+	}
+	assertReplayProgress(t, control, streamID, claim.EndLSN, transactionCount, transactionCount)
+	var rows int
+	if err := control.QueryRow(ctx, "SELECT count(*) FROM public.claim_v4_items").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != transactionCount {
+		t.Fatalf("plan-v4 resumed rows=%d, want %d", rows, transactionCount)
+	}
+	if _, exists, err := readReplayClaim(ctx, control, streamID); err != nil || exists {
+		t.Fatalf("finalized plan-v4 claim exists=%t err=%v", exists, err)
+	}
+}
+
 func TestPG17ReplayClaimCommitsContiguousSerialWorkAndReceiptsAtomically(t *testing.T) {
 	target := pgtest.Start(t, 17)
 	control := target.Connect(t)

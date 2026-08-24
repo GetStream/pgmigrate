@@ -551,16 +551,25 @@ func TestReplayPlanVersionedFingerprintFreezesRelationLaneCapability(t *testing.
 	}
 	if targetRelationReplayFingerprintVersion(left, 3) !=
 		targetRelationReplayFingerprintVersion(right, 3) {
-		t.Fatal("plan v3 fingerprint included relaxed plan-v4 lane safety")
+		t.Fatal("plan v3 fingerprint included a newer relation-lane capability")
 	}
-	if targetRelationReplayFingerprintVersion(left, 4) ==
+	if targetRelationReplayFingerprintVersion(left, 4) !=
 		targetRelationReplayFingerprintVersion(right, 4) {
-		t.Fatal("plan v4 fingerprint omitted relaxed relation-lane safety")
+		t.Fatal("plan v4 fingerprint included relaxed plan-v5 lane safety")
+	}
+	if targetRelationReplayFingerprintVersion(left, 5) ==
+		targetRelationReplayFingerprintVersion(right, 5) {
+		t.Fatal("plan v5 fingerprint omitted relaxed relation-lane safety")
 	}
 	right.capabilities.relationOrderedLaneV3 = false
 	if targetRelationReplayFingerprintVersion(left, 3) ==
 		targetRelationReplayFingerprintVersion(right, 3) {
 		t.Fatal("plan v3 fingerprint omitted its frozen lane safety")
+	}
+	right.capabilities.relationOrderedLaneV4 = false
+	if targetRelationReplayFingerprintVersion(left, 4) ==
+		targetRelationReplayFingerprintVersion(right, 4) {
+		t.Fatal("plan v4 fingerprint omitted its frozen lane safety")
 	}
 }
 
@@ -783,7 +792,8 @@ func replayTestRelation(oid uint32, name string) *targetRelation {
 	return &targetRelation{
 		source: source, quoted: `"public"."` + name + `"`,
 		capabilities: targetRelationCapabilities{
-			relationLane: true, relationOrderedLane: true, relationOrderedLaneV3: true,
+			relationLane: true, relationOrderedLane: true,
+			relationOrderedLaneV4: true, relationOrderedLaneV3: true,
 			primaryKeyArbiter: true, keyedSetDML: true,
 			binaryCopy: true, textCopyStage: true,
 		},

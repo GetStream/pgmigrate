@@ -558,6 +558,9 @@ type targetRelationCapabilities struct {
 	// in source order without turning them into a global replay barrier.
 	relationLane        bool
 	relationOrderedLane bool
+	// relationOrderedLaneV4 freezes plan-v4 admission. Plan v5 may admit a
+	// custom text-search config only after proving its complete unaccent closure.
+	relationOrderedLaneV4 bool
 	// relationOrderedLaneV3 freezes the stricter plan-v3 catalog admission so
 	// an active v3 claim reconstructs exactly after a rolling binary restart.
 	// Plan v4 separates relation-local ordering from set-DML transport safety.
@@ -1155,6 +1158,137 @@ func (a *Applier) queueTransactionChanges(
 
 func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *Relation) (*targetRelation, error) {
 	rows, err := db.Query(ctx, `
+		WITH trusted_unaccent_extension AS (
+		  SELECT extension_row.oid, extension_row.extnamespace
+		  FROM pg_catalog.pg_extension extension_row
+		  WHERE extension_row.extname = 'unaccent'
+		    AND extension_row.extversion = '1.1'
+		), trusted_unaccent_init_function AS (
+		  SELECT init_function.oid, trusted_extension.oid AS extension_oid
+		  FROM trusted_unaccent_extension trusted_extension
+		  JOIN pg_catalog.pg_namespace function_namespace
+		    ON function_namespace.oid = trusted_extension.extnamespace
+		  JOIN pg_catalog.pg_proc init_function
+		    ON init_function.pronamespace = function_namespace.oid
+		   AND init_function.proname = 'unaccent_init'
+		  JOIN pg_catalog.pg_language function_language
+		    ON function_language.oid = init_function.prolang
+		   AND function_language.oid = 13
+		   AND function_language.lanname = 'c'
+		  JOIN pg_catalog.pg_depend extension_dependency
+		    ON extension_dependency.classid = 'pg_catalog.pg_proc'::regclass
+		   AND extension_dependency.objid = init_function.oid
+		   AND extension_dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+		   AND extension_dependency.refobjid = trusted_extension.oid
+		   AND extension_dependency.deptype = 'e'
+		  WHERE init_function.prorettype = 'internal'::regtype
+		    AND init_function.pronargs = 1
+		    AND init_function.proargtypes[0] = 'internal'::regtype
+		    AND init_function.probin = '$libdir/unaccent'
+		    AND init_function.prosrc = 'unaccent_init'
+		    AND init_function.provolatile = 'v'
+		    AND init_function.proparallel = 's'
+		    AND init_function.prokind = 'f'
+		    AND NOT init_function.proretset
+		    AND NOT init_function.proisstrict
+		    AND NOT init_function.prosecdef
+		    AND NOT init_function.proleakproof
+		    AND init_function.proconfig IS NULL
+		    AND init_function.prosupport = 0
+		), trusted_unaccent_lexize_function AS (
+		  SELECT lexize_function.oid, trusted_extension.oid AS extension_oid
+		  FROM trusted_unaccent_extension trusted_extension
+		  JOIN pg_catalog.pg_namespace function_namespace
+		    ON function_namespace.oid = trusted_extension.extnamespace
+		  JOIN pg_catalog.pg_proc lexize_function
+		    ON lexize_function.pronamespace = function_namespace.oid
+		   AND lexize_function.proname = 'unaccent_lexize'
+		  JOIN pg_catalog.pg_language function_language
+		    ON function_language.oid = lexize_function.prolang
+		   AND function_language.oid = 13
+		   AND function_language.lanname = 'c'
+		  JOIN pg_catalog.pg_depend extension_dependency
+		    ON extension_dependency.classid = 'pg_catalog.pg_proc'::regclass
+		   AND extension_dependency.objid = lexize_function.oid
+		   AND extension_dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+		   AND extension_dependency.refobjid = trusted_extension.oid
+		   AND extension_dependency.deptype = 'e'
+		  WHERE lexize_function.prorettype = 'internal'::regtype
+		    AND lexize_function.pronargs = 4
+		    AND lexize_function.proargtypes[0] = 'internal'::regtype
+		    AND lexize_function.proargtypes[1] = 'internal'::regtype
+		    AND lexize_function.proargtypes[2] = 'internal'::regtype
+		    AND lexize_function.proargtypes[3] = 'internal'::regtype
+		    AND lexize_function.probin = '$libdir/unaccent'
+		    AND lexize_function.prosrc = 'unaccent_lexize'
+		    AND lexize_function.provolatile = 'v'
+		    AND lexize_function.proparallel = 's'
+		    AND lexize_function.prokind = 'f'
+		    AND NOT lexize_function.proretset
+		    AND NOT lexize_function.proisstrict
+		    AND NOT lexize_function.prosecdef
+		    AND NOT lexize_function.proleakproof
+		    AND lexize_function.proconfig IS NULL
+		    AND lexize_function.prosupport = 0
+		), trusted_unaccent_template AS (
+		  SELECT template_row.oid, trusted_extension.oid AS extension_oid
+		  FROM trusted_unaccent_extension trusted_extension
+		  JOIN pg_catalog.pg_namespace template_namespace
+		    ON template_namespace.oid = trusted_extension.extnamespace
+		  JOIN trusted_unaccent_init_function init_function
+		    ON init_function.extension_oid = trusted_extension.oid
+		  JOIN trusted_unaccent_lexize_function lexize_function
+		    ON lexize_function.extension_oid = trusted_extension.oid
+		  JOIN pg_catalog.pg_ts_template template_row
+		    ON template_row.tmplnamespace = template_namespace.oid
+		   AND template_row.tmplname = 'unaccent'
+		   AND template_row.tmplinit = init_function.oid
+		   AND template_row.tmpllexize = lexize_function.oid
+		  JOIN pg_catalog.pg_depend extension_dependency
+		    ON extension_dependency.classid = 'pg_catalog.pg_ts_template'::regclass
+		   AND extension_dependency.objid = template_row.oid
+		   AND extension_dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+		   AND extension_dependency.refobjid = trusted_extension.oid
+		   AND extension_dependency.deptype = 'e'
+		), trusted_unaccent_dictionary AS (
+		  SELECT dictionary_row.oid
+		  FROM trusted_unaccent_extension trusted_extension
+		  JOIN pg_catalog.pg_namespace dictionary_namespace
+		    ON dictionary_namespace.oid = trusted_extension.extnamespace
+		  JOIN trusted_unaccent_template template_row
+		    ON template_row.extension_oid = trusted_extension.oid
+		  JOIN pg_catalog.pg_ts_dict dictionary_row
+		    ON dictionary_row.dictnamespace = dictionary_namespace.oid
+		   AND dictionary_row.dictname = 'unaccent'
+		   AND dictionary_row.dicttemplate = template_row.oid
+		   AND dictionary_row.dictinitoption = 'rules = ''unaccent'''
+		  JOIN pg_catalog.pg_depend extension_dependency
+		    ON extension_dependency.classid = 'pg_catalog.pg_ts_dict'::regclass
+		   AND extension_dependency.objid = dictionary_row.oid
+		   AND extension_dependency.refclassid = 'pg_catalog.pg_extension'::regclass
+		   AND extension_dependency.refobjid = trusted_extension.oid
+		   AND extension_dependency.deptype = 'e'
+		), trusted_unaccent_text_search_config AS (
+		  SELECT config_row.oid
+		  FROM pg_catalog.pg_ts_config config_row
+		  JOIN pg_catalog.pg_ts_parser parser_row
+		    ON parser_row.oid = config_row.cfgparser
+		   AND parser_row.oid < 16384
+		  JOIN pg_catalog.pg_namespace parser_namespace
+		    ON parser_namespace.oid = parser_row.prsnamespace
+		   AND parser_namespace.nspname = 'pg_catalog'
+		  JOIN pg_catalog.pg_ts_config_map config_map
+		    ON config_map.mapcfg = config_row.oid
+		  JOIN pg_catalog.pg_ts_dict dictionary_row
+		    ON dictionary_row.oid = config_map.mapdict
+		  LEFT JOIN trusted_unaccent_dictionary trusted_dictionary
+		    ON trusted_dictionary.oid = dictionary_row.oid
+		  GROUP BY config_row.oid
+		  HAVING count(*) > 0
+		     AND pg_catalog.bool_and(
+		       dictionary_row.oid < 16384 OR trusted_dictionary.oid IS NOT NULL
+		     )
+		)
 		SELECT a.attname,
 		       a.atttypid,
 		       t.typarray,
@@ -1412,6 +1546,11 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		             OR (
 		               dependency.refclassid = 'pg_catalog.pg_ts_config'::regclass
 		               AND dependency_ts_config.oid >= 16384
+		               AND NOT EXISTS (
+		                 SELECT 1
+		                 FROM trusted_unaccent_text_search_config trusted_config
+		                 WHERE trusted_config.oid = dependency_ts_config.oid
+		               )
 		             )
 		             OR dependency.refclassid NOT IN (
 		               'pg_catalog.pg_class'::regclass,
@@ -1425,6 +1564,19 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		             )
 		           )
 		       ) AS relation_ordered_lane_safe,
+		       NOT EXISTS (
+		         SELECT 1
+		         FROM pg_catalog.pg_index plan_v4_index
+		         JOIN pg_catalog.pg_depend plan_v4_dependency
+		           ON plan_v4_dependency.classid = 'pg_catalog.pg_class'::regclass
+		          AND plan_v4_dependency.objid = plan_v4_index.indexrelid
+		         JOIN pg_catalog.pg_ts_config plan_v4_ts_config
+		           ON plan_v4_dependency.refclassid =
+		                'pg_catalog.pg_ts_config'::regclass
+		          AND plan_v4_ts_config.oid = plan_v4_dependency.refobjid
+		         WHERE plan_v4_index.indrelid = c.oid
+		           AND plan_v4_ts_config.oid >= 16384
+		       ) AS relation_ordered_lane_v4_ts_safe,
 		       c.relpersistence = 'p'
 		       AND NOT c.relhassubclass
 		       AND NOT c.relispartition
@@ -1589,6 +1741,7 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		capabilities: targetRelationCapabilities{
 			relationLane:          true,
 			relationOrderedLane:   true,
+			relationOrderedLaneV4: true,
 			relationOrderedLaneV3: true,
 			primaryKeyArbiter:     true,
 			keyedSetDML:           true,
@@ -1601,14 +1754,15 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		var column targetColumn
 		var replayKeyCatalogSafe, primaryKeyArbiter, setDMLSafe, builtIn, lanePayloadSafe bool
 		var selectiveUpdates, crossKeyConflicts bool
-		var relationOrderedLaneSafe, relationOrderedLaneV3Safe bool
+		var relationOrderedLaneSafe, relationOrderedLaneV4TSSafe, relationOrderedLaneV3Safe bool
 		var heapBytes, heapBlocksRead, heapBlocksHit int64
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
 			&column.generated, &column.notNull, &column.primaryPos, &replayKeyCatalogSafe,
 			&primaryKeyArbiter,
 			&column.conflicting, &selectiveUpdates, &crossKeyConflicts,
-			&relationOrderedLaneSafe, &relationOrderedLaneV3Safe, &setDMLSafe,
+			&relationOrderedLaneSafe, &relationOrderedLaneV4TSSafe,
+			&relationOrderedLaneV3Safe, &setDMLSafe,
 			&builtIn, &lanePayloadSafe, &heapBytes,
 			&heapBlocksRead, &heapBlocksHit,
 		); err != nil {
@@ -1619,6 +1773,12 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		// columns are intentionally skipped by the writable-column gates below.
 		result.capabilities.relationOrderedLane =
 			result.capabilities.relationOrderedLane && relationOrderedLaneSafe
+		// Plan v5 changes only the custom text-search-config dependency gate.
+		// Combining the v5 result with the old unconditional custom-config
+		// rejection reconstructs the complete plan-v4 catalog decision exactly.
+		result.capabilities.relationOrderedLaneV4 =
+			result.capabilities.relationOrderedLaneV4 &&
+				relationOrderedLaneSafe && relationOrderedLaneV4TSSafe
 		result.capabilities.relationOrderedLaneV3 =
 			result.capabilities.relationOrderedLaneV3 && relationOrderedLaneV3Safe
 		result.capabilities.primaryKeyArbiter =
@@ -1636,6 +1796,8 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 				result.capabilities.relationLane && setLaneSafe
 			result.capabilities.relationOrderedLane =
 				result.capabilities.relationOrderedLane && lanePayloadSafe
+			result.capabilities.relationOrderedLaneV4 =
+				result.capabilities.relationOrderedLaneV4 && lanePayloadSafe
 			result.capabilities.relationOrderedLaneV3 =
 				result.capabilities.relationOrderedLaneV3 && setLaneSafe
 			result.capabilities.keyedSetDML = result.capabilities.keyedSetDML && setDMLSafe

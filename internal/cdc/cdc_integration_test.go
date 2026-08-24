@@ -1332,15 +1332,17 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 	})
 
 	t.Run("exclusion indexes remain global serial barriers", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS btree_gist`); err != nil {
+			t.Skipf("server lacks btree_gist exclusion support: %v", err)
+		}
 		if _, err := conn.Exec(ctx, `
-			CREATE EXTENSION IF NOT EXISTS btree_gist;
 			CREATE TABLE public.pipeline_exclusion (
 				id integer PRIMARY KEY,
 				guarded integer NOT NULL,
 				EXCLUDE USING gist (guarded WITH =)
 			)
 		`); err != nil {
-			t.Skipf("server lacks btree_gist exclusion support: %v", err)
+			t.Fatalf("create exclusion-index fixture: %v", err)
 		}
 		source := relation(1198, "pipeline_exclusion", 23)
 		source.Columns[1].Name = "guarded"
@@ -1354,9 +1356,15 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 	})
 
 	t.Run("trusted relocated btree_gin opclass remains lane safe", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `CREATE SCHEMA pipeline_btree_gin`); err != nil {
+			t.Fatalf("create btree_gin fixture schema: %v", err)
+		}
+		if _, err := conn.Exec(ctx,
+			`CREATE EXTENSION btree_gin WITH SCHEMA pipeline_btree_gin`,
+		); err != nil {
+			t.Skipf("server lacks relocatable btree_gin support: %v", err)
+		}
 		if _, err := conn.Exec(ctx, `
-			CREATE SCHEMA pipeline_btree_gin;
-			CREATE EXTENSION btree_gin WITH SCHEMA pipeline_btree_gin;
 			CREATE TABLE public.pipeline_trusted_gin (
 				id integer PRIMARY KEY,
 				guarded bigint NOT NULL
@@ -1365,7 +1373,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 				ON public.pipeline_trusted_gin
 				USING gin (guarded pipeline_btree_gin.int8_ops);
 		`); err != nil {
-			t.Skipf("server lacks relocatable btree_gin support: %v", err)
+			t.Fatalf("create btree_gin fixture: %v", err)
 		}
 		source := relation(1201, "pipeline_trusted_gin", 20)
 		source.Columns[1].Name = "guarded"
@@ -1375,6 +1383,178 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}
 		if !loaded.capabilities.relationLane || !loaded.capabilities.relationOrderedLane {
 			t.Fatalf("trusted btree_gin relation capabilities=%+v", loaded.capabilities)
+		}
+	})
+
+	t.Run("text search config requires an exact trusted unaccent closure", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `CREATE SCHEMA pipeline_unaccent`); err != nil {
+			t.Fatalf("create unaccent fixture schema: %v", err)
+		}
+		if _, err := conn.Exec(ctx,
+			`CREATE EXTENSION unaccent WITH SCHEMA pipeline_unaccent`,
+		); err != nil {
+			t.Skipf("server lacks relocatable unaccent support: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_trusted_unaccent_config
+				(COPY = pg_catalog.simple);
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_trusted_unaccent_config
+				ALTER MAPPING FOR word, hword, hword_part
+				WITH pipeline_unaccent.unaccent, pg_catalog.simple;
+			CREATE TABLE public.pipeline_trusted_unaccent (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_trusted_unaccent_search
+				ON public.pipeline_trusted_unaccent USING gin
+				(to_tsvector('public.pipeline_trusted_unaccent_config'::regconfig, value));
+
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_builtin_config
+				(COPY = pg_catalog.simple);
+			CREATE TABLE public.pipeline_builtin_config_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_builtin_config_search
+				ON public.pipeline_builtin_config_table USING gin
+				(to_tsvector('public.pipeline_builtin_config'::regconfig, value));
+
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_empty_config
+				(PARSER = pg_catalog.default);
+			CREATE TABLE public.pipeline_empty_config_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_empty_config_search
+				ON public.pipeline_empty_config_table USING gin
+				(to_tsvector('public.pipeline_empty_config'::regconfig, value));
+
+			CREATE TEXT SEARCH PARSER public.pipeline_custom_parser (
+				START = pg_catalog.prsd_start,
+				GETTOKEN = pg_catalog.prsd_nexttoken,
+				END = pg_catalog.prsd_end,
+				HEADLINE = pg_catalog.prsd_headline,
+				LEXTYPES = pg_catalog.prsd_lextype
+			);
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_custom_parser_config
+				(PARSER = public.pipeline_custom_parser);
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_custom_parser_config
+				ADD MAPPING FOR word WITH pg_catalog.simple;
+			CREATE TABLE public.pipeline_custom_parser_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_custom_parser_search
+				ON public.pipeline_custom_parser_table USING gin
+				(to_tsvector('public.pipeline_custom_parser_config'::regconfig, value));
+
+			CREATE TEXT SEARCH DICTIONARY public.pipeline_untrusted_dictionary
+				(TEMPLATE = pipeline_unaccent.unaccent, RULES = 'unaccent');
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_mixed_config
+				(COPY = pg_catalog.simple);
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_mixed_config
+				ALTER MAPPING FOR asciiword
+				WITH public.pipeline_untrusted_dictionary;
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_mixed_config
+				ALTER MAPPING FOR word
+				WITH pipeline_unaccent.unaccent, pg_catalog.simple;
+			CREATE TABLE public.pipeline_mixed_config_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_mixed_config_search
+				ON public.pipeline_mixed_config_table USING gin
+				(to_tsvector('public.pipeline_mixed_config'::regconfig, value));
+
+			CREATE TABLE public.pipeline_partitioned (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			) PARTITION BY RANGE (id);
+			CREATE TABLE public.pipeline_partitioned_default
+				PARTITION OF public.pipeline_partitioned DEFAULT;
+		`); err != nil {
+			t.Fatal(err)
+		}
+
+		load := func(oid uint32, name string) *targetRelation {
+			t.Helper()
+			source := relation(oid, name, 25)
+			loaded, err := loadTargetRelation(ctx, conn, &source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return loaded
+		}
+		for _, fixture := range []struct {
+			oid     uint32
+			name    string
+			ordered bool
+		}{
+			{oid: 1211, name: "pipeline_trusted_unaccent", ordered: true},
+			{oid: 1212, name: "pipeline_builtin_config_table", ordered: true},
+			{oid: 1213, name: "pipeline_empty_config_table", ordered: false},
+			{oid: 1214, name: "pipeline_mixed_config_table", ordered: false},
+			{oid: 1215, name: "pipeline_partitioned", ordered: false},
+			{oid: 1217, name: "pipeline_partitioned_default", ordered: false},
+			{oid: 1218, name: "pipeline_custom_parser_table", ordered: false},
+		} {
+			loaded := load(fixture.oid, fixture.name)
+			if loaded.capabilities.relationOrderedLane != fixture.ordered {
+				t.Fatalf("%s ordered=%t capabilities=%+v", fixture.name, fixture.ordered, loaded.capabilities)
+			}
+			if fixture.name == "pipeline_trusted_unaccent" {
+				if loaded.capabilities.relationOrderedLaneV4 {
+					t.Fatalf("trusted unaccent changed plan-v4 admission: %+v", loaded.capabilities)
+				}
+				if !loaded.capabilities.relationLane ||
+					loaded.capabilities.crossKeyConflicts || len(primaryKeyColumns(loaded)) == 0 {
+					t.Fatalf("trusted unaccent is not primary-key sharded: %+v", loaded.capabilities)
+				}
+			}
+		}
+
+		if _, err := conn.Exec(ctx, `
+			CREATE FUNCTION public.pipeline_untrusted_unaccent_init(internal)
+				RETURNS internal
+				AS '$libdir/unaccent', 'unaccent_init'
+				LANGUAGE C PARALLEL SAFE;
+			CREATE FUNCTION public.pipeline_untrusted_unaccent_lexize(
+				internal, internal, internal, internal
+			) RETURNS internal
+				AS '$libdir/unaccent', 'unaccent_lexize'
+				LANGUAGE C PARALLEL SAFE;
+			CREATE TEXT SEARCH TEMPLATE public.pipeline_untrusted_function_template (
+				INIT = public.pipeline_untrusted_unaccent_init,
+				LEXIZE = public.pipeline_untrusted_unaccent_lexize
+			);
+			CREATE TEXT SEARCH DICTIONARY public.pipeline_untrusted_function_dictionary
+				(TEMPLATE = public.pipeline_untrusted_function_template, RULES = 'unaccent');
+			ALTER EXTENSION unaccent ADD FUNCTION
+				public.pipeline_untrusted_unaccent_init(internal);
+			ALTER EXTENSION unaccent ADD FUNCTION
+				public.pipeline_untrusted_unaccent_lexize(internal, internal, internal, internal);
+			ALTER EXTENSION unaccent ADD TEXT SEARCH TEMPLATE
+				public.pipeline_untrusted_function_template;
+			ALTER EXTENSION unaccent ADD TEXT SEARCH DICTIONARY
+				public.pipeline_untrusted_function_dictionary;
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_untrusted_function_config
+				(COPY = pg_catalog.simple);
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_untrusted_function_config
+				ALTER MAPPING FOR word
+				WITH public.pipeline_untrusted_function_dictionary;
+			CREATE TABLE public.pipeline_untrusted_function_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_untrusted_function_search
+				ON public.pipeline_untrusted_function_table USING gin
+				(to_tsvector('public.pipeline_untrusted_function_config'::regconfig, value));
+		`); err != nil {
+			t.Fatal(err)
+		}
+		untrustedFunction := load(1216, "pipeline_untrusted_function_table")
+		if untrustedFunction.capabilities.relationOrderedLane {
+			t.Fatalf("extension-laundered text-search closure was admitted: %+v", untrustedFunction.capabilities)
 		}
 	})
 

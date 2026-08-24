@@ -371,7 +371,24 @@ func replayChangeKeyForVersion(
 	if planVersion == 3 {
 		return replayChangeKeyV3(relation, relationFingerprint, change)
 	}
+	if planVersion == 4 {
+		return replayChangeKeyV4(relation, relationFingerprint, change)
+	}
 	return replayChangeKey(relation, relationFingerprint, change)
+}
+
+// replayChangeKeyV4 freezes plan-v4 catalog admission. Plan v5 may admit a
+// fully verified unaccent text-search closure, but an active v4 claim must keep
+// the exact table barriers and lane manifest with which it was created.
+func replayChangeKeyV4(
+	relation *targetRelation,
+	relationFingerprint [sha256.Size]byte,
+	change *Change,
+) ([sha256.Size]byte, bool, error) {
+	return replayChangeKeyWithOrderedLane(
+		relation, relationFingerprint, change,
+		relation != nil && relation.capabilities.relationOrderedLaneV4,
+	)
 }
 
 // replayChangeKeyV3 freezes the stricter plan-v3 relation-lane admission.
@@ -828,6 +845,8 @@ func targetRelationReplayFingerprintVersion(
 	if planVersion >= 3 {
 		if planVersion == 3 {
 			writeReplayHashBool(hasher, relation.capabilities.relationOrderedLaneV3)
+		} else if planVersion == 4 {
+			writeReplayHashBool(hasher, relation.capabilities.relationOrderedLaneV4)
 		} else {
 			writeReplayHashBool(hasher, relation.capabilities.relationOrderedLane)
 		}
