@@ -2190,7 +2190,7 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 		}
 	}
 	if migration.Phase == state.PhaseIndexes || migration.Phase == state.PhaseCatchup || migration.Phase == state.PhaseFollow {
-		return store.ResetForFreshSnapshot(ctx)
+		return store.ResetForFreshSnapshot(ctx, cdcDivergenceFindingID)
 	}
 	return store.ResetBaseCopy(ctx)
 }

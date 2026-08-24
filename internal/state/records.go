@@ -12,7 +12,7 @@ import (
 // supported recovery for setup/schema/copy after the exporting process dies;
 // callers must first remove the old source and target objects.
 func (s *Store) ResetBaseCopy(ctx context.Context) error {
-	return s.resetSnapshotState(ctx, func(phase Phase) error {
+	return s.resetSnapshotState(ctx, false, nil, func(phase Phase) error {
 		if phaseOrder[phase] > phaseOrder[PhaseCopy] {
 			return fmt.Errorf("base-copy reset is only allowed through copy phase (current %s)", phase)
 		}
@@ -24,8 +24,8 @@ func (s *Store) ResetBaseCopy(ctx context.Context) error {
 // snapshot after the caller has independently proved that its logical stream
 // is unrecoverable and removed the migration-owned source and target objects.
 // It deliberately excludes drained, cutover, and complete migrations.
-func (s *Store) ResetForFreshSnapshot(ctx context.Context) error {
-	return s.resetSnapshotState(ctx, func(phase Phase) error {
+func (s *Store) ResetForFreshSnapshot(ctx context.Context, resolvedFindingIDs ...string) error {
+	return s.resetSnapshotState(ctx, true, resolvedFindingIDs, func(phase Phase) error {
 		switch phase {
 		case PhaseIndexes, PhaseCatchup, PhaseFollow:
 			return nil
@@ -35,7 +35,12 @@ func (s *Store) ResetForFreshSnapshot(ctx context.Context) error {
 	})
 }
 
-func (s *Store) resetSnapshotState(ctx context.Context, validate func(Phase) error) error {
+func (s *Store) resetSnapshotState(
+	ctx context.Context,
+	clearFailure bool,
+	resolvedFindingIDs []string,
+	validate func(Phase) error,
+) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var phase Phase
 		if err := tx.QueryRowContext(ctx, "SELECT phase FROM migration WHERE id=1").Scan(&phase); err != nil {
@@ -53,6 +58,21 @@ func (s *Store) resetSnapshotState(ctx context.Context, validate func(Phase) err
 		} {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("reset base-copy state: %w", err)
+			}
+		}
+		if clearFailure {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM failed_attempt"); err != nil {
+				return fmt.Errorf("clear superseded failed attempt: %w", err)
+			}
+		}
+		for _, id := range resolvedFindingIDs {
+			if id == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE findings SET resolved=1, resolved_at=?
+				WHERE id=? AND resolved=0`, time.Now().UTC().UnixNano(), id); err != nil {
+				return fmt.Errorf("resolve superseded finding %s: %w", id, err)
 			}
 		}
 		return nil

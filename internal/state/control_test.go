@@ -120,6 +120,37 @@ func TestResetForFreshSnapshotIsLimitedToSafePostCopyPhases(t *testing.T) {
 	}
 }
 
+func TestResetForFreshSnapshotClearsSupersededFailureAndFinding(t *testing.T) {
+	ctx := context.Background()
+	store, err := Open(ctx, t.TempDir(), testFingerprints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	for _, phase := range []Phase{PhaseSetup, PhaseSchema, PhaseCopy, PhaseIndexes, PhaseCatchup} {
+		if err := store.TransitionPhase(ctx, phase); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.RecordFailedAttempt(ctx, PhaseCatchup, "error:divergence", "replay diverged"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertFinding(ctx, Finding{
+		ID: "cdc-divergence", Kind: "divergence", Severity: "error", Message: "replay diverged",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ResetForFreshSnapshot(ctx, "cdc-divergence"); err != nil {
+		t.Fatal(err)
+	}
+	if attempt, err := store.FailedAttempt(ctx); err != nil || attempt.Consecutive != 0 {
+		t.Fatalf("failed attempt after reset = %#v, err = %v", attempt, err)
+	}
+	if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 0 {
+		t.Fatalf("pending findings after reset = %#v, err = %v", findings, err)
+	}
+}
+
 func TestTargetCleanupRequestCanBeDurablyCleared(t *testing.T) {
 	ctx := context.Background()
 	store, err := Open(ctx, t.TempDir(), testFingerprints)
