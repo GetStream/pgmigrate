@@ -2942,6 +2942,35 @@ func writeBatchIdentityPredicate(
 	writeBatch()
 }
 
+// writeCompositeIdentityCTIDPredicate forces PostgreSQL to resolve every batch
+// row through the complete composite replica identity before updating. The
+// optimization barrier prevents the correlated lookup from being flattened
+// into a broad UPDATE ... FROM join, and the outer TidScan touches exactly the
+// physical row returned by the primary-key lookup.
+func writeCompositeIdentityCTIDPredicate(
+	sql *strings.Builder,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	batchColumnPrefix string,
+	batchColumnOffset int,
+) {
+	sql.WriteString("pgmigrate_target.ctid=(SELECT pgmigrate_lookup.ctid FROM ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" AS pgmigrate_lookup WHERE ")
+	for i, column := range identityColumns {
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString("pgmigrate_lookup.")
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(
+			sql, "=pgmigrate_batch.%s%d",
+			batchColumnPrefix, batchColumnOffset+i,
+		)
+	}
+	sql.WriteString(" OFFSET 0)")
+}
+
 func applyUpdateChunk(
 	replay *applyPipeline,
 	relation *targetRelation,
@@ -3042,7 +3071,13 @@ func applyUpdateTextStage(
 	sql.WriteString(" FROM ")
 	sql.WriteString(stage)
 	sql.WriteString(" AS pgmigrate_batch WHERE ")
-	writeBatchIdentityPredicate(&sql, identityColumns, "column_", len(setColumns))
+	if len(identityColumns) > 1 {
+		writeCompositeIdentityCTIDPredicate(
+			&sql, relation, identityColumns, "column_", len(setColumns),
+		)
+	} else {
+		writeBatchIdentityPredicate(&sql, identityColumns, "column_", len(setColumns))
+	}
 	sql.WriteString(" RETURNING pgmigrate_batch.ordinal")
 	return true, replay.queue(sql.String(), nil, applyExpectation{
 		relation: relation, kind: ChangeUpdate,
@@ -3118,8 +3153,14 @@ func applyUpdateValueChunk(
 		fmt.Fprintf(&sql, ",identity_%d", i)
 	}
 	sql.WriteString(") WHERE ")
-	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
-	if useExactIdentityMembership(relation, identityColumns) {
+	if len(identityColumns) > 1 {
+		writeCompositeIdentityCTIDPredicate(
+			&sql, relation, identityColumns, "identity_", 0,
+		)
+	} else {
+		writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	}
+	if len(identityColumns) == 1 && useExactIdentityMembership(relation, identityColumns) {
 		sql.WriteString(" AND (")
 		writeExactIdentityDisjunction(
 			&sql, "pgmigrate_target", identityColumns, identityParamPositions,
@@ -3228,8 +3269,14 @@ func applyUpdateArrayChunk(
 		sql.WriteByte(',')
 	}
 	sql.WriteString("ordinal) WHERE ")
-	writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
-	if len(identityParamPositions) != 0 {
+	if len(identityColumns) > 1 {
+		writeCompositeIdentityCTIDPredicate(
+			&sql, relation, identityColumns, "identity_", 0,
+		)
+	} else {
+		writeBatchIdentityPredicate(&sql, identityColumns, "identity_", 0)
+	}
+	if len(identityColumns) == 1 && len(identityParamPositions) != 0 {
 		sql.WriteString(" AND (")
 		writeExactIdentityDisjunction(
 			&sql, "pgmigrate_target", identityColumns, identityParamPositions,

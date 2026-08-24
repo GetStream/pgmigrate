@@ -258,6 +258,18 @@ func TestBatchIdentityPredicateKeepsSingleColumnEquality(t *testing.T) {
 	}
 }
 
+func TestCompositeUpdatePredicateForcesPrimaryKeyCTIDLookup(t *testing.T) {
+	t.Parallel()
+	var sql strings.Builder
+	relation := &targetRelation{quoted: `"public"."items"`}
+	identity := []targetColumn{{quoted: `"app_pk"`}, {quoted: `"id"`}}
+	writeCompositeIdentityCTIDPredicate(&sql, relation, identity, "identity_", 0)
+	want := `pgmigrate_target.ctid=(SELECT pgmigrate_lookup.ctid FROM "public"."items" AS pgmigrate_lookup WHERE pgmigrate_lookup."app_pk"=pgmigrate_batch.identity_0 AND pgmigrate_lookup."id"=pgmigrate_batch.identity_1 OFFSET 0)`
+	if got := sql.String(); got != want {
+		t.Fatalf("predicate = %q, want %q", got, want)
+	}
+}
+
 // TestApplyPreparationDistinguishesNullFromEmpty guards the bind-parameter
 // contract: nil means SQL NULL and non-nil zero-length means a zero-length
 // value. Inferring nullness from the data pointer applied every empty string as
