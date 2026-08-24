@@ -1186,7 +1186,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		assertProgress(t, "pipeline-stage-delete", deleteTransaction.EndLSN)
 	})
 
-	t.Run("typed stage missing match rolls back every row and progress", func(t *testing.T) {
+	t.Run("typed stage upsert repairs a missing target row atomically", func(t *testing.T) {
 		if _, err := conn.Exec(ctx, `
 			INSERT INTO public.pipeline_stage
 			SELECT id, 'calm', 'original' FROM generate_series(1, 64) AS id
@@ -1210,14 +1210,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			})
 		}
 		applied, next, err := applyBatch("pipeline-stage-missing", 0, []Transaction{transaction})
-		var divergence *DivergenceError
-		if !errors.As(err, &divergence) ||
-			(!strings.Contains(err.Error(), "identity ordinal 63") &&
-				!strings.Contains(err.Error(), "selective inspection did not match source row 63")) {
-			t.Fatalf("missing staged match error=%v", err)
-		}
-		if applied || next != 0 {
-			t.Fatalf("missing staged match applied=%t progress=%x", applied, next)
+		if err != nil || !applied || next != transaction.EndLSN {
+			t.Fatalf("staged upsert applied=%t progress=%x err=%v", applied, next, err)
 		}
 		var changed int
 		if err := conn.QueryRow(ctx, `
@@ -1225,10 +1219,17 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		`).Scan(&changed); err != nil {
 			t.Fatal(err)
 		}
-		if changed != 0 {
-			t.Fatalf("failed staged update retained %d changed rows", changed)
+		if changed != 64 {
+			t.Fatalf("staged upsert changed %d rows, want 64", changed)
 		}
-		assertProgress(t, "pipeline-stage-missing", 0)
+		var repaired string
+		if err := conn.QueryRow(ctx, `SELECT note FROM public.pipeline_stage WHERE id = 999`).Scan(&repaired); err != nil {
+			t.Fatal(err)
+		}
+		if repaired != "changed" {
+			t.Fatalf("repaired row note=%q, want changed", repaired)
+		}
+		assertProgress(t, "pipeline-stage-missing", transaction.EndLSN)
 		if status := conn.PgConn().TxStatus(); status != 'I' {
 			t.Fatalf("connection status after staged divergence=%q, want idle", status)
 		}
@@ -1507,8 +1508,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		var prepared int
 		if err := conn.QueryRow(ctx, `
 			SELECT count(*) FROM pg_catalog.pg_prepared_statements
-			WHERE statement LIKE 'UPDATE "public"."pipeline_update_batch" AS pgmigrate_target%'
-			  AND statement LIKE '%RETURNING pgmigrate_batch.ordinal%'
+			WHERE statement LIKE 'INSERT INTO "public"."pipeline_update_batch"%'
+			  AND statement LIKE '%ON CONFLICT ("id") DO UPDATE%'
 		`).Scan(&prepared); err != nil {
 			t.Fatal(err)
 		}
@@ -1934,23 +1935,35 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 	})
 
 	for _, kind := range []ChangeKind{ChangeUpdate, ChangeDelete} {
-		t.Run("zero-row "+changeKindName(kind)+" rolls back progress", func(t *testing.T) {
+		t.Run("zero-row "+changeKindName(kind)+" follows replay semantics", func(t *testing.T) {
 			source := relation(1103+uint32(kind), "pipeline_missing", 25)
+			id := "404"
+			if kind == ChangeDelete {
+				id = "405"
+			}
 			change := Change{
 				RelationOID: source.OID, Kind: kind,
-				Old: tuple(text("404"), TupleDatum{Kind: DatumNull}),
+				Old: tuple(text(id), TupleDatum{Kind: DatumNull}),
 			}
 			if kind == ChangeUpdate {
-				change.New = tuple(text("404"), text("missing"))
+				change.New = tuple(text(id), text("missing"))
 			}
 			stream := "pipeline-zero-" + changeKindName(kind)
-			var divergence *DivergenceError
+			endLSN := 31 + LSN(kind)
 			err := apply(stream, &Transaction{
-				CommitLSN: 30 + LSN(kind), EndLSN: 31 + LSN(kind),
+				CommitLSN: 30 + LSN(kind), EndLSN: endLSN,
 				Relations: []Relation{source}, Changes: []Change{change},
 			})
+			if kind == ChangeUpdate {
+				if err != nil {
+					t.Fatalf("missing-row update upsert: %v", err)
+				}
+				assertProgress(t, stream, endLSN)
+				return
+			}
+			var divergence *DivergenceError
 			if !errors.As(err, &divergence) {
-				t.Fatalf("zero-row %s error=%v, want divergence", changeKindName(kind), err)
+				t.Fatalf("zero-row delete error=%v, want divergence", err)
 			}
 			assertProgress(t, stream, 0)
 		})

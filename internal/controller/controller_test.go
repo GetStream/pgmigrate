@@ -621,6 +621,8 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		`data-secret-config="target" type="password"`,
 		"sourceDsn.value='';targetDsn.value=''",
 		"configurationRevision=data.revision",
+		"configurationSaved=saved||configured",
+		"Saved controller configuration loaded. Database URLs remain write-only.",
 		"X-PGMigrate-Config-Revision",
 		"Unlock this dashboard",
 		"Dashboard locked: controller token is missing or invalid.",

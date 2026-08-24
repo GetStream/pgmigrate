@@ -454,6 +454,7 @@ type targetColumn struct {
 	oid         uint32
 	arrayOID    uint32
 	key         bool
+	primary     bool
 	identity    string
 	sourceIndex int
 	generated   bool
@@ -948,6 +949,12 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		       a.attgenerated <> '',
 		       a.attnotnull,
 		       EXISTS (
+		         SELECT 1 FROM pg_catalog.pg_index primary_index
+		         WHERE primary_index.indrelid = c.oid
+		           AND primary_index.indisprimary
+		           AND a.attnum = ANY(primary_index.indkey)
+		       ) AS primary_key,
+		       EXISTS (
 		         SELECT 1 FROM pg_catalog.pg_index conflict_index
 		         WHERE conflict_index.indrelid = c.oid
 		           AND (conflict_index.indisunique OR conflict_index.indisexclusion)
@@ -1017,7 +1024,7 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		var heapBytes, heapBlocksRead, heapBlocksHit int64
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
-			&column.generated, &column.notNull, &column.conflicting,
+			&column.generated, &column.notNull, &column.primary, &column.conflicting,
 			&selectiveUpdates, &setDMLSafe, &builtIn, &heapBytes,
 			&heapBlocksRead, &heapBlocksHit,
 		); err != nil {
@@ -2223,7 +2230,307 @@ func applyInsertArrayChunk(
 	})
 }
 
+// PostgreSQL logical replication supplies a complete new row for ordinary
+// columns (apart from unchanged TOAST values). For those rows, use the same
+// primary-key upsert shape as crdb-to-pg: PostgreSQL resolves the conflict
+// through the exact primary key and performs the update in one operation. This
+// avoids a compare-first target read and avoids UPDATE ... FROM plans whose
+// join order can select an unrelated secondary index on very large tables.
+func canPrimaryKeyUpsert(relation *targetRelation, change *Change) bool {
+	if relation == nil || change == nil || change.New == nil ||
+		len(*change.New) != len(relation.source.Columns) || len(relation.columns) == 0 ||
+		!relation.capabilities.keyedSetDML {
+		return false
+	}
+	primary := primaryKeyColumns(relation)
+	if len(primary) == 0 {
+		return false
+	}
+	for _, column := range relation.columns {
+		if (*change.New)[column.sourceIndex].Kind == DatumUnchangedToast {
+			return false
+		}
+	}
+	if change.Old == nil || len(*change.Old) != len(relation.source.Columns) {
+		return true
+	}
+	for _, column := range primary {
+		oldDatum := (*change.Old)[column.sourceIndex]
+		newDatum := (*change.New)[column.sourceIndex]
+		if oldDatum.Kind == DatumUnchangedToast || !tupleDatumEqual(oldDatum, newDatum) {
+			return false
+		}
+	}
+	return true
+}
+
+func tupleDatumEqual(left, right TupleDatum) bool {
+	return left.Kind == right.Kind && bytes.Equal(left.Data, right.Data)
+}
+
+func primaryKeyColumns(relation *targetRelation) []targetColumn {
+	columns := make([]targetColumn, 0, len(relation.columns))
+	for _, column := range relation.columns {
+		if column.primary {
+			columns = append(columns, column)
+		}
+	}
+	return columns
+}
+
+func primaryKeyTupleKey(relation *targetRelation, tuple *Tuple) (string, error) {
+	if err := validateTuple(relation, tuple, ChangeUpdate); err != nil {
+		return "", err
+	}
+	var key strings.Builder
+	for _, column := range primaryKeyColumns(relation) {
+		datum := (*tuple)[column.sourceIndex]
+		key.WriteByte(byte(datum.Kind))
+		fmt.Fprintf(&key, ":%d:", len(datum.Data))
+		key.Write(datum.Data)
+	}
+	return key.String(), nil
+}
+
+func applyPrimaryKeyUpsertChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	changes []Change,
+) error {
+	if len(changes) == 0 {
+		return nil
+	}
+	if applied, err := applyPrimaryKeyUpsertTextStage(replay, relation, changes); applied || err != nil {
+		return err
+	}
+	if applied, err := applyPrimaryKeyUpsertArrayChunk(replay, relation, changes); applied || err != nil {
+		return err
+	}
+	chunkRows := insertChunkRows(len(relation.columns))
+	for start := 0; start < len(changes); start += chunkRows {
+		end := min(start+chunkRows, len(changes))
+		if err := applyPrimaryKeyUpsertValueChunk(replay, relation, changes[start:end]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func applyPrimaryKeyUpsertTextStage(
+	replay *applyPipeline,
+	relation *targetRelation,
+	changes []Change,
+) (bool, error) {
+	values := make([]TupleDatum, 0, len(changes)*len(relation.columns))
+	for row := range changes {
+		if err := validateTuple(relation, changes[row].New, ChangeUpdate); err != nil {
+			return true, err
+		}
+		for _, column := range relation.columns {
+			values = append(values, (*changes[row].New)[column.sourceIndex])
+		}
+	}
+	stage, applied, err := replay.loadTextCopyStage(
+		relation, ChangeUpdate, relation.columns, values, len(changes),
+	)
+	if err != nil || !applied {
+		return applied, err
+	}
+	var sql strings.Builder
+	writePrimaryKeyUpsertPrefix(&sql, relation)
+	sql.WriteString(" SELECT ")
+	for i := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "column_%d", i)
+	}
+	sql.WriteString(" FROM ")
+	sql.WriteString(stage)
+	sql.WriteString(" ORDER BY ordinal")
+	appendPrimaryKeyConflictClause(&sql, relation)
+	return true, replay.queue(sql.String(), nil, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description:  "staged primary-key upsert into " + relation.quoted,
+		expectedRows: int64(len(changes)),
+	})
+}
+
+func applyPrimaryKeyUpsertArrayChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	changes []Change,
+) (bool, error) {
+	params := make([]rawParam, 0, len(relation.columns))
+	for _, column := range relation.columns {
+		datums := make([]TupleDatum, len(changes))
+		for row := range changes {
+			if err := validateTuple(relation, changes[row].New, ChangeUpdate); err != nil {
+				return true, err
+			}
+			datums[row] = (*changes[row].New)[column.sourceIndex]
+		}
+		param, supported, err := arrayParamForColumn(relation, column, datums, ChangeUpdate)
+		if err != nil || !supported {
+			return supported, err
+		}
+		params = append(params, param)
+	}
+	var sql strings.Builder
+	writePrimaryKeyUpsertPrefix(&sql, relation)
+	sql.WriteString(" SELECT ")
+	for i := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "pgmigrate_batch.column_%d", i)
+	}
+	sql.WriteString(" FROM unnest(")
+	for i := range params {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "$%d", i+1)
+	}
+	sql.WriteString(") AS pgmigrate_batch(")
+	for i := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "column_%d", i)
+	}
+	sql.WriteString(") WHERE true")
+	appendPrimaryKeyConflictClause(&sql, relation)
+	return true, replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description:  "array primary-key upsert into " + relation.quoted,
+		expectedRows: int64(len(changes)),
+	})
+}
+
+func applyPrimaryKeyUpsertValueChunk(
+	replay *applyPipeline,
+	relation *targetRelation,
+	changes []Change,
+) error {
+	var sql strings.Builder
+	writePrimaryKeyUpsertPrefix(&sql, relation)
+	sql.WriteString(" VALUES ")
+	params := make([]rawParam, 0, len(changes)*len(relation.columns))
+	for row := range changes {
+		if err := validateTuple(relation, changes[row].New, ChangeUpdate); err != nil {
+			return err
+		}
+		if row != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteByte('(')
+		for columnIndex, column := range relation.columns {
+			if columnIndex != 0 {
+				sql.WriteByte(',')
+			}
+			param, err := datumParamForColumn(
+				relation, column, (*changes[row].New)[column.sourceIndex], ChangeUpdate,
+			)
+			if err != nil {
+				return err
+			}
+			params = append(params, param)
+			fmt.Fprintf(&sql, "$%d", len(params))
+		}
+		sql.WriteByte(')')
+	}
+	appendPrimaryKeyConflictClause(&sql, relation)
+	return replay.queue(sql.String(), params, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description:  "primary-key upsert into " + relation.quoted,
+		expectedRows: int64(len(changes)),
+	})
+}
+
+func writePrimaryKeyUpsertPrefix(sql *strings.Builder, relation *targetRelation) {
+	sql.WriteString("INSERT INTO ")
+	sql.WriteString(relation.quoted)
+	sql.WriteString(" (")
+	for i, column := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString(column.quoted)
+	}
+	sql.WriteByte(')')
+	if relation.overrideIdentity {
+		sql.WriteString(" OVERRIDING SYSTEM VALUE")
+	}
+}
+
+func appendPrimaryKeyConflictClause(sql *strings.Builder, relation *targetRelation) {
+	primary := primaryKeyColumns(relation)
+	sql.WriteString(" ON CONFLICT (")
+	for i, column := range primary {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString(column.quoted)
+	}
+	sql.WriteString(") DO UPDATE SET ")
+	assignments := 0
+	for _, column := range relation.columns {
+		if column.primary {
+			continue
+		}
+		if assignments != 0 {
+			sql.WriteByte(',')
+		}
+		sql.WriteString(column.quoted)
+		sql.WriteString("=EXCLUDED.")
+		sql.WriteString(column.quoted)
+		assignments++
+	}
+	if assignments == 0 {
+		sql.WriteString(primary[0].quoted)
+		sql.WriteString("=EXCLUDED.")
+		sql.WriteString(primary[0].quoted)
+	}
+}
+
 func applyUpdates(replay *applyPipeline, relation *targetRelation, changes []Change) error {
+	for start := 0; start < len(changes); {
+		if !canPrimaryKeyUpsert(relation, &changes[start]) {
+			end := start + 1
+			for end < len(changes) && !canPrimaryKeyUpsert(relation, &changes[end]) {
+				end++
+			}
+			if err := applyLegacyUpdates(replay, relation, changes[start:end]); err != nil {
+				return err
+			}
+			start = end
+			continue
+		}
+
+		seen := make(map[string]struct{})
+		end := start
+		for end < len(changes) && end-start < applyArrayChunkRows &&
+			canPrimaryKeyUpsert(relation, &changes[end]) {
+			key, err := primaryKeyTupleKey(relation, changes[end].New)
+			if err != nil {
+				return err
+			}
+			if _, duplicate := seen[key]; duplicate {
+				break
+			}
+			seen[key] = struct{}{}
+			end++
+		}
+		if err := applyPrimaryKeyUpsertChunk(replay, relation, changes[start:end]); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
+}
+
+func applyLegacyUpdates(replay *applyPipeline, relation *targetRelation, changes []Change) error {
 	identityColumns := batchUpdateIdentityColumns(relation)
 	if len(changes) < 2 || len(identityColumns) == 0 || len(relation.columns) == 0 {
 		for i := range changes {
@@ -3071,7 +3378,7 @@ func applyUpdateTextStage(
 	sql.WriteString(" FROM ")
 	sql.WriteString(stage)
 	sql.WriteString(" AS pgmigrate_batch WHERE ")
-	if len(identityColumns) > 1 {
+	if len(identityColumns) > 1 && useSelectiveBitmap(relation) {
 		writeCompositeIdentityCTIDPredicate(
 			&sql, relation, identityColumns, "column_", len(setColumns),
 		)
@@ -3153,7 +3460,7 @@ func applyUpdateValueChunk(
 		fmt.Fprintf(&sql, ",identity_%d", i)
 	}
 	sql.WriteString(") WHERE ")
-	if len(identityColumns) > 1 {
+	if len(identityColumns) > 1 && useSelectiveBitmap(relation) {
 		writeCompositeIdentityCTIDPredicate(
 			&sql, relation, identityColumns, "identity_", 0,
 		)
@@ -3269,7 +3576,7 @@ func applyUpdateArrayChunk(
 		sql.WriteByte(',')
 	}
 	sql.WriteString("ordinal) WHERE ")
-	if len(identityColumns) > 1 {
+	if len(identityColumns) > 1 && useSelectiveBitmap(relation) {
 		writeCompositeIdentityCTIDPredicate(
 			&sql, relation, identityColumns, "identity_", 0,
 		)

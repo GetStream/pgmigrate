@@ -270,6 +270,61 @@ func TestCompositeUpdatePredicateForcesPrimaryKeyCTIDLookup(t *testing.T) {
 	}
 }
 
+func TestPrimaryKeyUpsertUsesExactCompositePrimaryKey(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		quoted: `"public"."read_state"`,
+		columns: []targetColumn{
+			{name: "app_pk", quoted: `"app_pk"`, primary: true},
+			{name: "user_id", quoted: `"user_id"`, primary: true},
+			{name: "channel_cid", quoted: `"channel_cid"`, primary: true},
+			{name: "last_read", quoted: `"last_read"`},
+		},
+	}
+	var sql strings.Builder
+	writePrimaryKeyUpsertPrefix(&sql, relation)
+	sql.WriteString(" VALUES ($1,$2,$3,$4)")
+	appendPrimaryKeyConflictClause(&sql, relation)
+	want := `INSERT INTO "public"."read_state" ("app_pk","user_id","channel_cid","last_read")` +
+		` VALUES ($1,$2,$3,$4) ON CONFLICT ("app_pk","user_id","channel_cid")` +
+		` DO UPDATE SET "last_read"=EXCLUDED."last_read"`
+	if got := sql.String(); got != want {
+		t.Fatalf("primary-key upsert = %q, want %q", got, want)
+	}
+	if strings.Contains(sql.String(), "ctid") || strings.Contains(sql.String(), " FROM ") {
+		t.Fatalf("primary-key upsert contains a lookup join: %q", sql.String())
+	}
+}
+
+func TestPrimaryKeyUpsertRequiresCompleteStableRow(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		source:       Relation{Columns: []Column{{Name: "id"}, {Name: "body"}}},
+		capabilities: targetRelationCapabilities{keyedSetDML: true},
+		columns: []targetColumn{
+			{name: "id", sourceIndex: 0, primary: true},
+			{name: "body", sourceIndex: 1},
+		},
+	}
+	oldTuple := Tuple{{Kind: DatumText, Data: []byte("7")}, {Kind: DatumNull}}
+	complete := Tuple{{Kind: DatumText, Data: []byte("7")}, {Kind: DatumText, Data: []byte("new")}}
+	if !canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &complete}) {
+		t.Fatal("complete update with an unchanged primary key did not use the upsert path")
+	}
+
+	toasted := append(Tuple(nil), complete...)
+	toasted[1] = TupleDatum{Kind: DatumUnchangedToast}
+	if canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &toasted}) {
+		t.Fatal("unchanged TOAST value used the full-row upsert path")
+	}
+
+	changedKey := append(Tuple(nil), complete...)
+	changedKey[0] = TupleDatum{Kind: DatumText, Data: []byte("8")}
+	if canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &changedKey}) {
+		t.Fatal("primary-key-changing update used the conflict-upsert path")
+	}
+}
+
 // TestApplyPreparationDistinguishesNullFromEmpty guards the bind-parameter
 // contract: nil means SQL NULL and non-nil zero-length means a zero-length
 // value. Inferring nullness from the data pointer applied every empty string as
