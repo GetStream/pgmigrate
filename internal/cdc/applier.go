@@ -466,6 +466,7 @@ type targetColumn struct {
 	arrayOID    uint32
 	key         bool
 	primary     bool
+	primaryPos  int
 	identity    string
 	sourceIndex int
 	generated   bool
@@ -959,12 +960,15 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		       a.attidentity::text,
 		       a.attgenerated <> '',
 		       a.attnotnull,
-		       EXISTS (
-		         SELECT 1 FROM pg_catalog.pg_index primary_index
+		       coalesce((
+		         SELECT primary_key.ordinality::integer
+		         FROM pg_catalog.pg_index primary_index
+		         JOIN LATERAL unnest(primary_index.indkey) WITH ORDINALITY
+		           AS primary_key(attnum, ordinality) ON true
 		         WHERE primary_index.indrelid = c.oid
 		           AND primary_index.indisprimary
-		           AND a.attnum = ANY(primary_index.indkey)
-		       ) AS primary_key,
+		           AND primary_key.attnum = a.attnum
+		       ), 0) AS primary_key_position,
 		       EXISTS (
 		         SELECT 1 FROM pg_catalog.pg_index conflict_index
 		         WHERE conflict_index.indrelid = c.oid
@@ -1035,7 +1039,7 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 		var heapBytes, heapBlocksRead, heapBlocksHit int64
 		if err := rows.Scan(
 			&column.name, &column.oid, &column.arrayOID, &column.identity,
-			&column.generated, &column.notNull, &column.primary, &column.conflicting,
+			&column.generated, &column.notNull, &column.primaryPos, &column.conflicting,
 			&selectiveUpdates, &setDMLSafe, &builtIn, &heapBytes,
 			&heapBlocksRead, &heapBlocksHit,
 		); err != nil {
@@ -1058,6 +1062,7 @@ func loadTargetRelation(ctx context.Context, db targetRelationQuerier, source *R
 			result.overrideIdentity = true
 		}
 		column.quoted = pgx.Identifier{column.name}.Sanitize()
+		column.primary = column.primaryPos > 0
 		if column.generated {
 			result.generatedColumns = append(result.generatedColumns, column)
 		} else {
@@ -2286,6 +2291,9 @@ func primaryKeyColumns(relation *targetRelation) []targetColumn {
 			columns = append(columns, column)
 		}
 	}
+	slices.SortFunc(columns, func(left, right targetColumn) int {
+		return left.primaryPos - right.primaryPos
+	})
 	return columns
 }
 
@@ -3706,6 +3714,9 @@ func hasReplicaIdentityColumns(relation *targetRelation) bool {
 
 func applyDeletes(replay *applyPipeline, relation *targetRelation, changes []Change) error {
 	identityColumns := batchUpdateIdentityColumns(relation)
+	if primary, safe := primaryKeyDeleteColumns(relation); safe {
+		identityColumns = primary
+	}
 	if len(changes) < 2 || len(identityColumns) == 0 {
 		for i := range changes {
 			if err := applyDelete(replay, relation, &changes[i]); err != nil {
@@ -3749,6 +3760,26 @@ func applyDeletes(replay *applyPipeline, relation *targetRelation, changes []Cha
 		start = end
 	}
 	return nil
+}
+
+// primaryKeyDeleteColumns returns the target primary key in its catalog index
+// order only when pgoutput's old tuple carries every component. Composite row
+// bounds are order-sensitive: using table-column or source replica-identity
+// order can make PostgreSQL miss the primary-key access path on a large table.
+func primaryKeyDeleteColumns(relation *targetRelation) ([]targetColumn, bool) {
+	if relation == nil || !relation.capabilities.keyedSetDML {
+		return nil, false
+	}
+	primary := primaryKeyColumns(relation)
+	if len(primary) == 0 {
+		return nil, false
+	}
+	for _, column := range primary {
+		if !column.key || column.sourceIndex < 0 {
+			return nil, false
+		}
+	}
+	return primary, true
 }
 
 func batchDeleteIdentityKey(

@@ -325,6 +325,34 @@ func TestPrimaryKeyUpsertUsesExactCompositePrimaryKey(t *testing.T) {
 	}
 }
 
+func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		capabilities: targetRelationCapabilities{keyedSetDML: true},
+		columns: []targetColumn{
+			{name: "id", quoted: `"id"`, sourceIndex: 0, key: true, primary: true, primaryPos: 2},
+			{name: "app_pk", quoted: `"app_pk"`, sourceIndex: 1, key: true, primary: true, primaryPos: 1},
+		},
+	}
+	primary, safe := primaryKeyDeleteColumns(relation)
+	if !safe {
+		t.Fatal("complete source primary key was not eligible for exact delete")
+	}
+	if got := []string{primary[0].name, primary[1].name}; !slices.Equal(got, []string{"app_pk", "id"}) {
+		t.Fatalf("delete primary key order = %v, want [app_pk id]", got)
+	}
+	var sql strings.Builder
+	writeBatchIdentityPredicate(&sql, primary, "identity_", 0)
+	if got := sql.String(); !strings.Contains(got, `ROW(pgmigrate_target."app_pk",pgmigrate_target."id")`) {
+		t.Fatalf("delete predicate does not follow the target primary key: %q", got)
+	}
+
+	relation.columns[1].key = false
+	if _, safe := primaryKeyDeleteColumns(relation); safe {
+		t.Fatal("delete used a target primary key absent from the old pgoutput tuple")
+	}
+}
+
 func TestPrimaryKeyUpsertRequiresCompleteStableRow(t *testing.T) {
 	t.Parallel()
 	relation := &targetRelation{
