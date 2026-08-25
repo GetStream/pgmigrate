@@ -488,3 +488,54 @@ func TestSequencesRejectsNegativeOffset(t *testing.T) {
 		t.Errorf("Sequences with a negative offset = %v, want a negative-offset error", err)
 	}
 }
+
+func TestResolveSupersededIndexFinding(t *testing.T) {
+	ctx := context.Background()
+	open := func(t *testing.T) *state.Store {
+		t.Helper()
+		store, err := state.Open(ctx, t.TempDir(), state.Fingerprints{Source: "source", Filter: "filter"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.UpsertFinding(ctx, state.Finding{
+			ID: cdcDivergenceFindingID, Kind: "divergence", Severity: "error", Message: "old divergence",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+
+	t.Run("orphan at indexes is superseded", func(t *testing.T) {
+		store := open(t)
+		if err := resolveSupersededIndexFinding(ctx, store, state.Migration{Phase: state.PhaseIndexes}); err != nil {
+			t.Fatal(err)
+		}
+		if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 0 {
+			t.Fatalf("pending findings = %#v, err = %v", findings, err)
+		}
+	})
+
+	t.Run("current failure remains", func(t *testing.T) {
+		store := open(t)
+		if err := store.RecordFailedAttempt(ctx, state.PhaseIndexes, "error:test", "current failure"); err != nil {
+			t.Fatal(err)
+		}
+		if err := resolveSupersededIndexFinding(ctx, store, state.Migration{Phase: state.PhaseIndexes}); err != nil {
+			t.Fatal(err)
+		}
+		if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+			t.Fatalf("pending findings = %#v, err = %v", findings, err)
+		}
+	})
+
+	t.Run("catchup finding is never inferred stale", func(t *testing.T) {
+		store := open(t)
+		if err := resolveSupersededIndexFinding(ctx, store, state.Migration{Phase: state.PhaseCatchup}); err != nil {
+			t.Fatal(err)
+		}
+		if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+			t.Fatalf("pending findings = %#v, err = %v", findings, err)
+		}
+	})
+}

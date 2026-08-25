@@ -820,6 +820,9 @@ func (a App) resumePostCopy(
 	}, snapshot); err != nil {
 		return fmt.Errorf("validate source CDC stream before local recovery: %w", err)
 	}
+	if err := resolveSupersededIndexFinding(ctx, store, migration); err != nil {
+		return err
+	}
 	cdcDir := filepath.Join(cfg.Dir, "cdc")
 	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{
 		Directory:        cdcDir,
@@ -913,6 +916,29 @@ func (a App) resumePostCopy(
 	}
 	logEvent(cfg.Dir, "error", map[string]any{"error": fmt.Sprint(err)})
 	return err
+}
+
+// A divergence cannot originate in indexes because replay has not started.
+// After a proven fresh-snapshot reset, older binaries cleared the failed
+// attempt on entering indexes but could leave its divergence finding open.
+// Retire that orphan only at this pre-replay boundary and only when no current
+// failure exists; catchup/follow findings still require durable replay progress.
+func resolveSupersededIndexFinding(
+	ctx context.Context,
+	store *state.Store,
+	migration state.Migration,
+) error {
+	if migration.Phase != state.PhaseIndexes {
+		return nil
+	}
+	attempt, err := store.FailedAttempt(ctx)
+	if err != nil {
+		return err
+	}
+	if attempt.Consecutive != 0 {
+		return nil
+	}
+	return store.ResolveFinding(ctx, cdcDivergenceFindingID)
 }
 
 func resumeIndexes(ctx context.Context, cfg config.Config, store *state.Store) error {
