@@ -49,11 +49,20 @@ Change data capture uses `pgoutput`, the logical decoding plugin built into
 PostgreSQL, so there is no extension to install on the source. Decoded
 transactions are written to append-only checksummed segment files under the
 migration directory and fsynced at each transaction boundary; a transaction over
-256 MiB spills to temporary files beneath `cdc/spill`. Apply is serial, and
-target DML commits in the same transaction as
-`pgmigrate_internal.replication_progress` on the target, which is the
-authoritative apply position. Finalized segments that have been applied are
-pruned every `--segment-prune-interval`, retaining one safety segment.
+256 MiB spills to temporary files beneath `cdc/spill`. Replay uses concurrent,
+durable claims when conservative target-catalog and primary-key checks prove
+that transactions are independent. A complete source transaction always stays
+inside one target commit, and transactions that touch the same target primary
+key stay in source order. Anything that cannot be proved safe becomes an
+ordered serial barrier.
+
+Each concurrent lane commits its DML with an exact target-side receipt. The
+authoritative `pgmigrate_internal.replication_progress` LSN and replay counters
+remain at the start of the claim until every expected receipt exists, then move
+to the claim's EndLSN in one final transaction. A restart reconstructs the same
+claim from the retained segment data and skips only work with a matching
+receipt. Finalized segments behind authoritative progress are pruned every
+`--segment-prune-interval`, retaining one safety segment.
 
 `pgmigrate cutover` then emits a logical boundary message, drains exactly through
 it, advances target sequences with headroom, reverts what the migration changed on
@@ -76,20 +85,22 @@ explains why the mechanism is what it is and what each choice cost,
 [Limitations](#limitations) what the tool does not do. Test patterns and
 environment controls are in [test/README.md](test/README.md).
 
-There are six commands:
+There are seven commands:
 
 | command | what it does |
 |---|---|
 | `preflight` | checks whether a migration can succeed, and persists its findings |
 | `run` | starts or resumes the migration, and waits in `follow` until cutover completes |
 | `status` | reads local state only, so it is safe to run beside `run` |
+| `controller` | serves a guarded local dashboard for status, preflight, run, and verification |
 | `verify` | samples each table against the target and checks what replication wrote |
 | `sequences` | advances target sequences alone, so the target can take writes before the cutover |
 | `cutover` | performs the rerunnable, durably stepped cutover |
 
-Every command takes `--dir`. All but `status` also need source and target
-connection strings. `pgmigrate <command> --help` prints the defaults as resolved
-on the host, which for `--workers` and `--restore-jobs` depend on its CPU count.
+Every command takes `--dir`. Database actions need source and target connection
+strings; `status` and the controller's read-only dashboard do not. `pgmigrate
+<command> --help` prints the defaults as resolved on the host, which for
+`--workers` and `--restore-jobs` depend on its CPU count.
 
 ## Example
 
@@ -147,7 +158,7 @@ verify e2e.metrics: done 0/0 rows sampled (0.00%), 0/0 source pages, 0 target ro
 verify e2e.order_items: done 3059/3059 rows sampled (100.00%), 24/24 source pages, 3059 target rows, 123/123 applied rows checked
 findings: 4 open
 steps: 33 complete
-apply: 0/1BE9D08 staged, 0/1BE9D08 applied, 0 txns, 0 rows
+apply: 0/1BE9D08 staged, 0/1BE9D08 applied, 4821 txns, 10234 rows
 lag: 0 bytes, 30.489s stale
 ```
 
@@ -285,6 +296,9 @@ directory's writer lock.
 | `--pg-restore <path>` | found on `PATH` | `pg_restore` executable |
 | `--metrics <address>` | off | serve Prometheus metrics at `/metrics` on this address, for example `:9187` |
 | `--segment-prune-interval <duration>` | `1m` | minimum interval between passes that delete applied CDC segments |
+| `--replay-workers <n>` | `8` | maximum target sessions used concurrently for independent transaction components in one durable replay claim. Unsafe work still runs as an ordered serial barrier |
+| `--replay-batch-bytes <bytes>` | `8388608` (8 MiB) | decoded payload target for one durable replay claim. A source transaction is never split, so one transaction can exceed it |
+| `--replay-batch-changes <n>` | `32768` | row-change target for one durable replay claim. A source transaction is never split, so one transaction can exceed it |
 | `--wal-sample-duration <duration>` | `1m` | source WAL-rate sample for the preflight checks `run` repeats |
 | `--retry-base-copy` | false | restart the base copy even though the last attempts failed the same way; see [Restarting a failed base copy](#restarting-a-failed-base-copy) |
 | `--cdc-sample-rows <n>` | `100000` | applied keys the applier keeps per relation, so `verify` can check the replication path. `0` records none |
@@ -297,6 +311,11 @@ directory's writer lock.
 | `--max-wal-size <size>` | derived | apply this `max_wal_size` for the bulk load |
 | `--checkpoint-timeout <duration>` | derived | apply this `checkpoint_timeout` for the bulk load |
 
+`--workers` controls base copy and index builds; it does not control CDC
+replay. Use `--replay-workers` for replay concurrency. An active durable claim
+always resumes with the lane count recorded in that claim; a changed setting can
+only affect a later claim.
+
 ### pgmigrate status
 
 Opens `state.db` read-only and reports progress, so it is safe to run repeatedly
@@ -307,6 +326,117 @@ beside an active `run`. It needs no database connection and no DSNs.
 | `--dir <path>` | required | migration state directory to read |
 | `--json` | false | render the snapshot as JSON instead of text |
 | `--watch <duration>` | off | re-render at this interval until interrupted. Must be zero or at least `10ms` |
+
+### pgmigrate controller
+
+Serves an embedded web dashboard backed by the same durable state as `status`.
+It shows the lifecycle stage, exact object completion counts, copied rows and
+bytes, live in-flight COPY rows/bytes and aggregate transfer rate, apply lag and
+staleness, exact replayed transaction/change totals, rolling replay rates,
+per-table verification coverage and rates, findings, failures, and action
+output. On the standalone serial path, replay DML, totals, and the resume LSN
+advance in one target transaction. For a concurrent replay claim, those
+authoritative totals and the resume LSN advance only when all of the claim's
+lane receipts have committed. The dashboard derives transactions/s and row
+changes/s from a rolling window over those crash-safe counters rather than
+estimating work from WAL bytes, so the displayed replay rate can update in
+short, exact bursts rather than for each lane independently. In-flight COPY
+counters come from the target's
+`pg_stat_progress_copy`; they keep long-running parts visibly moving before the
+first durable part completion. The lifecycle bar is stage progress, not an
+elapsed-time estimate; the object and verification bars use the recorded
+completed and total work.
+
+The lifecycle is also rendered as an ordered, numbered ten-step path from
+preflight through completion, with cutover marked CLI-only. Findings are
+collapsed by default and classified as blockers, accepted risks,
+performance-only notes, or conditions pgmigrate manages automatically; this
+keeps expected preflight warnings visible without presenting them as failures.
+
+The controller starts idle. After any required authentication, the dashboard loads all
+non-secret preflight, run, copy, tuning, and verification defaults. Save a valid
+configuration before using an action. Controls track the durable lifecycle and
+remain disabled while configuration has unsaved changes, when an action is not
+valid, or when the migration is complete. Configuration is locked while either
+a migration or verification operation is active. Verification is permitted only
+while `run` is following. If `run` stops or fails after durable state exists,
+the control becomes `Resume from <phase>` and explains which committed copy,
+CDC, and target apply state will be reused. A failed controller operation does
+not lock its action slot; the next confirmed `run` starts a fresh operation over
+the durable migration state. Each preflight, run, and verification action runs
+in its own child process, supervised by the HTTP controller. Configuration and
+write-only DSNs reach the child through an anonymous stdin pipe, not argv. A
+normal error, panic, fatal runtime exit, or cancellation ends only that worker,
+marks its operation failed or stopped, and leaves the dashboard process
+available to show diagnostics and accept the resume. Stop first asks the worker
+to terminate cleanly, then forcibly reaps it if it does not exit within ten
+seconds.
+
+Successful saves atomically persist only those non-secret settings to
+`<dir>/controller-config.json` with mode `0600`, file and directory fsync, and a
+same-directory rename. A recreated pod therefore reloads replay workers, batch
+limits, and the rest of the reviewed UI settings from the migration PVC.
+Startup-provided source/target DSNs remain authoritative secrets and are never
+written to this file. A restarted controller issues a new configuration
+revision, so the operator must still review the reloaded values before starting
+another action.
+
+When a token is configured, its field is at the top of the dashboard. Until a
+valid token is entered, the dashboard reports itself as locked and does not
+render empty configuration fields as though the controller were unconfigured.
+The token remains in browser session storage only. When the controller has no
+token (appropriate for a loopback-only listener reached through `kubectl
+port-forward`), the authentication panel is hidden and the dashboard loads
+immediately.
+
+Each successful save returns an opaque, controller-instance-bound configuration
+revision that the dashboard sends with preflight, run, and verification. The
+controller rejects the action if the reviewed configuration changed before it
+started or if the controller restarted after the configuration was reviewed.
+
+Source and target DSNs can be supplied through the dashboard, but are
+write-only: config and status API responses contain only configured/not-configured
+flags. The password inputs are cleared after every save or reload, and DSNs are
+never placed in browser storage, migration state, or logs. Controller token,
+listener, and migration directory remain startup-only. The dashboard deliberately
+does not expose `sequences` or `cutover`; starting a migration still requires an
+explicit in-page browser confirmation and creates or reuses logical-replication
+state on the source.
+
+```bash
+$ pgmigrate controller --dir ./migration
+pgmigrate controller listening on http://127.0.0.1:9188
+```
+
+The default listener is loopback-only. A pod intended solely for `kubectl
+port-forward` can keep that listener and omit the token; no Service or Ingress
+should expose it. If the controller must bind to the pod IP or any other
+non-loopback interface, it requires a token:
+
+```bash
+$ pgmigrate controller --dir /work/migration --listen 127.0.0.1:9188
+
+# Only for a non-loopback listener:
+$ export PGMIGRATE_CONTROLLER_TOKEN="$(secret-tool-or-platform-command)"
+$ pgmigrate controller --dir /work/migration --listen :9188
+```
+
+The browser sends the token in `X-PGMigrate-Token`; only this controller token is
+kept in the tab's session storage, and it is not written into migration state. A
+non-loopback listener is rejected when no token is configured.
+
+| flag | default | what it does |
+|---|---|---|
+| `--dir <path>` | required | migration state directory to display and control |
+| `--listen <address>` | `127.0.0.1:9188` | HTTP listen address |
+| `--token <value>` | `PGMIGRATE_CONTROLLER_TOKEN` | required for any non-loopback listener |
+| `--source <dsn>` | `PGMIGRATE_SOURCE` | optional initial source connection string; it can instead be entered write-only in the dashboard |
+| `--target <dsn>` | `PGMIGRATE_TARGET` | optional initial target connection string; it can instead be entered write-only in the dashboard |
+
+Run the isolated authenticated-controller migration test with
+`make controller-e2e`. It drives preflight, run, live and final verification
+through the API, keeps cutover CLI-only, and independently compares source and
+target contents.
 
 ### pgmigrate verify
 
@@ -455,30 +585,56 @@ about what a partial part left behind.
 ### Apply progress lives on the target, not beside the tool
 
 `pgmigrate_internal.replication_progress` on the target is the authoritative
-apply position, and it commits in the same transaction as the DML it describes.
-The local SQLite database is a low-rate control plane whose apply LSN is
-display-only. A position recorded anywhere but next to the rows can disagree
-with them after a crash, and then replay either loses transactions or repeats
-them. A source-and-filter-derived stream generation binds copied data to that
-progress, and a resume refuses progress that is missing or belongs to another
-stream.
+apply position. It commits with DML on the standalone serial path. During a
+concurrent claim, exact target-side receipts commit with each lane's DML and
+progress remains at the claim start until every receipt exists. The local
+SQLite database is a low-rate control plane whose apply LSN is display-only. A
+position or receipt recorded away from the rows can disagree with them after a
+crash, and then replay either loses transactions or repeats them. A
+source-and-filter-derived stream generation binds copied data to that progress,
+and a resume refuses progress that is missing or belongs to another stream.
 
-During catch-up, the applier coalesces an available ordered prefix of small
-source transactions into one bounded target transaction. It never waits to fill
-a group, so follow-mode latency stays low when traffic is light. A group is
-capped by transaction count, row changes, and decoded data bytes; spilled or
-large source transactions are replayed on their own. The final source EndLSN is
-committed atomically with the whole group, so a crash or replay error leaves
-either all grouped changes and their progress or neither.
+During catch-up, the applier collects an available ordered prefix of small
+source transactions as a bounded replay batch. It never waits to fill a batch,
+so follow-mode latency stays low when traffic is light. When the planner finds
+independent components, the batch becomes a durable concurrent claim;
+otherwise it uses the standalone serial path. A batch is bounded by transaction
+count, row changes, and decoded data bytes, but a source transaction is never
+split to satisfy a bound. A resident transaction that exceeds a bound becomes
+one whole claim/batch so it retains set-based DML; only disk-spilled
+transactions use the streaming standalone path.
 
-For plain built-in relations, catalog checks prove that replica-mode writes have
-no cross-relation behavior: no replica/always triggers or rules, RLS, checks,
-generated columns, domains, or expression/partial indexes. The applier can then
-preserve exact per-relation order while grouping independent relation lanes,
-using binary `COPY` for large insert runs and ordinal-checked array operations
-for keyed updates and deletes. Any relation outside that conservative set keeps
-exact source order and the scalar fallback. This removes most SQL, commit/fsync,
-and progress overhead while the target is still offline for migration.
+The parallel planner keeps every complete source transaction indivisible. It
+hashes target primary keys only when source and target types, operator classes,
+and collations make captured-byte equality a safe proxy for PostgreSQL
+equality. Transactions sharing any key, including transitively, form one
+component and are assigned to one deterministic lane. That preserves source
+order for each target row while independent components run on up to
+`--replay-workers` target sessions. A relation with triggers, rules, RLS,
+cross-key constraints, an unsafe key representation, changed catalog metadata,
+or another unproved behavior becomes an ordered serial barrier.
+
+Each lane may coalesce several complete source transactions in one target
+transaction. Its exact manifest receipt commits with its DML. The target
+progress LSN and exact transaction/change counters deliberately stay at the
+claim's starting position until every receipt is present; finalization then
+advances them to the claim EndLSN once. A crash may therefore leave some lane
+DML ahead of the displayed LSN, but a restart rebuilds and validates the same
+claim digest, skips exactly those committed receipts, and finishes the missing
+lanes. A monotonic target-side generation fence prevents a stale or rolled-back
+applier from committing against a newer claim.
+
+For lane-safe relations, catalog checks prove that replica-mode writes have no
+cross-key behavior: no replica/always triggers or rules, RLS, checks, domains,
+arbitrary custom input functions, non-primary unique/exclusion constraints, or
+unsafe expression/partial uniqueness. Built-in payloads use binary `COPY` for
+large insert runs. Exact enums and system enum arrays are also admitted as
+non-key payloads only in pgoutput text format and use target-typed parameters or
+temporary COPY stages; custom primary keys remain serial. The applier preserves
+exact per-relation order while grouping homogeneous work inside each safe key
+lane. Anything outside that conservative set keeps exact source order and the
+scalar fallback. This removes most SQL, commit/fsync, and progress overhead
+while the target is still offline for migration.
 
 Every connection that reads or executes a catalog definition pins `search_path`
 to the empty path, so definitions are fully qualified and mean the same thing on
@@ -703,10 +859,27 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
 - A torn `.partial` CDC tail is scanned and truncated to the last valid frame.
   Receiving resumes from the latest fsynced transaction EndLSN.
 - Target DML and authoritative progress commit atomically, so a reconnect or
-  restart skips transactions already recorded on the target. Missing or
-  mismatched stream generation or progress is fatal once copied data exists.
+  restart skips transactions already recorded on the target on the standalone
+  serial path. In a concurrent claim, each lane's DML and exact receipt commit
+  atomically; progress advances only after every manifest receipt exists. A
+  restart reconstructs the claim from retained CDC, validates its digest and
+  target catalog fingerprint, skips matching committed receipts, and runs the
+  missing work. Missing or mismatched identity, claim, receipt, generation, or
+  progress is fatal once copied data exists.
+- A complete source transaction is never split between lanes or commits.
+  Transactions that share a target primary key, including through a chain of
+  shared keys, stay in one deterministic lane and retain source order for that
+  key. Work that cannot prove those conditions falls back to an ordered serial
+  barrier.
+- Replay batch limits bound a durable claim, not correctness. They change how
+  much retained CDC is planned at once; one source transaction may exceed a
+  limit and is still applied whole. Exact transaction and row-change counters
+  advance once at claim finalization and never count rolled-back work.
 - Restarts from `indexes`, `catchup`, or `follow` retain the completed base copy
   and recover staged CDC.
+- Controller actions are isolated child processes. If the replay worker exits,
+  the controller remains available and a confirmed resume starts a fresh worker
+  from the last atomically committed target LSN and replay counters.
 - Restarts from `setup`, `schema`, or `copy` deliberately discard **all**
   base-copy progress and start with a fresh slot and snapshot. An exported
   snapshot cannot survive its holder connection, and mixing snapshots would be
@@ -792,8 +965,12 @@ inventory, row counts, and canonical row digests, including one digest per leaf
 partition and a comparison of every index and constraint definition in the
 schema.
 
-`make cdc-bench` times only replay of a durable 500,000-change backlog and
-compares full source/target table digests. Use
+`make cdc-bench` times only replay of a durable 500,000-change backlog, uses the
+production default of eight replay workers, and compares full source/target
+table digests. Set `PGMIGRATE_CDC_BENCH_REPLAY_WORKERS=1` for a serial baseline
+or another positive value for a concurrency sweep. Claim sizes can be varied
+with `PGMIGRATE_CDC_BENCH_REPLAY_BATCH_BYTES` and
+`PGMIGRATE_CDC_BENCH_REPLAY_BATCH_CHANGES`. Use
 `PGMIGRATE_CDC_BENCH_BARRIER_EVERY=N` to add a check-constrained ordering
 barrier every N source transactions, and `PGMIGRATE_CDC_BENCH_ACCOUNT_COUNT=N`
 to exercise hot-key skew. Transaction count and the minimum accepted rate are
@@ -810,7 +987,10 @@ controlled by `PGMIGRATE_CDC_BENCH_TRANSACTIONS` and
   findings and need an operator plan.
 - The target is assumed not to receive independent application traffic before
   cutover. Replay divergence stops the run.
-- Apply is serial.
+- Replay parallelism is conservative. Transactions without a safely comparable
+  primary key, or with target behavior that can couple otherwise distinct rows,
+  use the ordered serial path. A workload dominated by one hot-key component or
+  serial barriers may therefore use fewer than `--replay-workers` sessions.
 - The delivered e2e bed is PostgreSQL 17 to 17. Cross-major compatibility has
   focused integration probes but no full cross-major Compose migration.
 - Verification samples, and reports 64-bit server-side hashes rather than a

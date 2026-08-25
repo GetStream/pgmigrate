@@ -19,6 +19,7 @@ import (
 	"github.com/GetStream/pgmigrate/internal/pgtest"
 	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/jackc/pglogrepl"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {
@@ -273,6 +274,16 @@ func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {
 	if err := <-retryDone; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
+	replay, exists, err := postgres.ReadReplicationProgress(ctx, targetSQL, "pg17-live-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || replay.Transactions != int64(len(statements)) || replay.Rows < int64(len(statements)) {
+		t.Fatalf(
+			"replay counters after crash/retry = %+v exists=%t, want %d transactions and at least %d changes",
+			replay, exists, len(statements), len(statements),
+		)
+	}
 	segments, err := listSegments(directory)
 	if err != nil {
 		t.Fatal(err)
@@ -501,6 +512,15 @@ func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
 	target := pgtest.Start(t, 17)
 	ctx := context.Background()
 	applyConn := target.Connect(t)
+	if _, err := applyConn.Exec(ctx, `
+		DO $$ BEGIN
+			EXECUTE format('ALTER DATABASE %I SET synchronous_commit = off', current_database());
+		END $$
+	`); err != nil {
+		t.Fatal(err)
+	}
+	applyConn.Close(ctx)
+	applyConn = target.Connect(t)
 	if err := configureApplySession(ctx, applyConn); err != nil {
 		t.Fatal(err)
 	}
@@ -509,8 +529,8 @@ func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		var role string
-		if err := tx.QueryRow(ctx, "SHOW session_replication_role").Scan(&role); err != nil {
+		var role, synchronousCommit string
+		if err := tx.QueryRow(ctx, "SELECT current_setting('session_replication_role'), current_setting('synchronous_commit')").Scan(&role, &synchronousCommit); err != nil {
 			_ = tx.Rollback(ctx)
 			t.Fatal(err)
 		}
@@ -518,18 +538,25 @@ func TestPG17ApplySessionKeepsReplicaRoleConnectionLocal(t *testing.T) {
 			_ = tx.Rollback(ctx)
 			t.Fatalf("apply transaction %d role=%q, want replica", i+1, role)
 		}
+		if synchronousCommit != "on" {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("apply transaction %d synchronous_commit=%q, want on", i+1, synchronousCommit)
+		}
 		if err := tx.Commit(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
 
 	other := target.Connect(t)
-	var role string
-	if err := other.QueryRow(ctx, "SHOW session_replication_role").Scan(&role); err != nil {
+	var role, synchronousCommit string
+	if err := other.QueryRow(ctx, "SELECT current_setting('session_replication_role'), current_setting('synchronous_commit')").Scan(&role, &synchronousCommit); err != nil {
 		t.Fatal(err)
 	}
 	if role != "origin" {
 		t.Fatalf("unrelated target connection role=%q, want origin", role)
+	}
+	if synchronousCommit != "off" {
+		t.Fatalf("unrelated target connection synchronous_commit=%q, want off", synchronousCommit)
 	}
 }
 
@@ -596,7 +623,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 10); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 0, 10, 2, 20); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -620,7 +647,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 11); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 10, 11, 3, 30); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -647,7 +674,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, generation, 12); err != nil {
+	if err := updateStreamProgress(ctx, tx, stream, generation, 11, 12, 5, 50); err != nil {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
@@ -661,6 +688,13 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if !exists || LSN(progress) != 12 {
 		t.Fatalf("restart progress=%x exists=%t, want 12", progress, exists)
 	}
+	replay, exists, err := postgres.ReadReplicationProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || replay.Transactions != 10 || replay.Rows != 100 || replay.UpdatedAt.IsZero() {
+		t.Fatalf("restart replay progress=%+v exists=%t, want 10 transactions/100 rows", replay, exists)
+	}
 
 	tx, err = restarted.Begin(ctx)
 	if err != nil {
@@ -670,7 +704,7 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 		_ = tx.Rollback(ctx)
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, stream, "wrong-generation", 13); !errors.Is(err, ErrStreamGenerationMismatch) {
+	if err := updateStreamProgress(ctx, tx, stream, "wrong-generation", 12, 13, 7, 70); !errors.Is(err, ErrStreamGenerationMismatch) {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("generation mismatch error=%v", err)
 	}
@@ -691,18 +725,192 @@ func TestPG17TransactionalProgressUpsert(t *testing.T) {
 	if !exists || LSN(progress) != 12 {
 		t.Fatalf("generation mismatch changed progress to %x exists=%t", progress, exists)
 	}
+	replay, exists, err = postgres.ReadReplicationProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || replay.Transactions != 10 || replay.Rows != 100 {
+		t.Fatalf("generation mismatch changed replay counters: %+v exists=%t", replay, exists)
+	}
+
+	// Two appliers may briefly overlap during a restart. Both can start from the
+	// same checkpoint, but only the transaction whose exact expected LSN still
+	// matches may publish DML and progress.
+	stale, err := restarted.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	winnerConn := target.Connect(t)
+	winner, err := winnerConn.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, winner, stream, generation, 12, 13, 1, 1); err != nil {
+		_ = winner.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := winner.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stale.Exec(ctx, "INSERT INTO public.progress_upsert_data VALUES (2)"); err != nil {
+		_ = stale.Rollback(ctx)
+		t.Fatal(err)
+	}
+	if err := updateStreamProgress(ctx, stale, stream, generation, 12, 14, 1, 1); !errors.Is(err, ErrStreamGenerationMismatch) {
+		_ = stale.Rollback(ctx)
+		t.Fatalf("stale expected-LSN error=%v", err)
+	}
+	if err := stale.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.QueryRow(
+		ctx, "SELECT count(*) FROM public.progress_upsert_data WHERE id = 2",
+	).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("stale expected-LSN transaction committed %d rows", count)
+	}
+	replay, exists, err = postgres.ReadReplicationProgress(ctx, restarted, stream)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || LSN(replay.RemoteLSN) != 13 || replay.Transactions != 11 || replay.Rows != 101 {
+		t.Fatalf("winner replay progress=%+v exists=%t", replay, exists)
+	}
 
 	tx, err = restarted.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := updateStreamProgress(ctx, tx, "missing-identity", generation, 1); !errors.Is(err, ErrStreamGenerationMismatch) {
+	if err := updateStreamProgress(ctx, tx, "missing-identity", generation, 0, 1, 11, 110); !errors.Is(err, ErrStreamGenerationMismatch) {
 		_ = tx.Rollback(ctx)
 		t.Fatalf("missing identity error=%v", err)
 	}
 	if err := tx.Rollback(ctx); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestPG17TargetPrimaryKeyReplaySafety(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	conn := target.Connect(t)
+
+	if _, err := conn.Exec(ctx, `
+		CREATE TABLE public.replay_key_types (
+			bool_key boolean,
+			bytea_key bytea,
+			int2_key smallint,
+			int4_key integer,
+			int8_key bigint,
+			text_key text,
+			varchar_key varchar,
+			date_key date,
+			time_key time without time zone,
+			timestamp_key timestamp without time zone,
+			timestamptz_key timestamp with time zone,
+			uuid_key uuid,
+			numeric_key numeric,
+			bpchar_key character(8),
+			float4_key real,
+			float8_key double precision,
+			timetz_key time with time zone,
+			PRIMARY KEY (
+				bool_key, bytea_key, int2_key, int4_key, int8_key, text_key,
+				varchar_key, date_key, time_key, timestamp_key, timestamptz_key,
+				uuid_key, numeric_key, bpchar_key, float4_key, float8_key, timetz_key
+			)
+		);
+		CREATE TABLE public.replay_key_source_mismatch (id integer PRIMARY KEY);
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	type replayKeyType struct {
+		name string
+		oid  uint32
+		safe bool
+	}
+	types := []replayKeyType{
+		{name: "bool_key", oid: pgtype.BoolOID, safe: true},
+		{name: "bytea_key", oid: pgtype.ByteaOID, safe: true},
+		{name: "int2_key", oid: pgtype.Int2OID, safe: true},
+		{name: "int4_key", oid: pgtype.Int4OID, safe: true},
+		{name: "int8_key", oid: pgtype.Int8OID, safe: true},
+		{name: "text_key", oid: pgtype.TextOID, safe: true},
+		{name: "varchar_key", oid: pgtype.VarcharOID, safe: true},
+		{name: "date_key", oid: pgtype.DateOID, safe: true},
+		{name: "time_key", oid: pgtype.TimeOID, safe: true},
+		{name: "timestamp_key", oid: pgtype.TimestampOID, safe: true},
+		{name: "timestamptz_key", oid: pgtype.TimestamptzOID, safe: true},
+		{name: "uuid_key", oid: pgtype.UUIDOID, safe: true},
+		{name: "numeric_key", oid: pgtype.NumericOID},
+		{name: "bpchar_key", oid: pgtype.BPCharOID},
+		{name: "float4_key", oid: pgtype.Float4OID},
+		{name: "float8_key", oid: pgtype.Float8OID},
+		{name: "timetz_key", oid: pgtype.TimetzOID},
+	}
+	source := Relation{
+		OID: 9001, Namespace: "public", Name: "replay_key_types", ReplicaIdentity: 'd',
+		Columns: make([]Column, 0, len(types)),
+	}
+	for _, keyType := range types {
+		source.Columns = append(source.Columns, Column{Name: keyType.name, Type: keyType.oid, Flags: 1})
+	}
+	loaded, err := loadTargetRelation(ctx, conn, &source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	columns := make(map[string]targetColumn, len(loaded.columns))
+	for _, column := range loaded.columns {
+		columns[column.name] = column
+	}
+	for _, keyType := range types {
+		column, exists := columns[keyType.name]
+		if !exists {
+			t.Fatalf("target column %q was not loaded", keyType.name)
+		}
+		if column.replayKeySafe != keyType.safe {
+			t.Errorf("target column %q replayKeySafe=%t, want %t", keyType.name, column.replayKeySafe, keyType.safe)
+		}
+	}
+
+	mismatchSource := Relation{
+		OID: 9002, Namespace: "public", Name: "replay_key_source_mismatch", ReplicaIdentity: 'd',
+		Columns: []Column{{Name: "id", Type: pgtype.Int8OID, Flags: 1}},
+	}
+	mismatch, err := loadTargetRelation(ctx, conn, &mismatchSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mismatch.columns) != 1 || mismatch.columns[0].replayKeySafe {
+		t.Fatalf("source/target type mismatch replay columns=%+v", mismatch.columns)
+	}
+
+	t.Run("nondeterministic collation", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `
+			CREATE COLLATION public.replay_key_nondeterministic
+				(provider=icu, locale='und-u-ks-level2', deterministic=false);
+			CREATE TABLE public.replay_key_nondeterministic_table (
+				id text COLLATE public.replay_key_nondeterministic PRIMARY KEY
+			);
+		`); err != nil {
+			t.Skipf("server lacks nondeterministic ICU collations: %v", err)
+		}
+		nondeterministicSource := Relation{
+			OID: 9003, Namespace: "public", Name: "replay_key_nondeterministic_table", ReplicaIdentity: 'd',
+			Columns: []Column{{Name: "id", Type: pgtype.TextOID, Flags: 1}},
+		}
+		nondeterministic, err := loadTargetRelation(ctx, conn, &nondeterministicSource)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(nondeterministic.columns) != 1 || nondeterministic.columns[0].replayKeySafe {
+			t.Fatalf("nondeterministic primary key replay columns=%+v", nondeterministic.columns)
+		}
+	})
 }
 
 func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
@@ -726,6 +934,63 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			id integer PRIMARY KEY,
 			value text CHECK (value <> 'bad')
 		);
+		CREATE FUNCTION public.pipeline_custom_check(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> 'bad';
+		CREATE TABLE public.pipeline_custom_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (public.pipeline_custom_check(value))
+		);
+		CREATE TABLE public.pipeline_volatile_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (random() >= 0)
+		);
+		CREATE TABLE public.pipeline_sqlvalue_checked (
+			id integer PRIMARY KEY,
+			value text CHECK (CURRENT_TIMESTAMP IS NOT NULL)
+		);
+		CREATE TABLE public.pipeline_io_cast_checked (
+			id integer PRIMARY KEY,
+			value text CHECK ((value::timestamptz) > '-infinity'::timestamptz)
+		);
+		CREATE TABLE public.pipeline_selective_update (
+			id integer PRIMARY KEY,
+			indexed_value text NOT NULL,
+			other_value text NOT NULL,
+			unique_a text NOT NULL,
+			unique_b text NOT NULL,
+			indexed_length integer GENERATED ALWAYS AS (length(indexed_value)) STORED,
+			UNIQUE (unique_a, unique_b)
+		);
+		CREATE INDEX pipeline_selective_update_partial
+			ON public.pipeline_selective_update (indexed_value)
+			WHERE indexed_value <> '';
+			CREATE INDEX pipeline_selective_update_expression
+				ON public.pipeline_selective_update ((lower(indexed_value)));
+			CREATE COLLATION public.pipeline_nondeterministic (
+				provider = icu,
+				locale = 'und-u-ks-level2',
+				deterministic = false
+			);
+			CREATE TABLE public.pipeline_selective_array (
+				id integer PRIMARY KEY,
+				indexed_value text NOT NULL,
+				array_value text[],
+				toasted_array text[],
+				nondeterministic_text text COLLATE public.pipeline_nondeterministic,
+				nondeterministic_array text[] COLLATE public.pipeline_nondeterministic,
+				unique_value text NOT NULL UNIQUE
+			);
+			ALTER TABLE public.pipeline_selective_array
+				ALTER COLUMN toasted_array SET STORAGE EXTERNAL;
+			CREATE INDEX pipeline_selective_array_expression
+				ON public.pipeline_selective_array ((lower(indexed_value)));
+			CREATE TABLE public.pipeline_unique_indexed (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE UNIQUE INDEX pipeline_unique_indexed_partial
+			ON public.pipeline_unique_indexed (value) WHERE value <> '';
 		CREATE TABLE public.pipeline_batch_deferred (
 			id integer PRIMARY KEY,
 			value text,
@@ -737,6 +1002,56 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			value text NOT NULL UNIQUE
 		);
 		CREATE TABLE public.pipeline_update_batch_duplicates (id integer NOT NULL, value text);
+		CREATE TABLE public.pipeline_builtin_indexes (id integer PRIMARY KEY, value text NOT NULL);
+		CREATE INDEX pipeline_builtin_indexes_expression
+			ON public.pipeline_builtin_indexes ((lower(value)));
+		CREATE INDEX pipeline_builtin_indexes_partial
+			ON public.pipeline_builtin_indexes (value) WHERE value <> '';
+		CREATE FUNCTION public.pipeline_custom_index_predicate(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> '';
+		CREATE TABLE public.pipeline_custom_index (id integer PRIMARY KEY, value text NOT NULL);
+		CREATE INDEX pipeline_custom_index_partial
+			ON public.pipeline_custom_index (value)
+			WHERE public.pipeline_custom_index_predicate(value);
+		CREATE FUNCTION pg_catalog.pipeline_catalog_index_predicate(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> '';
+		CREATE TABLE public.pipeline_catalog_custom_index (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE INDEX pipeline_catalog_custom_index_partial
+			ON public.pipeline_catalog_custom_index (value)
+			WHERE pg_catalog.pipeline_catalog_index_predicate(value);
+		CREATE TABLE public.pipeline_index_domain_guard (enabled boolean NOT NULL);
+		INSERT INTO public.pipeline_index_domain_guard VALUES (true);
+		CREATE FUNCTION public.pipeline_index_domain_check(value text)
+			RETURNS boolean LANGUAGE sql IMMUTABLE
+			RETURN value <> 'blocked'
+				AND (SELECT enabled FROM public.pipeline_index_domain_guard LIMIT 1);
+		CREATE DOMAIN public.pipeline_index_domain AS text
+			CHECK (public.pipeline_index_domain_check(VALUE));
+		CREATE TABLE public.pipeline_custom_type_index (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE UNIQUE INDEX pipeline_custom_type_index_expression
+			ON public.pipeline_custom_type_index
+			((value::public.pipeline_index_domain));
+		CREATE UNLOGGED TABLE public.pipeline_unlogged (
+			id integer PRIMARY KEY,
+			value text NOT NULL
+		);
+		CREATE TABLE public.pipeline_generated_only (
+			value integer GENERATED ALWAYS AS (1) STORED
+		);
+		CREATE TABLE public.pipeline_deferrable_primary (
+			id integer NOT NULL,
+			value text NOT NULL,
+			CONSTRAINT pipeline_deferrable_primary_pkey
+				PRIMARY KEY (id) DEFERRABLE INITIALLY DEFERRED
+		);
 		CREATE TABLE public.pipeline_copy (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_progress_guard (id integer PRIMARY KEY, value text);
 		CREATE TABLE public.pipeline_epoch_a (id integer PRIMARY KEY, value text);
@@ -746,6 +1061,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			mood public.pipeline_stage_mood NOT NULL,
 			note text
 		);
+		CREATE INDEX pipeline_stage_note_partial
+			ON public.pipeline_stage ((lower(note))) WHERE note IS NOT NULL;
 		CREATE TABLE public.pipeline_stage_duplicates (
 			id public.pipeline_stage_key NOT NULL,
 			value text
@@ -788,6 +1105,32 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			},
 		}
 	}
+	selectiveRelation := func(oid uint32) Relation {
+		return Relation{
+			OID: oid, Namespace: "public", Name: "pipeline_selective_update", ReplicaIdentity: 'd',
+			Columns: []Column{
+				{Name: "id", Type: 23, Flags: 1},
+				{Name: "indexed_value", Type: 25},
+				{Name: "other_value", Type: 25},
+				{Name: "unique_a", Type: 25},
+				{Name: "unique_b", Type: 25},
+			},
+		}
+	}
+	selectiveArrayRelation := func(oid uint32) Relation {
+		return Relation{
+			OID: oid, Namespace: "public", Name: "pipeline_selective_array", ReplicaIdentity: 'd',
+			Columns: []Column{
+				{Name: "id", Type: 23, Flags: 1},
+				{Name: "indexed_value", Type: 25},
+				{Name: "array_value", Type: 1009},
+				{Name: "toasted_array", Type: 1009},
+				{Name: "nondeterministic_text", Type: 25},
+				{Name: "nondeterministic_array", Type: 1009},
+				{Name: "unique_value", Type: 25},
+			},
+		}
+	}
 	relationCache := newTargetRelationCache()
 	statementCache := newApplyStatementCache(applyStatementCacheCapacity)
 	apply := func(stream string, transaction *Transaction) error {
@@ -797,10 +1140,20 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		}); err != nil {
 			return err
 		}
+		current, exists, err := postgres.ReadProgress(ctx, conn, stream)
+		if err != nil {
+			return err
+		}
+		var progress LSN
+		if exists {
+			progress = LSN(current)
+		}
 		applier := &Applier{config: ApplierConfig{
 			StreamID: stream, StreamGeneration: generation,
 		}}
-		return applier.applyTransaction(ctx, conn, relationCache, statementCache, transaction)
+		return applier.applyTransaction(
+			ctx, conn, relationCache, statementCache, progress, transaction,
+		)
 	}
 	applyBatch := func(
 		stream string, progress LSN, transactions []Transaction,
@@ -835,7 +1188,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !plain.capabilities.relationLane {
+		if !plain.capabilities.relationLane || !plain.capabilities.relationOrderedLane {
 			t.Fatal("plain built-in relation was not eligible for relation-lane replay")
 		}
 		checkedSource := relation(1191, "pipeline_batch_checked", 25)
@@ -843,17 +1196,754 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if checked.capabilities.relationLane {
-			t.Fatal("checked relation was eligible for relation-lane replay")
+		if checked.capabilities.relationLane || !checked.capabilities.relationOrderedLane ||
+			checked.capabilities.relationOrderedLaneV3 || checked.capabilities.keyedSetDML {
+			t.Fatalf("built-in checked relation capabilities=%+v", checked.capabilities)
+		}
+		customCheckedSource := relation(1205, "pipeline_custom_checked", 25)
+		customChecked, err := relationCache.resolve(ctx, conn, &customCheckedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if customChecked.capabilities.relationOrderedLane ||
+			customChecked.capabilities.relationOrderedLaneV3 {
+			t.Fatalf("custom checked relation capabilities=%+v", customChecked.capabilities)
+		}
+		volatileCheckedSource := relation(1206, "pipeline_volatile_checked", 25)
+		volatileChecked, err := relationCache.resolve(ctx, conn, &volatileCheckedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if volatileChecked.capabilities.relationOrderedLane ||
+			volatileChecked.capabilities.relationOrderedLaneV3 {
+			t.Fatalf("volatile checked relation capabilities=%+v", volatileChecked.capabilities)
+		}
+		sqlValueCheckedSource := relation(1207, "pipeline_sqlvalue_checked", 25)
+		sqlValueChecked, err := relationCache.resolve(
+			ctx, conn, &sqlValueCheckedSource, loadTargetRelation,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sqlValueChecked.capabilities.relationOrderedLane {
+			t.Fatalf("SQL-value checked relation capabilities=%+v", sqlValueChecked.capabilities)
+		}
+		ioCastCheckedSource := relation(1208, "pipeline_io_cast_checked", 25)
+		ioCastChecked, err := relationCache.resolve(ctx, conn, &ioCastCheckedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ioCastChecked.capabilities.relationOrderedLane {
+			t.Fatalf("I/O-cast checked relation capabilities=%+v", ioCastChecked.capabilities)
+		}
+		selectiveSource := selectiveRelation(1193)
+		selective, err := relationCache.resolve(ctx, conn, &selectiveSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !selective.capabilities.relationLane || !selective.capabilities.keyedSetDML ||
+			!selective.capabilities.selectiveUpdates {
+			t.Fatalf("selective relation capabilities=%+v", selective.capabilities)
+		}
+		uniqueIndexedSource := relation(1194, "pipeline_unique_indexed", 25)
+		uniqueIndexed, err := relationCache.resolve(ctx, conn, &uniqueIndexedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if uniqueIndexed.capabilities.relationLane || uniqueIndexed.capabilities.keyedSetDML ||
+			!uniqueIndexed.capabilities.relationOrderedLane ||
+			uniqueIndexed.capabilities.relationOrderedLaneV3 || uniqueIndexed.capabilities.selectiveUpdates {
+			t.Fatalf("unique partial indexed relation capabilities=%+v", uniqueIndexed.capabilities)
 		}
 		customSource := stageRelation(1192, "pipeline_stage")
 		custom, err := relationCache.resolve(ctx, conn, &customSource, loadTargetRelation)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if custom.capabilities.relationLane || !custom.capabilities.keyedSetDML ||
-			custom.capabilities.binaryCopy || !custom.capabilities.textCopyStage {
+		if custom.capabilities.relationLane || custom.capabilities.relationOrderedLane ||
+			!custom.capabilities.keyedSetDML ||
+			custom.capabilities.binaryCopy || !custom.capabilities.textCopyStage ||
+			!custom.capabilities.selectiveUpdates {
 			t.Fatalf("custom relation capabilities=%+v", custom.capabilities)
+		}
+		simpleUniqueSource := relation(1196, "pipeline_update_unique", 25)
+		simpleUnique, err := relationCache.resolve(ctx, conn, &simpleUniqueSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !simpleUnique.capabilities.relationLane ||
+			!simpleUnique.capabilities.relationOrderedLane ||
+			!simpleUnique.capabilities.crossKeyConflicts {
+			t.Fatalf("simple unique relation capabilities=%+v", simpleUnique.capabilities)
+		}
+		noPrimarySource := relation(1197, "pipeline_update_batch_duplicates", 25)
+		noPrimary, err := relationCache.resolve(ctx, conn, &noPrimarySource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if noPrimary.capabilities.relationLane || !noPrimary.capabilities.relationOrderedLane {
+			t.Fatalf("no-primary relation capabilities=%+v", noPrimary.capabilities)
+		}
+		builtInIndexSource := relation(1199, "pipeline_builtin_indexes", 25)
+		builtInIndex, err := relationCache.resolve(ctx, conn, &builtInIndexSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !builtInIndex.capabilities.relationLane ||
+			!builtInIndex.capabilities.relationOrderedLane {
+			t.Fatalf("built-in expression/partial index capabilities=%+v", builtInIndex.capabilities)
+		}
+		customIndexSource := relation(1200, "pipeline_custom_index", 25)
+		customIndex, err := relationCache.resolve(ctx, conn, &customIndexSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !customIndex.capabilities.relationLane || customIndex.capabilities.relationOrderedLane {
+			t.Fatalf("custom expression dependency capabilities=%+v", customIndex.capabilities)
+		}
+		catalogCustomIndexSource := relation(1209, "pipeline_catalog_custom_index", 25)
+		catalogCustomIndex, err := relationCache.resolve(
+			ctx, conn, &catalogCustomIndexSource, loadTargetRelation,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !catalogCustomIndex.capabilities.relationLane ||
+			catalogCustomIndex.capabilities.relationOrderedLane ||
+			!catalogCustomIndex.capabilities.relationOrderedLaneV3 {
+			t.Fatalf("pg_catalog custom index capabilities=%+v", catalogCustomIndex.capabilities)
+		}
+		customTypeIndexSource := relation(1210, "pipeline_custom_type_index", 25)
+		customTypeIndex, err := relationCache.resolve(
+			ctx, conn, &customTypeIndexSource, loadTargetRelation,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if customTypeIndex.capabilities.relationOrderedLane {
+			t.Fatalf("custom type index capabilities=%+v", customTypeIndex.capabilities)
+		}
+		unloggedSource := relation(1202, "pipeline_unlogged", 25)
+		unlogged, err := relationCache.resolve(ctx, conn, &unloggedSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if unlogged.capabilities.relationOrderedLane {
+			t.Fatalf("unlogged relation capabilities=%+v", unlogged.capabilities)
+		}
+		generatedOnlySource := Relation{
+			OID: 1203, Namespace: "public", Name: "pipeline_generated_only", ReplicaIdentity: 'd',
+			Columns: []Column{{Name: "value", Type: pgtype.Int4OID}},
+		}
+		generatedOnly, err := relationCache.resolve(
+			ctx, conn, &generatedOnlySource, loadTargetRelation,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if generatedOnly.capabilities.relationOrderedLane {
+			t.Fatalf("generated-only relation capabilities=%+v", generatedOnly.capabilities)
+		}
+		deferrableSource := relation(1204, "pipeline_deferrable_primary", 25)
+		deferrable, err := relationCache.resolve(ctx, conn, &deferrableSource, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if deferrable.capabilities.primaryKeyArbiter {
+			t.Fatalf("deferrable primary key capabilities=%+v", deferrable.capabilities)
+		}
+		oldDeferrable := Tuple{text("1"), text("old")}
+		newDeferrable := Tuple{text("1"), text("new")}
+		deferrableUpdate := Change{Kind: ChangeUpdate, Old: &oldDeferrable, New: &newDeferrable}
+		if canPrimaryKeyUpsert(deferrable, &deferrableUpdate) {
+			t.Fatal("deferrable primary key was admitted as an ON CONFLICT arbiter")
+		}
+		if !canPrimaryKeyUpsertV2(deferrable, &deferrableUpdate) {
+			t.Fatal("deferrable primary key changed plan-v2 lane reconstruction")
+		}
+	})
+
+	t.Run("exclusion indexes remain global serial barriers", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS btree_gist`); err != nil {
+			t.Skipf("server lacks btree_gist exclusion support: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `
+			CREATE TABLE public.pipeline_exclusion (
+				id integer PRIMARY KEY,
+				guarded integer NOT NULL,
+				EXCLUDE USING gist (guarded WITH =)
+			)
+		`); err != nil {
+			t.Fatalf("create exclusion-index fixture: %v", err)
+		}
+		source := relation(1198, "pipeline_exclusion", 23)
+		source.Columns[1].Name = "guarded"
+		loaded, err := relationCache.resolve(ctx, conn, &source, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !loaded.capabilities.crossKeyConflicts || loaded.capabilities.relationOrderedLane {
+			t.Fatalf("exclusion relation capabilities=%+v", loaded.capabilities)
+		}
+	})
+
+	t.Run("trusted relocated btree_gin opclass remains lane safe", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `CREATE SCHEMA pipeline_btree_gin`); err != nil {
+			t.Fatalf("create btree_gin fixture schema: %v", err)
+		}
+		if _, err := conn.Exec(ctx,
+			`CREATE EXTENSION btree_gin WITH SCHEMA pipeline_btree_gin`,
+		); err != nil {
+			t.Skipf("server lacks relocatable btree_gin support: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `
+			CREATE TABLE public.pipeline_trusted_gin (
+				id integer PRIMARY KEY,
+				guarded bigint NOT NULL
+			);
+			CREATE INDEX pipeline_trusted_gin_guarded
+				ON public.pipeline_trusted_gin
+				USING gin (guarded pipeline_btree_gin.int8_ops);
+		`); err != nil {
+			t.Fatalf("create btree_gin fixture: %v", err)
+		}
+		source := relation(1201, "pipeline_trusted_gin", 20)
+		source.Columns[1].Name = "guarded"
+		loaded, err := relationCache.resolve(ctx, conn, &source, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !loaded.capabilities.relationLane || !loaded.capabilities.relationOrderedLane {
+			t.Fatalf("trusted btree_gin relation capabilities=%+v", loaded.capabilities)
+		}
+	})
+
+	t.Run("text search config requires an exact trusted unaccent closure", func(t *testing.T) {
+		if _, err := conn.Exec(ctx, `CREATE SCHEMA pipeline_unaccent`); err != nil {
+			t.Fatalf("create unaccent fixture schema: %v", err)
+		}
+		if _, err := conn.Exec(ctx,
+			`CREATE EXTENSION unaccent WITH SCHEMA pipeline_unaccent`,
+		); err != nil {
+			t.Skipf("server lacks relocatable unaccent support: %v", err)
+		}
+		if _, err := conn.Exec(ctx, `
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_trusted_unaccent_config
+				(COPY = pg_catalog.simple);
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_trusted_unaccent_config
+				ALTER MAPPING FOR word, hword, hword_part
+				WITH pipeline_unaccent.unaccent, pg_catalog.simple;
+			CREATE TABLE public.pipeline_trusted_unaccent (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_trusted_unaccent_search
+				ON public.pipeline_trusted_unaccent USING gin
+				(to_tsvector('public.pipeline_trusted_unaccent_config'::regconfig, value));
+
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_builtin_config
+				(COPY = pg_catalog.simple);
+			CREATE TABLE public.pipeline_builtin_config_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_builtin_config_search
+				ON public.pipeline_builtin_config_table USING gin
+				(to_tsvector('public.pipeline_builtin_config'::regconfig, value));
+
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_empty_config
+				(PARSER = pg_catalog.default);
+			CREATE TABLE public.pipeline_empty_config_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_empty_config_search
+				ON public.pipeline_empty_config_table USING gin
+				(to_tsvector('public.pipeline_empty_config'::regconfig, value));
+
+			CREATE TEXT SEARCH PARSER public.pipeline_custom_parser (
+				START = pg_catalog.prsd_start,
+				GETTOKEN = pg_catalog.prsd_nexttoken,
+				END = pg_catalog.prsd_end,
+				HEADLINE = pg_catalog.prsd_headline,
+				LEXTYPES = pg_catalog.prsd_lextype
+			);
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_custom_parser_config
+				(PARSER = public.pipeline_custom_parser);
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_custom_parser_config
+				ADD MAPPING FOR word WITH pg_catalog.simple;
+			CREATE TABLE public.pipeline_custom_parser_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_custom_parser_search
+				ON public.pipeline_custom_parser_table USING gin
+				(to_tsvector('public.pipeline_custom_parser_config'::regconfig, value));
+
+			CREATE TEXT SEARCH DICTIONARY public.pipeline_untrusted_dictionary
+				(TEMPLATE = pipeline_unaccent.unaccent, RULES = 'unaccent');
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_mixed_config
+				(COPY = pg_catalog.simple);
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_mixed_config
+				ALTER MAPPING FOR asciiword
+				WITH public.pipeline_untrusted_dictionary;
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_mixed_config
+				ALTER MAPPING FOR word
+				WITH pipeline_unaccent.unaccent, pg_catalog.simple;
+			CREATE TABLE public.pipeline_mixed_config_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_mixed_config_search
+				ON public.pipeline_mixed_config_table USING gin
+				(to_tsvector('public.pipeline_mixed_config'::regconfig, value));
+
+			CREATE TABLE public.pipeline_partitioned (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			) PARTITION BY RANGE (id);
+			CREATE TABLE public.pipeline_partitioned_default
+				PARTITION OF public.pipeline_partitioned DEFAULT;
+		`); err != nil {
+			t.Fatal(err)
+		}
+
+		load := func(oid uint32, name string) *targetRelation {
+			t.Helper()
+			source := relation(oid, name, 25)
+			loaded, err := loadTargetRelation(ctx, conn, &source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return loaded
+		}
+		for _, fixture := range []struct {
+			oid     uint32
+			name    string
+			ordered bool
+		}{
+			{oid: 1211, name: "pipeline_trusted_unaccent", ordered: true},
+			{oid: 1212, name: "pipeline_builtin_config_table", ordered: true},
+			{oid: 1213, name: "pipeline_empty_config_table", ordered: false},
+			{oid: 1214, name: "pipeline_mixed_config_table", ordered: false},
+			{oid: 1215, name: "pipeline_partitioned", ordered: false},
+			{oid: 1217, name: "pipeline_partitioned_default", ordered: false},
+			{oid: 1218, name: "pipeline_custom_parser_table", ordered: false},
+		} {
+			loaded := load(fixture.oid, fixture.name)
+			if loaded.capabilities.relationOrderedLane != fixture.ordered {
+				t.Fatalf("%s ordered=%t capabilities=%+v", fixture.name, fixture.ordered, loaded.capabilities)
+			}
+			if fixture.name == "pipeline_trusted_unaccent" {
+				if loaded.capabilities.relationOrderedLaneV4 {
+					t.Fatalf("trusted unaccent changed plan-v4 admission: %+v", loaded.capabilities)
+				}
+				if !loaded.capabilities.relationLane ||
+					loaded.capabilities.crossKeyConflicts || len(primaryKeyColumns(loaded)) == 0 {
+					t.Fatalf("trusted unaccent is not primary-key sharded: %+v", loaded.capabilities)
+				}
+			}
+		}
+
+		if _, err := conn.Exec(ctx, `
+			CREATE FUNCTION public.pipeline_untrusted_unaccent_init(internal)
+				RETURNS internal
+				AS '$libdir/unaccent', 'unaccent_init'
+				LANGUAGE C PARALLEL SAFE;
+			CREATE FUNCTION public.pipeline_untrusted_unaccent_lexize(
+				internal, internal, internal, internal
+			) RETURNS internal
+				AS '$libdir/unaccent', 'unaccent_lexize'
+				LANGUAGE C PARALLEL SAFE;
+			CREATE TEXT SEARCH TEMPLATE public.pipeline_untrusted_function_template (
+				INIT = public.pipeline_untrusted_unaccent_init,
+				LEXIZE = public.pipeline_untrusted_unaccent_lexize
+			);
+			CREATE TEXT SEARCH DICTIONARY public.pipeline_untrusted_function_dictionary
+				(TEMPLATE = public.pipeline_untrusted_function_template, RULES = 'unaccent');
+			ALTER EXTENSION unaccent ADD FUNCTION
+				public.pipeline_untrusted_unaccent_init(internal);
+			ALTER EXTENSION unaccent ADD FUNCTION
+				public.pipeline_untrusted_unaccent_lexize(internal, internal, internal, internal);
+			ALTER EXTENSION unaccent ADD TEXT SEARCH TEMPLATE
+				public.pipeline_untrusted_function_template;
+			ALTER EXTENSION unaccent ADD TEXT SEARCH DICTIONARY
+				public.pipeline_untrusted_function_dictionary;
+			CREATE TEXT SEARCH CONFIGURATION public.pipeline_untrusted_function_config
+				(COPY = pg_catalog.simple);
+			ALTER TEXT SEARCH CONFIGURATION public.pipeline_untrusted_function_config
+				ALTER MAPPING FOR word
+				WITH public.pipeline_untrusted_function_dictionary;
+			CREATE TABLE public.pipeline_untrusted_function_table (
+				id integer PRIMARY KEY,
+				value text NOT NULL
+			);
+			CREATE INDEX pipeline_untrusted_function_search
+				ON public.pipeline_untrusted_function_table USING gin
+				(to_tsvector('public.pipeline_untrusted_function_config'::regconfig, value));
+		`); err != nil {
+			t.Fatal(err)
+		}
+		untrustedFunction := load(1216, "pipeline_untrusted_function_table")
+		if untrustedFunction.capabilities.relationOrderedLane {
+			t.Fatalf("extension-laundered text-search closure was admitted: %+v", untrustedFunction.capabilities)
+		}
+	})
+
+	t.Run("selective replay preserves values and HOT-updates unindexed columns", func(t *testing.T) {
+		source := selectiveRelation(1195)
+		targetRelation, err := relationCache.resolve(ctx, conn, &source, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Force the scalar VALUES inspection transport used when a real target
+		// column has no usable array parameter representation, and the bitmap
+		// heap path used by a target relation too large to remain cached.
+		otherArrayOID := targetRelation.columns[2].arrayOID
+		targetRelation.columns[2].arrayOID = 0
+		targetRelation.heapBytes = selectiveBitmapMinHeapBytes
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO public.pipeline_selective_update
+				(id, indexed_value, other_value, unique_a, unique_b)
+			VALUES (1, 'indexed-old', 'other-old', 'a', 'b'),
+			       (2, 'indexed-two', 'other-two', 'c', 'd');
+			SELECT pg_stat_reset_single_table_counters('public.pipeline_selective_update'::regclass);
+		`); err != nil {
+			t.Fatal(err)
+		}
+		transaction := Transaction{
+			CommitLSN: 410, EndLSN: 411, Relations: []Relation{source},
+			Changes: []Change{
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("1"), text("indexed-old"), text("other-old"), text("a"), text("b")),
+					New: tuple(text("1"), text("indexed-old"), text("other-middle"), text("a"), text("b")),
+				},
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("1"), text("indexed-old"), text("other-middle"), text("a"), text("b")),
+					New: tuple(text("1"), text("indexed-old"), text("other-new"), text("a"), text("b")),
+				},
+				{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: tuple(text("2"), text("indexed-two"), text("other-two"), text("c"), text("d")),
+					New: tuple(text("2"), text("indexed-new"), text("other-two"), text("c-new"), text("d-new")),
+				},
+			},
+		}
+		if err := apply("pipeline-selective-update", &transaction); err != nil {
+			t.Fatal(err)
+		}
+		var values string
+		if err := conn.QueryRow(ctx, `
+			SELECT string_agg(indexed_value || ':' || other_value, ',' ORDER BY id)
+			FROM public.pipeline_selective_update
+		`).Scan(&values); err != nil {
+			t.Fatal(err)
+		}
+		if values != "indexed-old:other-new,indexed-new:other-two" {
+			t.Fatalf("selective values=%q", values)
+		}
+		var uniqueValues string
+		if err := conn.QueryRow(ctx, `
+			SELECT unique_a || ':' || unique_b
+			FROM public.pipeline_selective_update WHERE id = 2
+		`).Scan(&uniqueValues); err != nil {
+			t.Fatal(err)
+		}
+		if uniqueValues != "c-new:d-new" {
+			t.Fatalf("selective unique values=%q", uniqueValues)
+		}
+		// Restore the array transport and exercise the same bitmap target lookup
+		// through its compact unnest input.
+		targetRelation.columns[2].arrayOID = otherArrayOID
+		arrayTransaction := Transaction{
+			CommitLSN: 412, EndLSN: 413, Relations: []Relation{source},
+			Changes: []Change{{
+				RelationOID: source.OID, Kind: ChangeUpdate,
+				Old: tuple(text("1"), text("indexed-old"), text("other-new"), text("a"), text("b")),
+				New: tuple(text("1"), text("indexed-old"), text("other-array"), text("a"), text("b")),
+			}},
+		}
+		if err := apply("pipeline-selective-update-array", &arrayTransaction); err != nil {
+			t.Fatal(err)
+		}
+		if err := conn.QueryRow(ctx, `
+			SELECT other_value FROM public.pipeline_selective_update WHERE id = 1
+		`).Scan(&values); err != nil {
+			t.Fatal(err)
+		}
+		if values != "other-array" {
+			t.Fatalf("selective array value=%q", values)
+		}
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO public.pipeline_selective_update
+				(id, indexed_value, other_value, unique_a, unique_b)
+			VALUES (3, 'indexed-three', 'other-three', 'e', 'f')
+		`); err != nil {
+			t.Fatal(err)
+		}
+		deleteTransaction := Transaction{
+			CommitLSN: 414, EndLSN: 415, Relations: []Relation{source},
+			Changes: []Change{
+				{
+					RelationOID: source.OID, Kind: ChangeDelete,
+					Old: tuple(text("2"), text("indexed-new"), text("other-two"), text("c-new"), text("d-new")),
+				},
+				{
+					RelationOID: source.OID, Kind: ChangeDelete,
+					Old: tuple(text("3"), text("indexed-three"), text("other-three"), text("e"), text("f")),
+				},
+			},
+		}
+		if err := apply("pipeline-selective-delete-array", &deleteTransaction); err != nil {
+			t.Fatal(err)
+		}
+		var remaining int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*) FROM public.pipeline_selective_update
+		`).Scan(&remaining); err != nil {
+			t.Fatal(err)
+		}
+		if remaining != 1 {
+			t.Fatalf("selective rows after bitmap delete=%d, want 1", remaining)
+		}
+		if _, err := conn.Exec(ctx, "SELECT pg_stat_force_next_flush()"); err != nil {
+			t.Fatal(err)
+		}
+		var hotUpdates int64
+		if err := conn.QueryRow(ctx, `
+			SELECT n_tup_hot_upd FROM pg_stat_user_tables
+			WHERE relid = 'public.pipeline_selective_update'::regclass
+		`).Scan(&hotUpdates); err != nil {
+			t.Fatal(err)
+		}
+		if hotUpdates < 1 {
+			t.Fatalf("selective replay produced %d HOT updates, want at least 1", hotUpdates)
+		}
+	})
+
+	t.Run("selective replay preserves arrays, TOAST, collation fidelity, and rollback", func(t *testing.T) {
+		source := selectiveArrayRelation(1220)
+		targetRelation, err := relationCache.resolve(ctx, conn, &source, loadTargetRelation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !targetRelation.capabilities.selectiveUpdates {
+			t.Fatalf("selective array relation capabilities=%+v", targetRelation.capabilities)
+		}
+		for _, columnIndex := range []int{2, 3, 5} {
+			if targetRelation.columns[columnIndex].arrayOID != 0 {
+				t.Fatalf(
+					"array column %s has array-of-array OID %d, want scalar VALUES fallback",
+					targetRelation.columns[columnIndex].name,
+					targetRelation.columns[columnIndex].arrayOID,
+				)
+			}
+		}
+		if targetRelation.columns[2].nondeterministicCollation ||
+			!targetRelation.columns[4].nondeterministicCollation ||
+			!targetRelation.columns[5].nondeterministicCollation {
+			t.Fatalf("selective collation catalog flags=%+v", targetRelation.columns)
+		}
+
+		if _, err := conn.Exec(ctx, `
+			INSERT INTO public.pipeline_selective_array (
+				id, indexed_value, array_value, toasted_array,
+				nondeterministic_text, nondeterministic_array, unique_value
+			)
+			SELECT id,
+			       format('indexed-%s', id),
+			       ARRAY[format('old-%s', id)],
+			       ARRAY[(
+			         SELECT string_agg(md5(id::text || ':' || chunk::text), '' ORDER BY chunk)
+			         FROM generate_series(1, 1024) AS chunk
+			       )],
+			       format('case-%s', id),
+			       ARRAY[format('case-%s', id)],
+			       format('unique-%s', id)
+			FROM generate_series(1, 4) AS id
+		`); err != nil {
+			t.Fatal(err)
+		}
+		var toastedBefore string
+		var minimumToastedBytes int
+		if err := conn.QueryRow(ctx, `
+			SELECT string_agg(toasted_array::text, '|' ORDER BY id),
+			       min(octet_length(toasted_array::text))
+			FROM public.pipeline_selective_array
+		`).Scan(&toastedBefore, &minimumToastedBytes); err != nil {
+			t.Fatal(err)
+		}
+		if minimumToastedBytes < 16*1024 {
+			t.Fatalf("array fixture has only %d bytes, want an externally stored value", minimumToastedBytes)
+		}
+
+		null := TupleDatum{Kind: DatumNull}
+		unchangedToast := TupleDatum{Kind: DatumUnchangedToast}
+		oldRow := func(id int) *Tuple {
+			return tuple(text(strconv.Itoa(id)), null, null, null, null, null, null)
+		}
+		newRow := func(id int, arrayValue TupleDatum, nondeterministicText, nondeterministicArray, unique string) *Tuple {
+			return tuple(
+				text(strconv.Itoa(id)),
+				text(fmt.Sprintf("indexed-%d", id)),
+				arrayValue,
+				unchangedToast,
+				text(nondeterministicText),
+				text(nondeterministicArray),
+				text(unique),
+			)
+		}
+		arrayValues := []TupleDatum{
+			text(`{"comma,value","quote\"value","back\\slash","NULL",""}`),
+			text(`[0:1][3:4]={{a,b},{c,d}}`),
+			null,
+			text(`{}`),
+		}
+		arrayTransaction := Transaction{
+			CommitLSN: 520, EndLSN: 521, Relations: []Relation{source},
+			Changes: make([]Change, 0, len(arrayValues)),
+		}
+		for i, arrayValue := range arrayValues {
+			id := i + 1
+			arrayTransaction.Changes = append(arrayTransaction.Changes, Change{
+				RelationOID: source.OID,
+				Kind:        ChangeUpdate,
+				Old:         oldRow(id),
+				New: newRow(
+					id,
+					arrayValue,
+					fmt.Sprintf("case-%d", id),
+					fmt.Sprintf("{case-%d}", id),
+					fmt.Sprintf("unique-%d", id),
+				),
+			})
+		}
+		if err := apply("pipeline-selective-real-array", &arrayTransaction); err != nil {
+			t.Fatal(err)
+		}
+		var quotedArray, boundedArray, nullArray, emptyArray bool
+		if err := conn.QueryRow(ctx, `
+			SELECT
+			  (SELECT array_value IS NOT DISTINCT FROM
+			     $array${"comma,value","quote\"value","back\\slash","NULL",""}$array$::text[]
+			   FROM public.pipeline_selective_array WHERE id = 1),
+			  (SELECT array_value IS NOT DISTINCT FROM
+			     '[0:1][3:4]={{a,b},{c,d}}'::text[]
+			   FROM public.pipeline_selective_array WHERE id = 2),
+			  (SELECT array_value IS NULL
+			   FROM public.pipeline_selective_array WHERE id = 3),
+			  (SELECT cardinality(array_value) = 0
+			   FROM public.pipeline_selective_array WHERE id = 4)
+		`).Scan(&quotedArray, &boundedArray, &nullArray, &emptyArray); err != nil {
+			t.Fatal(err)
+		}
+		if !quotedArray || !boundedArray || !nullArray || !emptyArray {
+			t.Fatalf(
+				"array fidelity quoted=%t bounded=%t null=%t empty=%t",
+				quotedArray, boundedArray, nullArray, emptyArray,
+			)
+		}
+		var toastedAfter string
+		if err := conn.QueryRow(ctx, `
+			SELECT string_agg(toasted_array::text, '|' ORDER BY id)
+			FROM public.pipeline_selective_array
+		`).Scan(&toastedAfter); err != nil {
+			t.Fatal(err)
+		}
+		if toastedAfter != toastedBefore {
+			t.Fatal("selective array replay overwrote an unchanged TOAST value")
+		}
+		assertProgress(t, "pipeline-selective-real-array", arrayTransaction.EndLSN)
+
+		var textCollatesEqual, arrayCollatesEqual bool
+		if err := conn.QueryRow(ctx, `
+			SELECT
+			  'case-1' COLLATE public.pipeline_nondeterministic =
+			    'CASE-1' COLLATE public.pipeline_nondeterministic,
+			  ARRAY['case-1']::text[] COLLATE public.pipeline_nondeterministic =
+			    ARRAY['CASE-1']::text[] COLLATE public.pipeline_nondeterministic
+		`).Scan(&textCollatesEqual, &arrayCollatesEqual); err != nil {
+			t.Fatal(err)
+		}
+		if !textCollatesEqual || !arrayCollatesEqual {
+			t.Fatal("nondeterministic collation fixture does not equate case variants")
+		}
+		collationTransaction := Transaction{
+			CommitLSN: 522, EndLSN: 523, Relations: []Relation{source},
+			Changes: make([]Change, 0, 2),
+		}
+		for id := 1; id <= 2; id++ {
+			collationTransaction.Changes = append(collationTransaction.Changes, Change{
+				RelationOID: source.OID,
+				Kind:        ChangeUpdate,
+				Old:         oldRow(id),
+				New: tuple(
+					text(strconv.Itoa(id)),
+					text(fmt.Sprintf("indexed-%d", id)),
+					unchangedToast,
+					unchangedToast,
+					text(fmt.Sprintf("CASE-%d", id)),
+					text(fmt.Sprintf("{CASE-%d}", id)),
+					text(fmt.Sprintf("unique-%d", id)),
+				),
+			})
+		}
+		if err := apply("pipeline-selective-nondeterministic", &collationTransaction); err != nil {
+			t.Fatal(err)
+		}
+		var exactText, exactArray string
+		if err := conn.QueryRow(ctx, `
+			SELECT nondeterministic_text, nondeterministic_array::text
+			FROM public.pipeline_selective_array WHERE id = 1
+		`).Scan(&exactText, &exactArray); err != nil {
+			t.Fatal(err)
+		}
+		if exactText != "CASE-1" || exactArray != "{CASE-1}" {
+			t.Fatalf("nondeterministic fidelity text=%q array=%q", exactText, exactArray)
+		}
+		assertProgress(t, "pipeline-selective-nondeterministic", collationTransaction.EndLSN)
+
+		rollbackTransaction := Transaction{
+			CommitLSN: 524, EndLSN: 525, Relations: []Relation{source},
+			Changes: make([]Change, 0, 2),
+		}
+		for id := 3; id <= 4; id++ {
+			rollbackTransaction.Changes = append(rollbackTransaction.Changes, Change{
+				RelationOID: source.OID,
+				Kind:        ChangeUpdate,
+				Old:         oldRow(id),
+				New: tuple(
+					text(strconv.Itoa(id)),
+					text(fmt.Sprintf("indexed-%d", id)),
+					unchangedToast,
+					unchangedToast,
+					text(fmt.Sprintf("CASE-%d", id)),
+					text(fmt.Sprintf("{CASE-%d}", id)),
+					text("duplicate-unique-value"),
+				),
+			})
+		}
+		if err := apply("pipeline-selective-array-rollback", &rollbackTransaction); err == nil {
+			t.Fatal("expected the second selective update to violate the unique constraint")
+		}
+		var rolledBackRows int
+		if err := conn.QueryRow(ctx, `
+			SELECT count(*)
+			FROM public.pipeline_selective_array
+			WHERE id IN (3, 4)
+			  AND nondeterministic_text = ('case-' || id)::text
+			  AND unique_value = ('unique-' || id)::text
+		`).Scan(&rolledBackRows); err != nil {
+			t.Fatal(err)
+		}
+		if rolledBackRows != 2 {
+			t.Fatalf("failed selective transaction retained changes on %d rows", 2-rolledBackRows)
+		}
+		assertProgress(t, "pipeline-selective-array-rollback", 0)
+		if status := conn.PgConn().TxStatus(); status != 'I' {
+			t.Fatalf("connection status after selective rollback=%q, want idle", status)
 		}
 	})
 
@@ -960,7 +2050,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		assertProgress(t, "pipeline-stage-delete", deleteTransaction.EndLSN)
 	})
 
-	t.Run("typed stage missing match rolls back every row and progress", func(t *testing.T) {
+	t.Run("typed stage upsert repairs a missing target row atomically", func(t *testing.T) {
 		if _, err := conn.Exec(ctx, `
 			INSERT INTO public.pipeline_stage
 			SELECT id, 'calm', 'original' FROM generate_series(1, 64) AS id
@@ -984,12 +2074,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			})
 		}
 		applied, next, err := applyBatch("pipeline-stage-missing", 0, []Transaction{transaction})
-		var divergence *DivergenceError
-		if !errors.As(err, &divergence) || !strings.Contains(err.Error(), "identity ordinal 63") {
-			t.Fatalf("missing staged match error=%v", err)
-		}
-		if applied || next != 0 {
-			t.Fatalf("missing staged match applied=%t progress=%x", applied, next)
+		if err != nil || !applied || next != transaction.EndLSN {
+			t.Fatalf("staged upsert applied=%t progress=%x err=%v", applied, next, err)
 		}
 		var changed int
 		if err := conn.QueryRow(ctx, `
@@ -997,10 +2083,17 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		`).Scan(&changed); err != nil {
 			t.Fatal(err)
 		}
-		if changed != 0 {
-			t.Fatalf("failed staged update retained %d changed rows", changed)
+		if changed != 64 {
+			t.Fatalf("staged upsert changed %d rows, want 64", changed)
 		}
-		assertProgress(t, "pipeline-stage-missing", 0)
+		var repaired string
+		if err := conn.QueryRow(ctx, `SELECT note FROM public.pipeline_stage WHERE id = 999`).Scan(&repaired); err != nil {
+			t.Fatal(err)
+		}
+		if repaired != "changed" {
+			t.Fatalf("repaired row note=%q, want changed", repaired)
+		}
+		assertProgress(t, "pipeline-stage-missing", transaction.EndLSN)
 		if status := conn.PgConn().TxStatus(); status != 'I' {
 			t.Fatalf("connection status after staged divergence=%q, want idle", status)
 		}
@@ -1279,8 +2372,8 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		var prepared int
 		if err := conn.QueryRow(ctx, `
 			SELECT count(*) FROM pg_catalog.pg_prepared_statements
-			WHERE statement LIKE 'UPDATE "public"."pipeline_update_batch" AS pgmigrate_target%'
-			  AND statement LIKE '%RETURNING pgmigrate_batch.ordinal%'
+			WHERE statement LIKE 'INSERT INTO "public"."pipeline_update_batch"%'
+			  AND statement LIKE '%ON CONFLICT ("id") DO UPDATE%'
 		`).Scan(&prepared); err != nil {
 			t.Fatal(err)
 		}
@@ -1523,7 +2616,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 		evictionRelations := newTargetRelationCache()
 		evictionStatements := newApplyStatementCache(1)
 		if err := applier.applyTransaction(
-			ctx, evictionConn, evictionRelations, evictionStatements,
+			ctx, evictionConn, evictionRelations, evictionStatements, 0,
 			&Transaction{
 				CommitLSN: 69, EndLSN: 70, Relations: []Relation{source},
 				Changes: []Change{{
@@ -1544,7 +2637,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := applier.applyTransaction(
-			ctx, evictionConn, evictionRelations, evictionStatements,
+			ctx, evictionConn, evictionRelations, evictionStatements, 70,
 			&Transaction{
 				CommitLSN: 70, EndLSN: 71, Relations: []Relation{source},
 				Changes: []Change{{
@@ -1643,7 +2736,7 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 			StreamID: stream, StreamGeneration: "wrong-generation",
 		}}
 		err := applier.applyTransaction(
-			ctx, conn, relationCache, statementCache,
+			ctx, conn, relationCache, statementCache, 0,
 			&Transaction{
 				CommitLSN: 79, EndLSN: 80, Relations: []Relation{source},
 				Changes: []Change{{
@@ -1706,23 +2799,35 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 	})
 
 	for _, kind := range []ChangeKind{ChangeUpdate, ChangeDelete} {
-		t.Run("zero-row "+changeKindName(kind)+" rolls back progress", func(t *testing.T) {
+		t.Run("zero-row "+changeKindName(kind)+" follows replay semantics", func(t *testing.T) {
 			source := relation(1103+uint32(kind), "pipeline_missing", 25)
+			id := "404"
+			if kind == ChangeDelete {
+				id = "405"
+			}
 			change := Change{
 				RelationOID: source.OID, Kind: kind,
-				Old: tuple(text("404"), TupleDatum{Kind: DatumNull}),
+				Old: tuple(text(id), TupleDatum{Kind: DatumNull}),
 			}
 			if kind == ChangeUpdate {
-				change.New = tuple(text("404"), text("missing"))
+				change.New = tuple(text(id), text("missing"))
 			}
 			stream := "pipeline-zero-" + changeKindName(kind)
-			var divergence *DivergenceError
+			endLSN := 31 + LSN(kind)
 			err := apply(stream, &Transaction{
-				CommitLSN: 30 + LSN(kind), EndLSN: 31 + LSN(kind),
+				CommitLSN: 30 + LSN(kind), EndLSN: endLSN,
 				Relations: []Relation{source}, Changes: []Change{change},
 			})
+			if kind == ChangeUpdate {
+				if err != nil {
+					t.Fatalf("missing-row update upsert: %v", err)
+				}
+				assertProgress(t, stream, endLSN)
+				return
+			}
+			var divergence *DivergenceError
 			if !errors.As(err, &divergence) {
-				t.Fatalf("zero-row %s error=%v, want divergence", changeKindName(kind), err)
+				t.Fatalf("zero-row delete error=%v, want divergence", err)
 			}
 			assertProgress(t, stream, 0)
 		})

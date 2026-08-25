@@ -8,6 +8,9 @@ coverage.*
 *.prof
 *.pprof
 
+# Local blueprint execution logs
+/docs/blueprints/*.log
+
 # Go workspace files, which are always local to one checkout
 go.work
 go.work.sum

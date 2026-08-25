@@ -18,6 +18,15 @@ func TestFromEnvironment(t *testing.T) {
 	if got.Target != "postgres://target/db" {
 		t.Fatalf("Target = %q", got.Target)
 	}
+	if got.ReplayWorkers != 8 {
+		t.Fatalf("ReplayWorkers = %d, want 8", got.ReplayWorkers)
+	}
+	if got.ReplayBatchBytes != 8<<20 || got.ReplayBatchChanges != 32_768 {
+		t.Fatalf(
+			"Replay batch = %d bytes / %d changes, want %d / %d",
+			got.ReplayBatchBytes, got.ReplayBatchChanges, 8<<20, 32_768,
+		)
+	}
 }
 
 func TestValidateConnections(t *testing.T) {
@@ -47,5 +56,18 @@ func TestValidateDir(t *testing.T) {
 	}
 	if err := (config.Config{Dir: " \t"}).ValidateDir(); err == nil {
 		t.Fatal("blank directory accepted")
+	}
+}
+
+func TestValidateReplayWorkers(t *testing.T) {
+	for _, workers := range []int{1, config.ReplayWorkersMax} {
+		if err := config.ValidateReplayWorkers(workers); err != nil {
+			t.Errorf("ValidateReplayWorkers(%d) error = %v", workers, err)
+		}
+	}
+	for _, workers := range []int{0, -1, config.ReplayWorkersMax + 1} {
+		if err := config.ValidateReplayWorkers(workers); err == nil {
+			t.Errorf("ValidateReplayWorkers(%d) accepted an invalid value", workers)
+		}
 	}
 }

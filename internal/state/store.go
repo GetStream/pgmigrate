@@ -308,7 +308,11 @@ func Open(ctx context.Context, dir string, fingerprints Fingerprints) (_ *Store,
 		}
 	}()
 
-	db, err := sql.Open("sqlite", filepath.Join(dir, "state.db"))
+	dsn, err := sqliteDSN(filepath.Join(dir, "state.db"), false)
+	if err != nil {
+		return nil, fmt.Errorf("resolve state database path: %w", err)
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open state database: %w", err)
 	}
@@ -348,11 +352,10 @@ func OpenReadOnly(ctx context.Context, dir string) (*Store, error) {
 		return nil, fmt.Errorf("%w: %s is not a regular file", ErrStateNotFound, filename)
 	}
 
-	absolute, err := filepath.Abs(filename)
+	dsn, err := sqliteDSN(filename, true)
 	if err != nil {
 		return nil, fmt.Errorf("resolve state database path: %w", err)
 	}
-	dsn := (&url.URL{Scheme: "file", Path: absolute, RawQuery: "mode=ro"}).String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open state database read-only: %w", err)
@@ -419,7 +422,12 @@ func OpenControl(ctx context.Context, dir string) (_ *Store, err error) {
 		}
 		return nil, fmt.Errorf("lock cutover controller: %w", err)
 	}
-	db, err := sql.Open("sqlite", filename)
+	dsn, err := sqliteDSN(filename, false)
+	if err != nil {
+		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
+		return nil, fmt.Errorf("resolve control state database path: %w", err)
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		_ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN)
 		return nil, fmt.Errorf("open control state database: %w", err)
@@ -439,6 +447,29 @@ func OpenControl(ctx context.Context, dir string) (_ *Store, err error) {
 		return nil, err
 	}
 	return &Store{db: db, lockFile: lockFile}, nil
+}
+
+// sqliteDSN installs the busy handler while modernc.org/sqlite is creating each
+// connection. Setting busy_timeout only after Ping is too late: transient WAL
+// recovery or controller contention can make the resumed run's first statement
+// fail immediately with SQLITE_BUSY_RECOVERY.
+func sqliteDSN(filename string, readOnly bool) (string, error) {
+	absolute, err := filepath.Abs(filename)
+	if err != nil {
+		return "", err
+	}
+	query := url.Values{}
+	query.Add("_pragma", "busy_timeout=5000")
+	if readOnly {
+		query.Set("mode", "ro")
+	} else {
+		// A deferred transaction can read first and then fail immediately while
+		// upgrading to a writer, because SQLite cannot safely wait on that
+		// deadlock-prone upgrade. Acquire the writer reservation up front so the
+		// busy handler can wait for a concurrent controller transaction instead.
+		query.Set("_txlock", "immediate")
+	}
+	return (&url.URL{Scheme: "file", Path: absolute, RawQuery: query.Encode()}).String(), nil
 }
 
 func configure(ctx context.Context, db *sql.DB) error {

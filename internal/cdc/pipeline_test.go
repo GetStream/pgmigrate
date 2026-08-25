@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/GetStream/pgmigrate/internal/config"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func TestPersisterSquashesBatchIntoOneDurableWatermark(t *testing.T) {
@@ -48,6 +51,81 @@ func TestDurableWatermarkIsMonotonic(t *testing.T) {
 	watermark.Publish(10)
 	if got := watermark.Load(); got != 20 {
 		t.Fatalf("watermark = %d, want 20", got)
+	}
+}
+
+func TestReplayKeyTargetTypeSafe(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		oid  uint32
+		safe bool
+	}{
+		{name: "bool", oid: pgtype.BoolOID, safe: true},
+		{name: "bytea", oid: pgtype.ByteaOID, safe: true},
+		{name: "int2", oid: pgtype.Int2OID, safe: true},
+		{name: "int4", oid: pgtype.Int4OID, safe: true},
+		{name: "int8", oid: pgtype.Int8OID, safe: true},
+		{name: "text", oid: pgtype.TextOID, safe: true},
+		{name: "varchar", oid: pgtype.VarcharOID, safe: true},
+		{name: "date", oid: pgtype.DateOID, safe: true},
+		{name: "time", oid: pgtype.TimeOID, safe: true},
+		{name: "timestamp", oid: pgtype.TimestampOID, safe: true},
+		{name: "timestamptz", oid: pgtype.TimestamptzOID, safe: true},
+		{name: "uuid", oid: pgtype.UUIDOID, safe: true},
+		{name: "numeric", oid: pgtype.NumericOID},
+		{name: "bpchar", oid: pgtype.BPCharOID},
+		{name: "float4", oid: pgtype.Float4OID},
+		{name: "float8", oid: pgtype.Float8OID},
+		{name: "timetz", oid: pgtype.TimetzOID},
+		{name: "custom", oid: 50000},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := replayKeyTargetTypeSafe(test.oid); got != test.safe {
+				t.Fatalf("replayKeyTargetTypeSafe(%d) = %t, want %t", test.oid, got, test.safe)
+			}
+		})
+	}
+}
+
+func TestApplierReplayBatchLimitsDefaultAndAllowOverrides(t *testing.T) {
+	t.Parallel()
+	base := ApplierConfig{
+		ConnString: "postgres://target", Directory: t.TempDir(), StreamID: "stream",
+		Durable: new(DurableWatermark),
+	}
+	applier, err := NewApplier(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applier.config.BatchMaxDataBytes != applyBatchDefaultDataBytes ||
+		applier.config.BatchMaxChanges != applyBatchDefaultChanges ||
+		applier.config.ReplayWorkers != 1 {
+		t.Fatalf("default batch limits = %d bytes / %d changes", applier.config.BatchMaxDataBytes, applier.config.BatchMaxChanges)
+	}
+	base.BatchMaxDataBytes = 64 << 20
+	base.BatchMaxChanges = 262_144
+	applier, err = NewApplier(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applier.config.BatchMaxDataBytes != 64<<20 || applier.config.BatchMaxChanges != 262_144 {
+		t.Fatalf("overridden batch limits = %d bytes / %d changes", applier.config.BatchMaxDataBytes, applier.config.BatchMaxChanges)
+	}
+	base.BatchMaxDataBytes = -1
+	if _, err := NewApplier(base); err == nil {
+		t.Fatal("negative replay batch limit was accepted")
+	}
+	base.BatchMaxDataBytes = 1
+	base.ReplayWorkers = -1
+	if _, err := NewApplier(base); err == nil {
+		t.Fatal("negative replay worker count was accepted")
+	}
+	base.ReplayWorkers = config.ReplayWorkersMax + 1
+	if _, err := NewApplier(base); err == nil {
+		t.Fatal("replay worker count above the shared maximum was accepted")
 	}
 }
 
@@ -133,6 +211,235 @@ func TestApplyPredicateStaysIndexableOnNotNullColumns(t *testing.T) {
 	}
 	if strings.Count(sql.String(), "IS NOT DISTINCT FROM") != 1 {
 		t.Fatalf("nullable columns should be the only NULL-safe comparisons: %q", sql.String())
+	}
+}
+
+func TestBatchIdentityPredicateUsesExactBTreeRowBounds(t *testing.T) {
+	t.Parallel()
+	columns := []targetColumn{
+		{quoted: `"app_pk"`, notNull: true},
+		{quoted: `"user_id"`, notNull: true},
+		{quoted: `"channel_cid"`, notNull: true},
+	}
+	var sql strings.Builder
+	writeBatchIdentityPredicate(&sql, columns, "identity_", 2)
+	want := `ROW(pgmigrate_target."app_pk",pgmigrate_target."user_id",pgmigrate_target."channel_cid")>=` +
+		`ROW(pgmigrate_batch.identity_2,pgmigrate_batch.identity_3,pgmigrate_batch.identity_4) AND ` +
+		`ROW(pgmigrate_target."app_pk",pgmigrate_target."user_id",pgmigrate_target."channel_cid")<=` +
+		`ROW(pgmigrate_batch.identity_2,pgmigrate_batch.identity_3,pgmigrate_batch.identity_4)`
+	if got := sql.String(); got != want {
+		t.Fatalf("predicate = %q, want %q", got, want)
+	}
+}
+
+func TestSelectiveTargetRowsCTEUsesExactIdentityEquality(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		quoted: `"shard_schema"."channels"`,
+		columns: []targetColumn{
+			{name: "app_pk", quoted: `"app_pk"`},
+			{name: "cid", quoted: `"cid"`},
+			{name: "custom", quoted: `"custom"`},
+		},
+	}
+	var sql strings.Builder
+	writeSelectiveTargetRowsCTE(
+		&sql,
+		relation,
+		relation.columns[:2],
+		[]int{2},
+		[][]int{{7, 8}, {9, 10}},
+	)
+	got := sql.String()
+	want := `WHERE (pgmigrate_bitmap_target."app_pk"=$7 AND pgmigrate_bitmap_target."cid"=$8) OR ` +
+		`(pgmigrate_bitmap_target."app_pk"=$9 AND pgmigrate_bitmap_target."cid"=$10)`
+	if !strings.Contains(got, want) {
+		t.Fatalf("bitmap predicate = %q, want exact composite identities %q", got, want)
+	}
+	if strings.Contains(got, ">=") || strings.Contains(got, "<=") {
+		t.Fatalf("bitmap predicate contains a range bound: %q", got)
+	}
+}
+
+func TestSelectiveBitmapUsesTargetCacheEvidence(t *testing.T) {
+	t.Parallel()
+	tests := map[string]struct {
+		relation targetRelation
+		want     bool
+	}{
+		"small heap uses direct primary-key probes": {
+			relation: targetRelation{heapBytes: selectiveBitmapMinHeapBytes - 1},
+		},
+		"large heap without enough evidence stays conservative": {
+			relation: targetRelation{heapBytes: selectiveBitmapMinHeapBytes},
+			want:     true,
+		},
+		"large cold heap uses bitmap reads": {
+			relation: targetRelation{
+				heapBytes:      selectiveBitmapMinHeapBytes,
+				heapBlocksRead: 600_000, heapBlocksHit: 400_000,
+			},
+			want: true,
+		},
+		"large resident heap keeps direct primary-key probes": {
+			relation: targetRelation{
+				heapBytes:      selectiveBitmapMinHeapBytes,
+				heapBlocksRead: 1_000, heapBlocksHit: selectiveDirectMinHeapBlocks,
+			},
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := useSelectiveBitmap(&test.relation); got != test.want {
+				t.Fatalf("useSelectiveBitmap() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
+func TestResidentCompositeUpdateSkipsTextStageWithoutBitmapGuard(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		heapBytes:      selectiveBitmapMinHeapBytes,
+		heapBlocksRead: 1_000,
+		heapBlocksHit:  selectiveDirectMinHeapBlocks,
+		capabilities: targetRelationCapabilities{
+			selectiveUpdates: true,
+			textCopyStage:    true,
+		},
+	}
+	identityColumns := []targetColumn{{quoted: `"app_pk"`}, {quoted: `"id"`}}
+	if useSelectiveBitmap(relation) {
+		t.Fatal("test relation must exercise the cache-resident path")
+	}
+	if useExactIdentityMembership(relation, identityColumns) {
+		t.Fatal("composite identity enabled the BitmapOr guard")
+	}
+	changes := make([]Change, minimumTextCopyStageRows)
+	applied, err := applyUpdateTextStage(nil, relation, identityColumns, nil, changes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatal("cache-resident composite update used text staging")
+	}
+}
+
+func TestBatchIdentityPredicateKeepsSingleColumnEquality(t *testing.T) {
+	t.Parallel()
+	var sql strings.Builder
+	writeBatchIdentityPredicate(&sql, []targetColumn{{quoted: `"id"`, notNull: true}}, "column_", 7)
+	want := `pgmigrate_target."id"=pgmigrate_batch.column_7`
+	if got := sql.String(); got != want {
+		t.Fatalf("predicate = %q, want %q", got, want)
+	}
+}
+
+func TestCompositeUpdatePredicateForcesPrimaryKeyCTIDLookup(t *testing.T) {
+	t.Parallel()
+	var sql strings.Builder
+	relation := &targetRelation{quoted: `"public"."items"`}
+	identity := []targetColumn{{quoted: `"app_pk"`}, {quoted: `"id"`}}
+	writeCompositeIdentityCTIDPredicate(&sql, relation, identity, "identity_", 0)
+	want := `pgmigrate_target.ctid=(SELECT pgmigrate_lookup.ctid FROM "public"."items" AS pgmigrate_lookup WHERE pgmigrate_lookup."app_pk"=pgmigrate_batch.identity_0 AND pgmigrate_lookup."id"=pgmigrate_batch.identity_1 OFFSET 0)`
+	if got := sql.String(); got != want {
+		t.Fatalf("predicate = %q, want %q", got, want)
+	}
+}
+
+func TestPrimaryKeyUpsertUsesExactCompositePrimaryKey(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		quoted: `"public"."read_state"`,
+		columns: []targetColumn{
+			{name: "app_pk", quoted: `"app_pk"`, primary: true},
+			{name: "user_id", quoted: `"user_id"`, primary: true},
+			{name: "channel_cid", quoted: `"channel_cid"`, primary: true},
+			{name: "last_read", quoted: `"last_read"`},
+		},
+	}
+	var sql strings.Builder
+	writePrimaryKeyUpsertPrefix(&sql, relation)
+	sql.WriteString(" VALUES ($1,$2,$3,$4)")
+	appendPrimaryKeyConflictClause(&sql, relation)
+	want := `INSERT INTO "public"."read_state" ("app_pk","user_id","channel_cid","last_read")` +
+		` VALUES ($1,$2,$3,$4) ON CONFLICT ("app_pk","user_id","channel_cid")` +
+		` DO UPDATE SET "last_read"=EXCLUDED."last_read"`
+	if got := sql.String(); got != want {
+		t.Fatalf("primary-key upsert = %q, want %q", got, want)
+	}
+	if strings.Contains(sql.String(), "ctid") || strings.Contains(sql.String(), " FROM ") {
+		t.Fatalf("primary-key upsert contains a lookup join: %q", sql.String())
+	}
+}
+
+func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		quoted:       `"shard_schema"."messages"`,
+		capabilities: targetRelationCapabilities{primaryKeyArbiter: true, keyedSetDML: true},
+		columns: []targetColumn{
+			{name: "id", quoted: `"id"`, sourceIndex: 0, key: true, primary: true, primaryPos: 2},
+			{name: "app_pk", quoted: `"app_pk"`, sourceIndex: 1, key: true, primary: true, primaryPos: 1},
+		},
+	}
+	primary, safe := primaryKeyDeleteColumns(relation)
+	if !safe {
+		t.Fatal("complete source primary key was not eligible for exact delete")
+	}
+	if got := []string{primary[0].name, primary[1].name}; !slices.Equal(got, []string{"app_pk", "id"}) {
+		t.Fatalf("delete primary key order = %v, want [app_pk id]", got)
+	}
+	var sql strings.Builder
+	writeDeleteIdentityPredicate(&sql, relation, primary, "identity_", 0)
+	want := `pgmigrate_target.ctid=(SELECT pgmigrate_lookup.ctid FROM "shard_schema"."messages" AS pgmigrate_lookup ` +
+		`WHERE pgmigrate_lookup."app_pk"=pgmigrate_batch.identity_0 AND ` +
+		`pgmigrate_lookup."id"=pgmigrate_batch.identity_1 OFFSET 0)`
+	if got := sql.String(); got != want {
+		t.Fatalf("delete predicate = %q, want forced target primary key %q", got, want)
+	}
+
+	relation.columns[1].key = false
+	if _, safe := primaryKeyDeleteColumns(relation); safe {
+		t.Fatal("delete used a target primary key absent from the old pgoutput tuple")
+	}
+}
+
+func TestPrimaryKeyUpsertRequiresCompleteStableRow(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		source:       Relation{Columns: []Column{{Name: "id"}, {Name: "body"}}},
+		capabilities: targetRelationCapabilities{primaryKeyArbiter: true, keyedSetDML: true},
+		columns: []targetColumn{
+			{name: "id", sourceIndex: 0, primary: true},
+			{name: "body", sourceIndex: 1},
+		},
+	}
+	oldTuple := Tuple{{Kind: DatumText, Data: []byte("7")}, {Kind: DatumNull}}
+	complete := Tuple{{Kind: DatumText, Data: []byte("7")}, {Kind: DatumText, Data: []byte("new")}}
+	if !canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &complete}) {
+		t.Fatal("complete update with an unchanged primary key did not use the upsert path")
+	}
+
+	toasted := append(Tuple(nil), complete...)
+	toasted[1] = TupleDatum{Kind: DatumUnchangedToast}
+	if canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &toasted}) {
+		t.Fatal("unchanged TOAST value used the full-row upsert path")
+	}
+
+	changedKey := append(Tuple(nil), complete...)
+	changedKey[0] = TupleDatum{Kind: DatumText, Data: []byte("8")}
+	if canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &changedKey}) {
+		t.Fatal("primary-key-changing update used the conflict-upsert path")
+	}
+
+	relation.capabilities.primaryKeyArbiter = false
+	if canPrimaryKeyUpsert(relation, &Change{Old: &oldTuple, New: &complete}) {
+		t.Fatal("deferrable primary key used the conflict-upsert path")
+	}
+	if !canPrimaryKeyUpsertV2(relation, &Change{Old: &oldTuple, New: &complete}) {
+		t.Fatal("plan-v2 reconstruction no longer preserves its legacy lane admission")
 	}
 }
 

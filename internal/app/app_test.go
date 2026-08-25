@@ -11,10 +11,12 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GetStream/pgmigrate/internal/cdc"
 	"github.com/GetStream/pgmigrate/internal/config"
 	"github.com/GetStream/pgmigrate/internal/copy"
+	"github.com/GetStream/pgmigrate/internal/postgres"
 	"github.com/GetStream/pgmigrate/internal/preflight"
 	"github.com/GetStream/pgmigrate/internal/schema"
 	"github.com/GetStream/pgmigrate/internal/state"
@@ -292,6 +294,51 @@ func TestFailureSignatureGroupsRetriesOfTheSameCause(t *testing.T) {
 	}
 }
 
+func TestTargetProgressPassesFailureOnlyMonotonically(t *testing.T) {
+	t.Parallel()
+	baseline := postgres.ReplicationProgress{
+		RemoteLSN: 10, Transactions: 20, Rows: 30,
+	}
+	tests := map[string]struct {
+		current postgres.ReplicationProgress
+		passed  bool
+		err     bool
+	}{
+		"equal baseline": {
+			current: baseline,
+		},
+		"row-neutral transaction advanced": {
+			current: postgres.ReplicationProgress{RemoteLSN: 11, Transactions: 21, Rows: 30},
+			passed:  true,
+		},
+		"only remote LSN advanced": {
+			current: postgres.ReplicationProgress{RemoteLSN: 11, Transactions: 20, Rows: 30},
+			passed:  true,
+		},
+		"remote LSN regressed": {
+			current: postgres.ReplicationProgress{RemoteLSN: 9, Transactions: 21, Rows: 31},
+			err:     true,
+		},
+		"transaction count regressed": {
+			current: postgres.ReplicationProgress{RemoteLSN: 11, Transactions: 19, Rows: 31},
+			err:     true,
+		},
+		"row count regressed": {
+			current: postgres.ReplicationProgress{RemoteLSN: 11, Transactions: 21, Rows: 29},
+			err:     true,
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			passed, err := targetProgressPassedFailure(baseline, test.current)
+			if (err != nil) != test.err || passed != test.passed {
+				t.Fatalf("passed=%t err=%v, want passed=%t err=%t", passed, err, test.passed, test.err)
+			}
+		})
+	}
+}
+
 func TestStreamGenerationAndBinaryModeAreStable(t *testing.T) {
 	first := streamGeneration("source", "filter")
 	if first == "" || first != streamGeneration("source", "filter") {
@@ -310,6 +357,54 @@ func TestStreamGenerationAndBinaryModeAreStable(t *testing.T) {
 	custom := []copy.Table{{Columns: []copy.Column{{TypeOID: 16384}}}}
 	if cdcBinaryMode(custom, 17, 17) {
 		t.Fatal("custom type selected binary CDC")
+	}
+}
+
+func TestFormatCDCRecoveryProgress(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		progress cdc.RecoveryProgress
+		want     string
+	}{
+		{
+			name: "measuring",
+			progress: cdc.RecoveryProgress{
+				FilesTotal: 4, BytesTotal: 4 << 30,
+			},
+			want: "CDC recovery: 0/4 files checked · 0 B/4.0 GiB scanned · 0.0 MiB/s · ETA measuring",
+		},
+		{
+			name: "rate and ETA",
+			progress: cdc.RecoveryProgress{
+				FilesChecked: 2, FilesTotal: 4,
+				BytesScanned: 2 << 30, BytesTotal: 4 << 30, Elapsed: 2 * time.Second,
+			},
+			want: "CDC recovery: 2/4 files checked · 2.0 GiB/4.0 GiB scanned · 1024.0 MiB/s · ETA 2s",
+		},
+		{
+			name: "complete",
+			progress: cdc.RecoveryProgress{
+				FilesChecked: 4, FilesTotal: 4,
+				BytesScanned: 4 << 30, BytesTotal: 4 << 30, Elapsed: 4 * time.Second,
+			},
+			want: "CDC recovery: 4/4 files checked · 4.0 GiB/4.0 GiB scanned · 1024.0 MiB/s · ETA 0s",
+		},
+		{
+			name: "repaired tail is explicit",
+			progress: cdc.RecoveryProgress{
+				FilesChecked: 1, FilesTotal: 1,
+				BytesScanned: 8, BytesTotal: 1024, BytesTruncated: 1016, Elapsed: time.Second,
+			},
+			want: "CDC recovery: 1/1 files checked · 8 B/1024 B scanned · 1016 B invalid tail repaired · 0.0 MiB/s · ETA 0s",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := formatCDCRecoveryProgress(test.progress); got != test.want {
+				t.Fatalf("formatCDCRecoveryProgress() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }
 
@@ -392,4 +487,55 @@ func TestSequencesRejectsNegativeOffset(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "must not be negative") {
 		t.Errorf("Sequences with a negative offset = %v, want a negative-offset error", err)
 	}
+}
+
+func TestResolveSupersededIndexFinding(t *testing.T) {
+	ctx := context.Background()
+	open := func(t *testing.T) *state.Store {
+		t.Helper()
+		store, err := state.Open(ctx, t.TempDir(), state.Fingerprints{Source: "source", Filter: "filter"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = store.Close() })
+		if err := store.UpsertFinding(ctx, state.Finding{
+			ID: cdcDivergenceFindingID, Kind: "divergence", Severity: "error", Message: "old divergence",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return store
+	}
+
+	t.Run("orphan at indexes is superseded", func(t *testing.T) {
+		store := open(t)
+		if err := resolveSupersededIndexFinding(ctx, store, state.Migration{Phase: state.PhaseIndexes}); err != nil {
+			t.Fatal(err)
+		}
+		if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 0 {
+			t.Fatalf("pending findings = %#v, err = %v", findings, err)
+		}
+	})
+
+	t.Run("current failure remains", func(t *testing.T) {
+		store := open(t)
+		if err := store.RecordFailedAttempt(ctx, state.PhaseIndexes, "error:test", "current failure"); err != nil {
+			t.Fatal(err)
+		}
+		if err := resolveSupersededIndexFinding(ctx, store, state.Migration{Phase: state.PhaseIndexes}); err != nil {
+			t.Fatal(err)
+		}
+		if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+			t.Fatalf("pending findings = %#v, err = %v", findings, err)
+		}
+	})
+
+	t.Run("catchup finding is never inferred stale", func(t *testing.T) {
+		store := open(t)
+		if err := resolveSupersededIndexFinding(ctx, store, state.Migration{Phase: state.PhaseCatchup}); err != nil {
+			t.Fatal(err)
+		}
+		if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+			t.Fatalf("pending findings = %#v, err = %v", findings, err)
+		}
+	})
 }

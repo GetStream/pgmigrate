@@ -208,6 +208,118 @@ func TestOpenRefusesNewerStateDirectory(t *testing.T) {
 	}
 }
 
+func TestOpenWaitsForConcurrentSQLiteStartupWriter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	initial, err := Open(ctx, dir, testFingerprints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// This connection deliberately bypasses sqliteDSN and holds SQLite's writer
+	// lock across the next Open. It models a controller or prior writer finishing
+	// one transaction at the same instant a crashed run restarts.
+	blocker, err := sql.Open("sqlite", filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blocker.Close()
+	blocker.SetMaxOpenConns(1)
+	conn, err := blocker.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.ExecContext(ctx, "BEGIN EXCLUSIVE"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.ExecContext(ctx, "UPDATE migration SET updated_at = updated_at WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+
+	released := make(chan error, 1)
+	ready := make(chan struct{})
+	go func() {
+		close(ready)
+		timer := time.NewTimer(200 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			_, err := conn.ExecContext(ctx, "COMMIT")
+			released <- err
+		case <-ctx.Done():
+			released <- ctx.Err()
+		}
+	}()
+	<-ready
+	started := time.Now()
+	resumed, openErr := Open(ctx, dir, testFingerprints)
+	waited := time.Since(started)
+	if err := <-released; err != nil {
+		t.Fatalf("release startup writer: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := blocker.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if openErr != nil {
+		t.Fatalf("Open() after startup writer released its lock: %v", openErr)
+	}
+	if waited < 100*time.Millisecond {
+		_ = resumed.Close()
+		t.Fatalf("Open() waited only %s for a writer held for 200ms", waited)
+	}
+	if err := resumed.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSQLiteDSNInstallsBusyTimeoutOnFirstConnection(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	initial, err := Open(ctx, dir, testFingerprints)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := initial.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, readOnly := range []bool{false, true} {
+		name := "read-write"
+		if readOnly {
+			name = "read-only"
+		}
+		t.Run(name, func(t *testing.T) {
+			dsn, err := sqliteDSN(filepath.Join(dir, "state.db"), readOnly)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, err := sql.Open("sqlite", dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.PingContext(ctx); err != nil {
+				t.Fatal(err)
+			}
+			var timeout int
+			if err := db.QueryRowContext(ctx, "PRAGMA busy_timeout").Scan(&timeout); err != nil {
+				t.Fatal(err)
+			}
+			if timeout != 5000 {
+				t.Fatalf("busy_timeout = %d, want 5000", timeout)
+			}
+		})
+	}
+}
+
 func openTestDB(t *testing.T, dir string) (*sql.DB, error) {
 	t.Helper()
 	db, err := sql.Open("sqlite", filepath.Join(dir, "state.db"))
@@ -384,8 +496,9 @@ func TestPersistenceProgressAndIdempotency(t *testing.T) {
 			t.Errorf("%s completion = %t, %v; want true, nil", check.name, done, err)
 		}
 	}
+	applyUpdatedAt := time.Date(2026, time.August, 21, 12, 34, 56, 789, time.UTC)
 	if err := store.UpdateApplyProgress(ctx, ApplyProgress{
-		StagedLSN: "1/C", AppliedLSN: "1/B", Txns: 7, Rows: 23,
+		StagedLSN: "1/C", AppliedLSN: "1/B", Txns: 7, Rows: 23, UpdatedAt: applyUpdatedAt,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +544,7 @@ func TestPersistenceProgressAndIdempotency(t *testing.T) {
 		t.Errorf("unexpected persisted counts: %#v", status)
 	}
 	if status.Apply.AppliedLSN != "1/B" || status.Apply.StagedLSN != "1/C" ||
-		status.Apply.Txns != 7 || status.Apply.Rows != 23 {
+		status.Apply.Txns != 7 || status.Apply.Rows != 23 || !status.Apply.UpdatedAt.Equal(applyUpdatedAt) {
 		t.Errorf("unexpected persisted apply progress: %#v", status.Apply)
 	}
 	if status.OpenFindings != 0 || status.CompletedSteps != 1 {
@@ -546,6 +659,68 @@ func TestFailedAttemptCountsOnlyConsecutiveIdenticalFailures(t *testing.T) {
 	}
 	if attempt, err = reopened.FailedAttempt(ctx); err != nil || attempt.Consecutive != 0 {
 		t.Fatalf("cleared attempt = %#v err = %v", attempt, err)
+	}
+}
+
+func TestResolveFailedAttemptDoesNotHideALaterFailure(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t, t.TempDir())
+	const findingID = "cdc-divergence"
+	record := func() {
+		t.Helper()
+		if err := store.UpsertFinding(ctx, Finding{
+			ID: findingID, Kind: "divergence", Severity: "error", Message: "replay diverged",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordFailedAttempt(
+			ctx, PhaseCatchup, "error:divergence", "replay diverged",
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	record()
+	baseline, err := store.FailedAttempt(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A recurrence before the old baseline is resolved is a newer failure and
+	// must not be erased by progress belonging to the resumed attempt.
+	record()
+	cleared, err := store.ResolveFailedAttempt(ctx, baseline, findingID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleared {
+		t.Fatal("stale failure baseline cleared a later recurrence")
+	}
+	current, err := store.FailedAttempt(ctx)
+	if err != nil || current.Consecutive != 2 {
+		t.Fatalf("later failure=%#v err=%v, want consecutive=2", current, err)
+	}
+	if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+		t.Fatalf("pending divergence after stale clear=%#v err=%v", findings, err)
+	}
+
+	cleared, err = store.ResolveFailedAttempt(ctx, current, findingID)
+	if err != nil || !cleared {
+		t.Fatalf("current failure cleared=%t err=%v", cleared, err)
+	}
+	if attempt, err := store.FailedAttempt(ctx); err != nil || attempt.Consecutive != 0 {
+		t.Fatalf("resolved failure=%#v err=%v", attempt, err)
+	}
+	if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 0 {
+		t.Fatalf("resolved divergence remains pending=%#v err=%v", findings, err)
+	}
+
+	// A recurrence after proven progress is a new blocker, not historical state.
+	record()
+	if attempt, err := store.FailedAttempt(ctx); err != nil || attempt.Consecutive != 1 {
+		t.Fatalf("new failure=%#v err=%v, want consecutive=1", attempt, err)
+	}
+	if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+		t.Fatalf("new divergence blocker=%#v err=%v", findings, err)
 	}
 }
 

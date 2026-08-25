@@ -12,13 +12,42 @@ import (
 // supported recovery for setup/schema/copy after the exporting process dies;
 // callers must first remove the old source and target objects.
 func (s *Store) ResetBaseCopy(ctx context.Context) error {
+	return s.resetSnapshotState(ctx, false, nil, func(phase Phase) error {
+		if phaseOrder[phase] > phaseOrder[PhaseCopy] {
+			return fmt.Errorf("base-copy reset is only allowed through copy phase (current %s)", phase)
+		}
+		return nil
+	})
+}
+
+// ResetForFreshSnapshot forgets all state derived from a completed base-copy
+// snapshot after the caller has independently proved that its logical stream
+// is unrecoverable and removed the migration-owned source and target objects.
+// It deliberately excludes drained, cutover, and complete migrations.
+func (s *Store) ResetForFreshSnapshot(ctx context.Context, resolvedFindingIDs ...string) error {
+	return s.resetSnapshotState(ctx, true, resolvedFindingIDs, func(phase Phase) error {
+		switch phase {
+		case PhaseIndexes, PhaseCatchup, PhaseFollow:
+			return nil
+		default:
+			return fmt.Errorf("fresh-snapshot reset is unavailable in %s phase", phase)
+		}
+	})
+}
+
+func (s *Store) resetSnapshotState(
+	ctx context.Context,
+	clearFailure bool,
+	resolvedFindingIDs []string,
+	validate func(Phase) error,
+) error {
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var phase Phase
 		if err := tx.QueryRowContext(ctx, "SELECT phase FROM migration WHERE id=1").Scan(&phase); err != nil {
 			return fmt.Errorf("read reset phase: %w", err)
 		}
-		if phaseOrder[phase] > phaseOrder[PhaseCopy] {
-			return fmt.Errorf("base-copy reset is only allowed through copy phase (current %s)", phase)
+		if err := validate(phase); err != nil {
+			return err
 		}
 		for _, statement := range []string{
 			"DELETE FROM verify_tables", "DELETE FROM constraints", "DELETE FROM indexes",
@@ -29,6 +58,21 @@ func (s *Store) ResetBaseCopy(ctx context.Context) error {
 		} {
 			if _, err := tx.ExecContext(ctx, statement); err != nil {
 				return fmt.Errorf("reset base-copy state: %w", err)
+			}
+		}
+		if clearFailure {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM failed_attempt"); err != nil {
+				return fmt.Errorf("clear superseded failed attempt: %w", err)
+			}
+		}
+		for _, id := range resolvedFindingIDs {
+			if id == "" {
+				continue
+			}
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE findings SET resolved=1, resolved_at=?
+				WHERE id=? AND resolved=0`, time.Now().UTC().UnixNano(), id); err != nil {
+				return fmt.Errorf("resolve superseded finding %s: %w", id, err)
 			}
 		}
 		return nil
@@ -92,6 +136,51 @@ func (s *Store) ClearFailedAttempt(ctx context.Context) error {
 		}
 		return nil
 	})
+}
+
+// ResolveFailedAttempt clears attempt only if it is still the failure the
+// caller observed, and resolves findingID in the same transaction. A later
+// failure must remain visible even if an older run subsequently reports
+// progress from another goroutine or process.
+func (s *Store) ResolveFailedAttempt(
+	ctx context.Context,
+	attempt FailedAttempt,
+	findingID string,
+) (bool, error) {
+	if attempt.Consecutive <= 0 {
+		return false, nil
+	}
+	cleared := false
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `
+			DELETE FROM failed_attempt
+			WHERE id=1 AND phase=? AND signature=? AND detail=?
+			  AND consecutive=? AND observed_at=?`,
+			attempt.Phase, attempt.Signature, attempt.Detail,
+			attempt.Consecutive, unixNano(attempt.ObservedAt),
+		)
+		if err != nil {
+			return fmt.Errorf("resolve failed attempt: %w", err)
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect failed attempt resolution: %w", err)
+		}
+		if rows == 0 {
+			return nil
+		}
+		if findingID != "" {
+			if _, err := tx.ExecContext(ctx, `
+				UPDATE findings SET resolved=1,
+					resolved_at=CASE WHEN resolved=0 THEN ? ELSE resolved_at END
+				WHERE id=?`, time.Now().UTC().UnixNano(), findingID); err != nil {
+				return fmt.Errorf("resolve finding %s with failed attempt: %w", findingID, err)
+			}
+		}
+		cleared = true
+		return nil
+	})
+	return cleared, err
 }
 
 // SetTargetCleanupRequested durably coordinates final target metadata cleanup
@@ -485,6 +574,10 @@ func (s *Store) completed(ctx context.Context, table, key string, value any) (bo
 
 // UpdateApplyProgress replaces the status copy of target-origin progress.
 func (s *Store) UpdateApplyProgress(ctx context.Context, progress ApplyProgress) error {
+	updatedAt := progress.UpdatedAt
+	if updatedAt.IsZero() {
+		updatedAt = time.Now().UTC()
+	}
 	return s.write(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(
 			ctx, `
@@ -494,7 +587,7 @@ func (s *Store) UpdateApplyProgress(ctx context.Context, progress ApplyProgress)
 				applied_lsn=excluded.applied_lsn, txns=excluded.txns,
 				rows_applied=excluded.rows_applied, updated_at=excluded.updated_at`,
 			progress.StagedLSN, progress.AppliedLSN, progress.Txns, progress.Rows,
-			time.Now().UTC().UnixNano(),
+			updatedAt.UTC().UnixNano(),
 		)
 		if err != nil {
 			return fmt.Errorf("update apply progress: %w", err)

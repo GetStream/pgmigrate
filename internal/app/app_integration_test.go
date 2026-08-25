@@ -4,10 +4,14 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GetStream/pgmigrate/internal/cdc"
 	"github.com/GetStream/pgmigrate/internal/config"
@@ -67,6 +71,114 @@ func TestPG17TargetIdentityRejectsWrongEndpoints(t *testing.T) {
 	}
 }
 
+func TestPG17ResumeClearsFailureOnlyAfterDurableTargetProgress(t *testing.T) {
+	ctx := context.Background()
+	target := pgtest.Start(t, 17)
+	const streamID = "resume-failure-progress"
+	const generation = "resume-failure-progress-v1"
+	if err := initializeTargetProgress(ctx, target.URI, streamID, generation); err != nil {
+		t.Fatal(err)
+	}
+	targetConn := target.Connect(t)
+	if _, err := targetConn.Exec(ctx, `
+		UPDATE pgmigrate_internal.replication_progress
+		SET remote_lsn='0/10', transactions_applied=5, rows_applied=7,
+		    updated_at=clock_timestamp()
+		WHERE stream_id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+
+	dir := t.TempDir()
+	store, err := state.Open(ctx, dir, state.Fingerprints{Source: "source", Filter: "filter"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	recordDivergence := func() {
+		t.Helper()
+		if err := store.UpsertFinding(ctx, state.Finding{
+			ID: cdcDivergenceFindingID, Kind: "divergence", Severity: "error",
+			Message: "selective update value arrays unsupported",
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordFailedAttempt(
+			ctx, state.PhaseCatchup, "error:divergence", "selective update value arrays unsupported",
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recordDivergence()
+	baseline, err := captureFailedAttemptProgress(ctx, store, target.URI, streamID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if baseline == nil || baseline.progress.RemoteLSN != 0x10 ||
+		baseline.progress.Transactions != 5 || baseline.progress.Rows != 7 {
+		t.Fatalf("resume failure baseline=%#v", baseline)
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	durable := &cdc.DurableWatermark{}
+	durable.Publish(0x20)
+	monitorErr := make(chan error, 1)
+	go func() {
+		monitorErr <- monitorProgress(
+			runCtx, store, target.URI, streamID, durable, dir, baseline,
+		)
+	}()
+	waitFor := func(description string, condition func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if condition() {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", description)
+	}
+	waitFor("equal baseline observation", func() bool {
+		snapshot, err := store.Snapshot(ctx)
+		return err == nil && snapshot.Apply.AppliedLSN == "0/10"
+	})
+	if attempt, err := store.FailedAttempt(ctx); err != nil || attempt.Consecutive != 1 {
+		t.Fatalf("equal baseline failure=%#v err=%v", attempt, err)
+	}
+	if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+		t.Fatalf("equal baseline findings=%#v err=%v", findings, err)
+	}
+
+	// A transaction may be row-neutral. LSN and transaction progress, with no
+	// counter regression, still proves the resumed run passed the old failure.
+	if _, err := targetConn.Exec(ctx, `
+		UPDATE pgmigrate_internal.replication_progress
+		SET remote_lsn='0/20', transactions_applied=6, rows_applied=7,
+		    updated_at=clock_timestamp()
+		WHERE stream_id=$1`, streamID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor("failure resolution after durable progress", func() bool {
+		attempt, attemptErr := store.FailedAttempt(ctx)
+		findings, findingsErr := store.PendingFindings(ctx)
+		return attemptErr == nil && findingsErr == nil &&
+			attempt.Consecutive == 0 && len(findings) == 0
+	})
+	cancel()
+	if err := <-monitorErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("monitor exit=%v, want cancellation", err)
+	}
+
+	// The same divergence recurring after proven progress is a new blocker.
+	recordDivergence()
+	if attempt, err := store.FailedAttempt(ctx); err != nil || attempt.Consecutive != 1 {
+		t.Fatalf("recurrent failure=%#v err=%v", attempt, err)
+	}
+	if findings, err := store.PendingFindings(ctx); err != nil || len(findings) != 1 {
+		t.Fatalf("recurrent divergence=%#v err=%v", findings, err)
+	}
+}
+
 func TestPG17BaseRestartRecoversSetupObjectsBeforeSnapshotMetadata(t *testing.T) {
 	ctx := context.Background()
 	source := pgtest.Start(t, 17)
@@ -117,6 +229,157 @@ func TestPG17BaseRestartRecoversSetupObjectsBeforeSnapshotMetadata(t *testing.T)
 	}
 	if artifacts != 0 {
 		t.Fatalf("stale setup artifacts remaining = %d", artifacts)
+	}
+}
+
+func TestPG17FreshSnapshotRestartRequiresAndCleansOnlyMissingSlotRun(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		name := "healthy_slot_is_refused"
+		if missing {
+			name = "missing_slot_is_reset"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			source := pgtest.Start(t, 17)
+			target := pgtest.Start(t, 17)
+			sourceConn := source.Connect(t)
+			targetConn := target.Connect(t)
+			if _, err := sourceConn.Exec(ctx, "CREATE TABLE public.restart_item (id bigint PRIMARY KEY)"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := targetConn.Exec(ctx, "CREATE TABLE public.restart_item (id bigint PRIMARY KEY)"); err != nil {
+				t.Fatal(err)
+			}
+			var tableOID uint32
+			if err := sourceConn.QueryRow(ctx, "SELECT 'public.restart_item'::regclass::oid").Scan(&tableOID); err != nil {
+				t.Fatal(err)
+			}
+			dir := t.TempDir()
+			filter, err := loadFilter("")
+			if err != nil {
+				t.Fatal(err)
+			}
+			fingerprint, err := sourceFingerprint(ctx, source.URI)
+			if err != nil {
+				t.Fatal(err)
+			}
+			publication, slot := setup.Names(fingerprint, migrationID(dir))
+			if _, err := sourceConn.Exec(ctx, "CREATE PUBLICATION "+pgx.Identifier{publication}.Sanitize()+" FOR TABLE public.restart_item"); err != nil {
+				t.Fatal(err)
+			}
+			var createdSlot, consistentPoint string
+			if err := sourceConn.QueryRow(ctx,
+				"SELECT slot_name, lsn::text FROM pg_catalog.pg_create_logical_replication_slot($1,'pgoutput')", slot,
+			).Scan(&createdSlot, &consistentPoint); err != nil {
+				t.Fatal(err)
+			}
+			if createdSlot != slot {
+				t.Fatalf("created slot = %q, want %q", createdSlot, slot)
+			}
+			store, err := state.Open(ctx, dir, state.Fingerprints{Source: fingerprint, Filter: filter.Fingerprint()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.SetSnapshot(ctx, slot, "old_snapshot", consistentPoint); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.UpsertTable(ctx, state.Table{OID: tableOID, Schema: "public", Name: "restart_item"}); err != nil {
+				t.Fatal(err)
+			}
+			for _, phase := range []state.Phase{state.PhaseSetup, state.PhaseSchema, state.PhaseCopy, state.PhaseIndexes, state.PhaseCatchup} {
+				if err := store.TransitionPhase(ctx, phase); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := setup.Snapshot{
+				SourceFingerprint: fingerprint,
+				Publication:       publication,
+				Slot:              slot,
+				Name:              "old_snapshot",
+				ConsistentPoint:   consistentPoint,
+				CreatedAt:         time.Now().UTC(),
+			}
+			data, err := json.Marshal(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "snapshot.json"), data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			for _, path := range []string{filepath.Join(dir, "dump", "stale.tmp"), filepath.Join(dir, "cdc", "stale.segment")} {
+				if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("stale"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if missing {
+				if _, err := sourceConn.Exec(ctx, "SELECT pg_catalog.pg_drop_replication_slot($1)", slot); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sourceConn.Exec(ctx, "DROP PUBLICATION "+pgx.Identifier{publication}.Sanitize()); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(filepath.Join(dir, "snapshot.json")); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			err = prepareFreshSnapshotRestart(ctx, config.Config{Source: source.URI, Target: target.URI, Dir: dir})
+			if !missing {
+				if err == nil || !strings.Contains(err.Error(), "slot is reusable") {
+					t.Fatalf("healthy-slot restart error = %v, want refusal", err)
+				}
+				check, openErr := state.OpenReadOnly(ctx, dir)
+				if openErr != nil {
+					t.Fatal(openErr)
+				}
+				migration, migrationErr := check.Migration(ctx)
+				check.Close()
+				if migrationErr != nil || migration.Phase != state.PhaseCatchup {
+					t.Fatalf("healthy-slot state = %#v, error = %v", migration, migrationErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			check, err := state.OpenReadOnly(ctx, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			migration, err := check.Migration(ctx)
+			check.Close()
+			if err != nil || migration.Phase != state.PhasePreflight || migration.SlotName != "" {
+				t.Fatalf("reset state = %#v, error = %v", migration, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, "snapshot.json")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("snapshot metadata survived reset: %v", err)
+			}
+			for _, path := range []string{filepath.Join(dir, "dump"), filepath.Join(dir, "cdc")} {
+				entries, err := os.ReadDir(path)
+				if err != nil || len(entries) != 0 {
+					t.Fatalf("reset directory %s entries=%v error=%v", path, entries, err)
+				}
+			}
+			var sourceArtifacts, targetTables int
+			if err := sourceConn.QueryRow(ctx, `
+				SELECT (SELECT count(*) FROM pg_catalog.pg_publication WHERE pubname=$1) +
+				       (SELECT count(*) FROM pg_catalog.pg_replication_slots WHERE slot_name=$2)`,
+				publication, slot).Scan(&sourceArtifacts); err != nil {
+				t.Fatal(err)
+			}
+			if err := targetConn.QueryRow(ctx, "SELECT count(*) FROM pg_catalog.pg_class WHERE oid=to_regclass('public.restart_item')").Scan(&targetTables); err != nil {
+				t.Fatal(err)
+			}
+			if sourceArtifacts != 0 || targetTables != 0 {
+				t.Fatalf("reset left source artifacts=%d target tables=%d", sourceArtifacts, targetTables)
+			}
+		})
 	}
 }
 

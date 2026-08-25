@@ -38,6 +38,8 @@ import (
 
 var errComplete = errors.New("migration complete")
 
+const cdcDivergenceFindingID = "cdc-divergence"
+
 type App struct {
 	Out io.Writer
 	// Progress receives human-readable progress, separately from Out so a machine
@@ -238,6 +240,51 @@ func cdcBinaryMode(tables []pgcopy.Table, sourceMajor, targetMajor int) bool {
 	return cdc.PGOutputBinarySafe(relations)
 }
 
+func cdcRecoveryProgress(output io.Writer) func(cdc.RecoveryProgress) {
+	return func(progress cdc.RecoveryProgress) {
+		_, _ = fmt.Fprintln(output, formatCDCRecoveryProgress(progress))
+	}
+}
+
+func formatCDCRecoveryProgress(progress cdc.RecoveryProgress) string {
+	rate := float64(0)
+	if progress.Elapsed > 0 {
+		rate = float64(progress.BytesScanned) / progress.Elapsed.Seconds()
+	}
+	eta := "measuring"
+	remaining := progress.BytesTotal - progress.BytesScanned
+	if progress.FilesChecked == progress.FilesTotal {
+		eta = "0s"
+	} else if rate > 0 && remaining > 0 {
+		etaDuration := time.Duration(float64(remaining) / rate * float64(time.Second))
+		eta = etaDuration.Round(time.Second).String()
+	}
+	repair := ""
+	if progress.BytesTruncated > 0 {
+		repair = fmt.Sprintf(" · %s invalid tail repaired", formatCDCRecoveryBytes(progress.BytesTruncated))
+	}
+	return fmt.Sprintf(
+		"CDC recovery: %d/%d files checked · %s/%s scanned%s · %.1f MiB/s · ETA %s",
+		progress.FilesChecked,
+		progress.FilesTotal,
+		formatCDCRecoveryBytes(progress.BytesScanned),
+		formatCDCRecoveryBytes(progress.BytesTotal),
+		repair,
+		rate/float64(1<<20),
+		eta,
+	)
+}
+
+func formatCDCRecoveryBytes(bytes int64) string {
+	if bytes < 1<<20 {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	if bytes >= 1<<30 {
+		return fmt.Sprintf("%.1f GiB", float64(bytes)/float64(1<<30))
+	}
+	return fmt.Sprintf("%.1f MiB", float64(bytes)/float64(1<<20))
+}
+
 func persistCDCBinaryMode(ctx context.Context, store *state.Store, binary bool) error {
 	return store.CompleteStep(ctx, "cdc.binary", strconv.FormatBool(binary))
 }
@@ -384,7 +431,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	if hadState && (migration.Phase == state.PhaseIndexes || migration.Phase == state.PhaseCatchup ||
 		migration.Phase == state.PhaseFollow || migration.Phase == state.PhaseDrained ||
 		migration.Phase == state.PhaseCutover) {
-		return a.resumePostCopy(ctx, cfg, store, migration)
+		return a.resumePostCopy(ctx, cfg, store, migration, tables)
 	}
 	if migration.Phase == state.PhaseSetup || migration.Phase == state.PhaseSchema || migration.Phase == state.PhaseCopy {
 		if err := guardRepeatedBaseCopyFailure(ctx, cfg, store, migration); err != nil {
@@ -455,7 +502,10 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	}
 
 	cdcDir := filepath.Join(cfg.Dir, "cdc")
-	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{Directory: cdcDir})
+	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{
+		Directory:        cdcDir,
+		RecoveryProgress: cdcRecoveryProgress(a.progressOutput()),
+	})
 	if err != nil {
 		return err
 	}
@@ -487,14 +537,22 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	group.Go(func() error { return runReceiverContinuous(groupCtx, receiver, store) })
 	group.Go(func() error { return persister.Run(groupCtx) })
 	group.Go(func() error {
-		return monitorProgress(groupCtx, store, cfg.Target, holder.Snapshot.Slot, durable, cfg.Dir)
+		return monitorProgress(groupCtx, store, cfg.Target, holder.Snapshot.Slot, durable, cfg.Dir, nil)
 	})
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, holder.Snapshot.Slot) })
+	watchCtx, stopSnapshotWatch := context.WithCancel(groupCtx)
+	defer stopSnapshotWatch()
 	group.Go(func() error {
-		watchCtx, stopWatch := context.WithCancel(groupCtx)
-		defer stopWatch()
-		watch := holder.Watchdog(watchCtx, time.Second)
-
+		err := <-holder.Watchdog(watchCtx, time.Second)
+		if errors.Is(err, context.Canceled) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("source snapshot holder lost; base copy must restart from a fresh snapshot: %w", err)
+		}
+		return nil
+	})
+	group.Go(func() error {
 		if err := transition(groupCtx, cfg, store, state.PhaseSchema); err != nil {
 			return err
 		}
@@ -549,16 +607,9 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		if err := runner.Run(groupCtx, parts); err != nil {
 			return err
 		}
-		stopWatch()
+		stopSnapshotWatch()
 		if err := holder.Close(context.Background()); err != nil {
 			return err
-		}
-		select {
-		case watchErr := <-watch:
-			if watchErr != nil && !errors.Is(watchErr, context.Canceled) {
-				return watchErr
-			}
-		default:
 		}
 
 		if err := transition(groupCtx, cfg, store, state.PhaseIndexes); err != nil {
@@ -637,12 +688,119 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	return err
 }
 
-func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state.Store, migration state.Migration) error {
+// RestartBaseCopy is the explicit lossless recovery path for a post-copy run
+// whose source logical slot has disappeared. It refuses to reset a reusable
+// stream: creating a new slot under an old snapshot would silently skip WAL,
+// while resetting a healthy stream would discard valid durable work.
+func (a App) RestartBaseCopy(ctx context.Context, cfg config.Config) error {
+	if err := prepareFreshSnapshotRestart(ctx, cfg); err != nil {
+		return err
+	}
+	fmt.Fprintln(a.progressOutput(), "fresh-snapshot restart: old pgmigrate-owned stream and target base state removed; starting a new lossless snapshot")
+	return a.Run(ctx, cfg)
+}
+
+func prepareFreshSnapshotRestart(ctx context.Context, cfg config.Config) error {
+	filter, err := loadFilter(cfg.TableFilter)
+	if err != nil {
+		return err
+	}
+	fingerprint, err := sourceFingerprint(ctx, cfg.Source)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(cfg.Dir, "state.db")); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return errors.New("fresh-snapshot restart requires an existing migration")
+		}
+		return fmt.Errorf("inspect durable migration state: %w", err)
+	}
+	store, err := state.Open(ctx, cfg.Dir, state.Fingerprints{Source: fingerprint, Filter: filter.Fingerprint()})
+	if err != nil {
+		return err
+	}
+	migration, err := store.Migration(ctx)
+	if err != nil {
+		store.Close()
+		return err
+	}
+	switch migration.Phase {
+	case state.PhaseIndexes, state.PhaseCatchup, state.PhaseFollow:
+	default:
+		store.Close()
+		return fmt.Errorf("fresh-snapshot restart is unavailable in %s phase", migration.Phase)
+	}
+	recordedTables, err := store.ListTables(ctx)
+	if err != nil {
+		store.Close()
+		return err
+	}
+	if len(recordedTables) == 0 {
+		store.Close()
+		return errors.New("fresh-snapshot restart requires a durable table inventory")
+	}
+	tables := make([]pgcopy.Table, len(recordedTables))
+	for index, table := range recordedTables {
+		tables[index] = pgcopy.Table{
+			OID: table.OID, Schema: table.Schema, Name: table.Name,
+			EstimatedRows: table.EstimatedRows, Bytes: table.Bytes,
+		}
+	}
+	snapshot, err := readSnapshot(cfg.Dir)
+	if errors.Is(err, os.ErrNotExist) {
+		publication, _ := setup.Names(migration.SourceFingerprint, migrationID(cfg.Dir))
+		snapshot = setup.Snapshot{
+			SourceFingerprint: migration.SourceFingerprint,
+			Publication:       publication,
+			Slot:              migration.SlotName,
+			Name:              migration.SnapshotName,
+			ConsistentPoint:   migration.ConsistentPoint,
+		}
+	} else if err != nil {
+		store.Close()
+		return fmt.Errorf("read durable snapshot before restart: %w", err)
+	}
+	resumeErr := setup.ValidateResume(ctx, setup.Config{
+		SourceDSN: cfg.Source,
+		Tables:    toSetup(tables),
+	}, snapshot)
+	if resumeErr == nil {
+		store.Close()
+		return errors.New("source replication slot is reusable; resume the migration instead of restarting the base copy")
+	}
+	if !errors.Is(resumeErr, setup.ErrResumeSlotMissing) &&
+		!errors.Is(resumeErr, setup.ErrResumePublicationMissing) {
+		store.Close()
+		return fmt.Errorf("refuse fresh-snapshot restart without a proven missing source CDC object: %w", resumeErr)
+	}
+	if err := resetInterruptedBaseCopy(ctx, cfg, store, tables, migration); err != nil {
+		store.Close()
+		return fmt.Errorf("restart base copy from a fresh snapshot: %w", err)
+	}
+	if err := store.Close(); err != nil {
+		return fmt.Errorf("close reset migration state: %w", err)
+	}
+	return nil
+}
+
+func (a App) resumePostCopy(
+	ctx context.Context,
+	cfg config.Config,
+	store *state.Store,
+	migration state.Migration,
+	tables []pgcopy.Table,
+) error {
 	if err := validateTargetIdentity(ctx, cfg, store); err != nil {
 		return err
 	}
 	generation := streamGeneration(migration.SourceFingerprint, migration.FilterFingerprint)
 	if err := validateTargetProgress(ctx, cfg.Target, migration.SlotName, generation); err != nil {
+		return err
+	}
+	failureBaseline, err := captureFailedAttemptProgress(
+		ctx, store, cfg.Target, migration.SlotName,
+	)
+	if err != nil {
 		return err
 	}
 	binaryMode, err := loadCDCBinaryMode(ctx, store)
@@ -656,8 +814,20 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 	if snapshot.Slot != migration.SlotName || snapshot.ConsistentPoint != migration.ConsistentPoint {
 		return errors.New("snapshot metadata does not match durable migration state")
 	}
+	if err := setup.ValidateResume(ctx, setup.Config{
+		SourceDSN: cfg.Source,
+		Tables:    toSetup(tables),
+	}, snapshot); err != nil {
+		return fmt.Errorf("validate source CDC stream before local recovery: %w", err)
+	}
+	if err := resolveSupersededIndexFinding(ctx, store, migration); err != nil {
+		return err
+	}
 	cdcDir := filepath.Join(cfg.Dir, "cdc")
-	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{Directory: cdcDir})
+	writer, recovery, err := cdc.OpenWriter(cdc.WriterConfig{
+		Directory:        cdcDir,
+		RecoveryProgress: cdcRecoveryProgress(a.progressOutput()),
+	})
 	if err != nil {
 		return err
 	}
@@ -689,7 +859,11 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error { return runReceiverContinuous(groupCtx, receiver, store) })
 	group.Go(func() error { return persister.Run(groupCtx) })
-	group.Go(func() error { return monitorProgress(groupCtx, store, cfg.Target, snapshot.Slot, durable, cfg.Dir) })
+	group.Go(func() error {
+		return monitorProgress(
+			groupCtx, store, cfg.Target, snapshot.Slot, durable, cfg.Dir, failureBaseline,
+		)
+	})
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, snapshot.Slot) })
 	group.Go(func() error {
 		phase := migration.Phase
@@ -742,6 +916,29 @@ func (a App) resumePostCopy(ctx context.Context, cfg config.Config, store *state
 	}
 	logEvent(cfg.Dir, "error", map[string]any{"error": fmt.Sprint(err)})
 	return err
+}
+
+// A divergence cannot originate in indexes because replay has not started.
+// After a proven fresh-snapshot reset, older binaries cleared the failed
+// attempt on entering indexes but could leave its divergence finding open.
+// Retire that orphan only at this pre-replay boundary and only when no current
+// failure exists; catchup/follow findings still require durable replay progress.
+func resolveSupersededIndexFinding(
+	ctx context.Context,
+	store *state.Store,
+	migration state.Migration,
+) error {
+	if migration.Phase != state.PhaseIndexes {
+		return nil
+	}
+	attempt, err := store.FailedAttempt(ctx)
+	if err != nil {
+		return err
+	}
+	if attempt.Consecutive != 0 {
+		return nil
+	}
+	return store.ResolveFinding(ctx, cdcDivergenceFindingID)
 }
 
 func resumeIndexes(ctx context.Context, cfg config.Config, store *state.Store) error {
@@ -1364,8 +1561,11 @@ func runApplierToFollow(
 		StreamID: snapshot.Slot, StreamGeneration: streamGeneration(
 			migration.SourceFingerprint, migration.FilterFingerprint,
 		), TargetHasCopiedData: true, Durable: durable, EndPosition: endPosition(store),
-		AfterProgress: pruner.OnProgress,
-		Sampler:       samplerOrNil(sampler),
+		AfterProgress:     pruner.OnProgress,
+		Sampler:           samplerOrNil(sampler),
+		ReplayWorkers:     cfg.ReplayWorkers,
+		BatchMaxDataBytes: cfg.ReplayBatchBytes,
+		BatchMaxChanges:   cfg.ReplayBatchChanges,
 	})
 	if err != nil {
 		return err
@@ -1694,7 +1894,7 @@ func recordFailedAttempt(ctx context.Context, out io.Writer, dir string, store *
 	var divergence *cdc.DivergenceError
 	if errors.As(runErr, &divergence) {
 		_ = store.UpsertFinding(context.WithoutCancel(ctx), state.Finding{
-			ID: "cdc-divergence", Kind: "divergence", Severity: "error", Message: detail,
+			ID: cdcDivergenceFindingID, Kind: "divergence", Severity: "error", Message: detail,
 		})
 	}
 	if err := store.RecordFailedAttempt(context.WithoutCancel(ctx), migration.Phase, failureSignature(runErr), detail); err != nil {
@@ -1727,7 +1927,67 @@ func pauseForCrashTest(ctx context.Context, phase state.Phase) error {
 	}
 }
 
-func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamID string, durable *cdc.DurableWatermark, dir string) error {
+type failedAttemptProgress struct {
+	attempt  state.FailedAttempt
+	progress postgres.ReplicationProgress
+}
+
+func captureFailedAttemptProgress(
+	ctx context.Context,
+	store *state.Store,
+	targetDSN string,
+	streamID string,
+) (*failedAttemptProgress, error) {
+	attempt, err := store.FailedAttempt(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if attempt.Consecutive == 0 {
+		return nil, nil
+	}
+	conn, err := postgres.Connect(ctx, targetDSN)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close(context.Background())
+	progress, exists, err := postgres.ReadReplicationProgress(ctx, conn, streamID)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, cdc.ErrMissingTargetProgress
+	}
+	return &failedAttemptProgress{attempt: attempt, progress: progress}, nil
+}
+
+func targetProgressPassedFailure(
+	baseline postgres.ReplicationProgress,
+	current postgres.ReplicationProgress,
+) (bool, error) {
+	if current.RemoteLSN < baseline.RemoteLSN ||
+		current.Transactions < baseline.Transactions ||
+		current.Rows < baseline.Rows {
+		return false, fmt.Errorf(
+			"target replication progress regressed after resume: lsn %s/%s, transactions %d/%d, rows %d/%d",
+			current.RemoteLSN, baseline.RemoteLSN,
+			current.Transactions, baseline.Transactions,
+			current.Rows, baseline.Rows,
+		)
+	}
+	return current.RemoteLSN > baseline.RemoteLSN ||
+		current.Transactions > baseline.Transactions ||
+		current.Rows > baseline.Rows, nil
+}
+
+func monitorProgress(
+	ctx context.Context,
+	store *state.Store,
+	targetDSN string,
+	streamID string,
+	durable *cdc.DurableWatermark,
+	dir string,
+	failureBaseline *failedAttemptProgress,
+) error {
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
 	nextLog := time.Now()
@@ -1736,20 +1996,43 @@ func monitorProgress(ctx context.Context, store *state.Store, targetDSN, streamI
 		if err != nil {
 			return err
 		}
-		applied, _, readErr := postgres.ReadProgress(ctx, conn, streamID)
+		progress, _, readErr := postgres.ReadReplicationProgress(ctx, conn, streamID)
 		conn.Close(context.Background())
 		if readErr != nil {
 			return readErr
 		}
+		passedFailure := false
+		if failureBaseline != nil {
+			passedFailure, err = targetProgressPassedFailure(failureBaseline.progress, progress)
+			if err != nil {
+				return err
+			}
+		}
 		if err := store.UpdateApplyProgress(ctx, state.ApplyProgress{
-			StagedLSN: pglogrepl.LSN(durable.Load()).String(), AppliedLSN: applied.String(),
+			StagedLSN:  pglogrepl.LSN(durable.Load()).String(),
+			AppliedLSN: progress.RemoteLSN.String(),
+			Txns:       progress.Transactions,
+			Rows:       progress.Rows,
+			UpdatedAt:  progress.UpdatedAt,
 		}); err != nil {
 			return err
 		}
+		if failureBaseline != nil && passedFailure {
+			if _, err := store.ResolveFailedAttempt(
+				ctx, failureBaseline.attempt, cdcDivergenceFindingID,
+			); err != nil {
+				return err
+			}
+			// Whether it cleared or found a newer attempt, this baseline has been
+			// consumed and must never act on a later failure.
+			failureBaseline = nil
+		}
 		if !time.Now().Before(nextLog) {
 			logEvent(dir, "progress", map[string]any{
-				"staged_lsn":  pglogrepl.LSN(durable.Load()).String(),
-				"applied_lsn": applied.String(),
+				"staged_lsn":   pglogrepl.LSN(durable.Load()).String(),
+				"applied_lsn":  progress.RemoteLSN.String(),
+				"transactions": progress.Transactions,
+				"rows":         progress.Rows,
 			})
 			nextLog = time.Now().Add(5 * time.Second)
 		}
@@ -1852,15 +2135,6 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 	if err := restoreReplicaIdentities(ctx, cfg.Source, store); err != nil {
 		return err
 	}
-	archive := filepath.Join(cfg.Dir, "dump", "schema.dump")
-	if _, err := os.Stat(archive); err == nil {
-		service := schema.Service{Tools: schema.Tools{Restore: cfg.PGRestorePath}}
-		if err := service.Clean(ctx, cfg.Target, archive); err != nil {
-			return fmt.Errorf("clean prior schema archive: %w", err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
 	schemas := map[string]bool{}
 	for _, table := range tables {
 		schemas[table.Schema] = true
@@ -1881,6 +2155,20 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 		if _, err := target.Exec(ctx, "DROP TABLE "+pgx.Identifier{table.Schema, table.Name}.Sanitize()+" CASCADE"); err != nil {
 			return err
 		}
+	}
+	// pg_restore emits inherited partition constraint drops before its table
+	// drops. PostgreSQL rejects those while the partition still exists, so remove
+	// the already ownership-validated migration tables first. The archive cleanup
+	// then removes the remaining functions, types, comments, and public-schema
+	// objects with IF EXISTS semantics.
+	archive := filepath.Join(cfg.Dir, "dump", "schema.dump")
+	if _, err := os.Stat(archive); err == nil {
+		service := schema.Service{Tools: schema.Tools{Restore: cfg.PGRestorePath}}
+		if err := service.Clean(ctx, cfg.Target, archive); err != nil {
+			return fmt.Errorf("clean prior schema archive: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	for name := range schemas {
 		if name == "public" {
@@ -1913,9 +2201,10 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 		}
 	}
 	_, _ = target.Exec(ctx, "DROP SCHEMA IF EXISTS pgmigrate_internal CASCADE")
-	if err := store.ResetBaseCopy(ctx); err != nil {
-		return err
-	}
+	// Keep the post-copy phase durable until every snapshot-bound file has been
+	// removed and its empty directories recreated. If the pod dies anywhere
+	// before ResetBaseCopy commits, retrying this cleanup is idempotent. Once the
+	// state says preflight, no stale snapshot, dump, or CDC segment can survive.
 	for _, path := range []string{filepath.Join(cfg.Dir, "snapshot.json"), filepath.Join(cfg.Dir, "dump"), filepath.Join(cfg.Dir, "cdc")} {
 		if err := os.RemoveAll(path); err != nil {
 			return err
@@ -1926,7 +2215,10 @@ func resetInterruptedBaseCopy(ctx context.Context, cfg config.Config, store *sta
 			return err
 		}
 	}
-	return nil
+	if migration.Phase == state.PhaseIndexes || migration.Phase == state.PhaseCatchup || migration.Phase == state.PhaseFollow {
+		return store.ResetForFreshSnapshot(ctx, cdcDivergenceFindingID)
+	}
+	return store.ResetBaseCopy(ctx)
 }
 
 func recordTargetIdentity(ctx context.Context, targetDSN, sourceFingerprint, filterFingerprint, streamID, generation string) error {

@@ -68,12 +68,17 @@ instances plus mixed INSERT/UPDATE/DELETE traffic.
 
 ```sh
 make e2e
+make controller-e2e
 ```
 
 The harness builds/runs preflight, waits for `follow`, confirms traffic, freezes
 writes, verifies, cuts over, checks cleanup, and independently compares table
 inventory, exact row counts, and order-independent canonical row digests. It
 does not use pgmigrate's verifier for the final data assertion.
+
+`make controller-e2e` drives preflight, run, status, and both verification
+passes through the authenticated controller API while using the same database
+fixture, CLI-only cutover, cleanup checks, and independent final comparison.
 
 The seed also carries objects whose `pg_dump` archive descriptions are multi-word
 or word-prefixed by a shorter description: a text-search configuration reached by

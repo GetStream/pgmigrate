@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -268,16 +269,48 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 }
 
 func replicationConnect(ctx context.Context, dsn string) (*pgconn.PgConn, error) {
-	config, err := pgconn.ParseConfig(dsn)
+	config, err := snapshotHolderConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse source replication DSN: %w", err)
+		return nil, err
 	}
-	config.RuntimeParams["replication"] = "database"
 	conn, err := pgconn.ConnectConfig(ctx, config)
 	if err != nil {
 		return nil, fmt.Errorf("connect source replication protocol: %w", err)
 	}
 	return conn, nil
+}
+
+func snapshotHolderConfig(dsn string) (*pgconn.Config, error) {
+	config, err := pgconn.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse source replication DSN: %w", err)
+	}
+	// CREATE_REPLICATION_SLOT ... EXPORT_SNAPSHOT returns a snapshot that is
+	// valid only while this replication connection remains command-idle. A
+	// normal sender or session timeout therefore turns a long base copy into a
+	// delayed failure: existing importers keep running, but the next part cannot
+	// import the snapshot after PostgreSQL closes the exporter. In particular,
+	// PostgreSQL reports the exporter as idle in transaction after it returns the
+	// snapshot, so idle_in_transaction_session_timeout applies to it. Set every
+	// relevant timeout in the startup packet because issuing SET after slot
+	// creation would itself invalidate the exported snapshot.
+	config.RuntimeParams["wal_sender_timeout"] = "0"
+	config.RuntimeParams["idle_in_transaction_session_timeout"] = "0"
+	config.RuntimeParams["idle_session_timeout"] = "0"
+	config.RuntimeParams["application_name"] = "pgmigrate_snapshot_holder"
+	dialer := &net.Dialer{
+		Timeout:   config.ConnectTimeout,
+		KeepAlive: 30 * time.Second,
+		KeepAliveConfig: net.KeepAliveConfig{
+			Enable:   true,
+			Idle:     30 * time.Second,
+			Interval: 10 * time.Second,
+			Count:    3,
+		},
+	}
+	config.DialFunc = dialer.DialContext
+	config.RuntimeParams["replication"] = "database"
+	return config, nil
 }
 
 func createSlot(ctx context.Context, conn *pgconn.PgConn, name string, failover bool) (pglogrepl.CreateReplicationSlotResult, error) {
@@ -487,6 +520,85 @@ func validateRecoverableSlot(
 		)
 	}
 	return true, nil
+}
+
+// ErrResumePublicationMissing and ErrResumeSlotMissing identify missing owned
+// CDC objects for which the explicit fresh-snapshot recovery is appropriate.
+var (
+	ErrResumePublicationMissing = errors.New("source publication is missing")
+	ErrResumeSlotMissing        = errors.New("source replication slot is missing")
+)
+
+// ValidateResume proves that the source objects recorded by a completed base
+// copy still describe one usable CDC stream. It is deliberately read-only and
+// must run before expensive local segment recovery: a missing logical slot
+// cannot be reconstructed at its old position, so scanning the local queue
+// first only delays the same fail-closed result.
+func ValidateResume(ctx context.Context, cfg Config, snapshot Snapshot) error {
+	if strings.TrimSpace(cfg.SourceDSN) == "" || len(cfg.Tables) == 0 {
+		return errors.New("source DSN and selected tables are required for resume validation")
+	}
+	if snapshot.Publication == "" || snapshot.Slot == "" || snapshot.ConsistentPoint == "" {
+		return errors.New("durable publication, slot, and consistent point are required for resume validation")
+	}
+
+	conn, err := postgres.Connect(ctx, cfg.SourceDSN)
+	if err != nil {
+		return fmt.Errorf("connect source resume validation: %w", err)
+	}
+	defer conn.Close(context.Background())
+
+	publicationExists, err := validateRecoverablePublication(ctx, conn, snapshot.Publication, cfg.Tables)
+	if err != nil {
+		return fmt.Errorf("validate source publication for resume: %w", err)
+	}
+	if !publicationExists {
+		return fmt.Errorf(
+			"%w: %q; the prior CDC stream cannot be resumed safely and a fresh base copy is required",
+			ErrResumePublicationMissing, snapshot.Publication,
+		)
+	}
+
+	slotExists, err := validateRecoverableSlot(ctx, conn, snapshot.Slot, snapshot.Failover)
+	if err != nil {
+		return fmt.Errorf("validate source replication slot for resume: %w", err)
+	}
+	if !slotExists {
+		return fmt.Errorf(
+			"%w: %q; recreating it would skip an unprovable WAL gap, so a fresh base copy is required",
+			ErrResumeSlotMissing, snapshot.Slot,
+		)
+	}
+
+	var restartLSN, confirmedFlushLSN, walStatus string
+	if err := conn.QueryRow(ctx, `
+		SELECT coalesce(restart_lsn::text, ''),
+		       coalesce(confirmed_flush_lsn::text, ''),
+		       coalesce(wal_status, '')
+		FROM pg_catalog.pg_replication_slots
+		WHERE slot_name=$1
+	`, snapshot.Slot).Scan(&restartLSN, &confirmedFlushLSN, &walStatus); err != nil {
+		return fmt.Errorf("inspect source replication slot positions for resume: %w", err)
+	}
+	if restartLSN == "" || confirmedFlushLSN == "" || walStatus == "lost" {
+		return fmt.Errorf(
+			"source replication slot %q is not usable (restart_lsn=%q confirmed_flush_lsn=%q wal_status=%q); a fresh base copy is required",
+			snapshot.Slot, restartLSN, confirmedFlushLSN, walStatus,
+		)
+	}
+	var positionValid bool
+	if err := conn.QueryRow(ctx,
+		"SELECT $1::pg_lsn >= $2::pg_lsn", confirmedFlushLSN, snapshot.ConsistentPoint,
+	).Scan(&positionValid); err != nil {
+		return fmt.Errorf("compare source replication slot resume position: %w", err)
+	}
+	if !positionValid {
+		return fmt.Errorf(
+			"source replication slot %q confirmed position %s precedes its durable consistent point %s; a fresh base copy is required",
+			snapshot.Slot, confirmedFlushLSN, snapshot.ConsistentPoint,
+		)
+	}
+	return nil
 }
 
 func createPublication(ctx context.Context, conn *pgx.Conn, name string, tables []Table) error {

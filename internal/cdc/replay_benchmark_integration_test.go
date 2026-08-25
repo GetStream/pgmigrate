@@ -46,8 +46,15 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 	transactionCount := benchmarkPositiveIntEnv(
 		t, "PGMIGRATE_CDC_BENCH_TRANSACTIONS", cdcReplayBenchmarkTransactions,
 	)
+	// Array-bearing updates make a row-change count alone misleading: one
+	// decoded change can carry substantially more WAL than the original fixture.
+	// Keep both gates so replay must sustain high operation throughput and high
+	// byte throughput instead of passing by making each synthetic row tiny.
 	minimumRate := benchmarkPositiveFloatEnv(
-		t, "PGMIGRATE_CDC_BENCH_MIN_CHANGES_PER_SECOND", 200_000,
+		t, "PGMIGRATE_CDC_BENCH_MIN_CHANGES_PER_SECOND", 140_000,
+	)
+	minimumMiBRate := benchmarkPositiveFloatEnv(
+		t, "PGMIGRATE_CDC_BENCH_MIN_MIB_PER_SECOND", 75,
 	)
 	accountCount := 20_000
 	accountCount = benchmarkPositiveIntEnv(
@@ -55,6 +62,15 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 	)
 	barrierEvery := benchmarkNonNegativeIntEnv(
 		t, "PGMIGRATE_CDC_BENCH_BARRIER_EVERY", 0,
+	)
+	replayWorkers := benchmarkPositiveIntEnv(
+		t, "PGMIGRATE_CDC_BENCH_REPLAY_WORKERS", 8,
+	)
+	replayBatchBytes := benchmarkPositiveIntEnv(
+		t, "PGMIGRATE_CDC_BENCH_REPLAY_BATCH_BYTES", 8<<20,
+	)
+	replayBatchChanges := benchmarkPositiveIntEnv(
+		t, "PGMIGRATE_CDC_BENCH_REPLAY_BATCH_CHANGES", 32_768,
 	)
 	sessionCount := transactionCount * cdcReplayDeletesPerTransaction
 	expectedChanges := transactionCount * cdcReplayChangesPerTransaction
@@ -273,7 +289,8 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 		ConnString: target.URI, Directory: directory,
 		StreamID: streamID, StreamGeneration: streamGeneration,
 		FreshSetup: true, TargetHasCopiedData: true, Durable: durable,
-		PollInterval: time.Millisecond,
+		PollInterval: time.Millisecond, ReplayWorkers: replayWorkers,
+		BatchMaxDataBytes: int64(replayBatchBytes), BatchMaxChanges: replayBatchChanges,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -329,15 +346,24 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 	}
 
 	rate := float64(expectedChanges) / elapsed.Seconds()
+	walMiB := float64(markerLSN-startLSN) / float64(1<<20)
+	walMiBRate := walMiB / elapsed.Seconds()
 	t.Logf(
-		"cdc_replay changes=%d source_transactions=%d accounts=%d barrier_every=%d elapsed=%s changes_per_second=%.0f target=%.0f",
+		"cdc_replay changes=%d source_transactions=%d accounts=%d barrier_every=%d replay_workers=%d replay_batch_bytes=%d replay_batch_changes=%d elapsed=%s changes_per_second=%.0f changes_target=%.0f wal=%.1f_MiB wal_apply=%.1f_MiB/s wal_target=%.1f_MiB/s",
 		expectedChanges, transactionCount, accountCount, barrierEvery,
-		elapsed.Round(time.Millisecond), rate, minimumRate,
+		replayWorkers, replayBatchBytes, replayBatchChanges,
+		elapsed.Round(time.Millisecond), rate, minimumRate, walMiB, walMiBRate, minimumMiBRate,
 	)
 	if rate < minimumRate {
 		t.Fatalf(
 			"CDC replay throughput %.0f changes/s is below the %.0f changes/s target",
 			rate, minimumRate,
+		)
+	}
+	if walMiBRate < minimumMiBRate {
+		t.Fatalf(
+			"CDC replay WAL throughput %.1f MiB/s is below the %.1f MiB/s target",
+			walMiBRate, minimumMiBRate,
 		)
 	}
 }
@@ -377,10 +403,52 @@ func cdcReplayFixtureSQL(accountCount, sessionCount int) string {
 			balance bigint NOT NULL,
 			revision integer NOT NULL,
 			metadata jsonb NOT NULL,
+			labels text[] NOT NULL,
 			updated_at timestamptz NOT NULL
 		);
 		CREATE INDEX accounts_tenant_revision_idx
 			ON cdc_benchmark.accounts (tenant_id, revision);
+		CREATE INDEX accounts_active_revision_idx
+			ON cdc_benchmark.accounts (tenant_id, revision)
+			WHERE revision >= 0;
+		CREATE INDEX accounts_segment_idx
+			ON cdc_benchmark.accounts ((metadata ->> 'segment'));
+		CREATE INDEX accounts_updated_day_idx
+			ON cdc_benchmark.accounts ((date_trunc('day', updated_at AT TIME ZONE 'UTC')));
+		CREATE INDEX accounts_positive_balance_idx
+			ON cdc_benchmark.accounts (balance) WHERE balance > 0;
+		CREATE INDEX accounts_tenant_band_00_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 1 AND 32;
+		CREATE INDEX accounts_tenant_band_01_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 33 AND 64;
+		CREATE INDEX accounts_tenant_band_02_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 65 AND 96;
+		CREATE INDEX accounts_tenant_band_03_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 97 AND 128;
+		CREATE INDEX accounts_tenant_band_04_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 129 AND 160;
+		CREATE INDEX accounts_tenant_band_05_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 161 AND 192;
+		CREATE INDEX accounts_tenant_band_06_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 193 AND 224;
+		CREATE INDEX accounts_tenant_band_07_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 225 AND 256;
+		CREATE INDEX accounts_tenant_band_08_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 257 AND 288;
+		CREATE INDEX accounts_tenant_band_09_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 289 AND 320;
+		CREATE INDEX accounts_tenant_band_10_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 321 AND 352;
+		CREATE INDEX accounts_tenant_band_11_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 353 AND 384;
+		CREATE INDEX accounts_tenant_band_12_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 385 AND 416;
+		CREATE INDEX accounts_tenant_band_13_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 417 AND 448;
+		CREATE INDEX accounts_tenant_band_14_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 449 AND 476;
+		CREATE INDEX accounts_tenant_band_15_idx ON cdc_benchmark.accounts (id) WHERE tenant_id BETWEEN 477 AND 500;
+		CREATE INDEX accounts_tenant_band_desc_00_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 1 AND 32;
+		CREATE INDEX accounts_tenant_band_desc_01_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 33 AND 64;
+		CREATE INDEX accounts_tenant_band_desc_02_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 65 AND 96;
+		CREATE INDEX accounts_tenant_band_desc_03_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 97 AND 128;
+		CREATE INDEX accounts_tenant_band_desc_04_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 129 AND 160;
+		CREATE INDEX accounts_tenant_band_desc_05_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 161 AND 192;
+		CREATE INDEX accounts_tenant_band_desc_06_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 193 AND 224;
+		CREATE INDEX accounts_tenant_band_desc_07_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 225 AND 256;
+		CREATE INDEX accounts_tenant_band_desc_08_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 257 AND 288;
+		CREATE INDEX accounts_tenant_band_desc_09_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 289 AND 320;
+		CREATE INDEX accounts_tenant_band_desc_10_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 321 AND 352;
+		CREATE INDEX accounts_tenant_band_desc_11_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 353 AND 384;
+		CREATE INDEX accounts_tenant_band_desc_12_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 385 AND 416;
+		CREATE INDEX accounts_tenant_band_desc_13_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 417 AND 448;
+		CREATE INDEX accounts_tenant_band_desc_14_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 449 AND 476;
+		CREATE INDEX accounts_tenant_band_desc_15_idx ON cdc_benchmark.accounts (id DESC) WHERE tenant_id BETWEEN 477 AND 500;
 
 		CREATE TABLE cdc_benchmark.events (
 			id bigint PRIMARY KEY,
@@ -415,6 +483,7 @@ func cdcReplayFixtureSQL(accountCount, sessionCount int) string {
 		       100000 + id * 17,
 		       0,
 		       jsonb_build_object('segment', id %% 7, 'seed', md5(id::text)),
+		       ARRAY['seed', (id %% 11)::text],
 		       TIMESTAMPTZ '2026-01-01 00:00:00+00' + id * interval '1 second'
 		FROM generate_series(1, %d) AS id;
 
@@ -451,6 +520,7 @@ const cdcReplayWorkloadSQL = `
 		SET balance = account.balance + (($1::bigint % 17) - 8),
 		    revision = account.revision + 1,
 		    metadata = jsonb_set(account.metadata, '{last_batch}', to_jsonb($1::bigint), true),
+		    labels = ARRAY['updated', ($1::bigint % 17)::text],
 		    updated_at = TIMESTAMPTZ '2026-03-01 00:00:00+00' +
 			    $1::bigint * interval '1 millisecond'
 		FROM generate_series(1, 4) AS item
