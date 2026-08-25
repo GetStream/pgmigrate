@@ -329,6 +329,8 @@ beside an active `run`. It needs no database connection and no DSNs.
 
 ### pgmigrate controller
 
+<img width="2482" height="968" alt="CleanShot 2026-08-25 at 17 58 41@2x" src="https://github.com/user-attachments/assets/41fa9207-48d6-4362-8722-4856fee503fe" />
+
 Serves an embedded web dashboard backed by the same durable state as `status`.
 It shows the lifecycle stage, exact object completion counts, copied rows and
 bytes, live in-flight COPY rows/bytes and aggregate transfer rate, apply lag and
