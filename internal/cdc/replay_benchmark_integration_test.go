@@ -333,6 +333,18 @@ func TestPG17CDCReplayThroughput(t *testing.T) {
 	if err := <-applyDone; err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatalf("stop benchmark applier: %v", err)
 	}
+	replayProgress, exists, err := postgres.ReadReplicationProgress(ctx, targetSQL, streamID)
+	if err != nil {
+		t.Fatalf("read final benchmark replay counters: %v", err)
+	}
+	if !exists || replayProgress.Transactions != int64(transactionCount) ||
+		replayProgress.Rows != int64(expectedChanges) {
+		t.Fatalf(
+			"final replay counters exist=%t transactions=%d/%d rows=%d/%d",
+			exists, replayProgress.Transactions, transactionCount,
+			replayProgress.Rows, expectedChanges,
+		)
+	}
 
 	for _, table := range []string{"accounts", "events", "sessions", "guarded"} {
 		sourceCount, sourceDigest := benchmarkTableDigest(t, sourceSQL, table)

@@ -609,7 +609,7 @@ func TestReplayPlanV4RelaxesOnlyRelationLocalOrdering(t *testing.T) {
 	}
 }
 
-func TestFreshFragmentedReplayPlanUsesBoundedOrderedFallback(t *testing.T) {
+func TestFreshFragmentedReplayPlanKeepsOrderedBarriersInsideConcurrentWindow(t *testing.T) {
 	t.Parallel()
 	safe := replayTestRelation(53, "safe_items")
 	barrier := replayTestRelation(54, "barrier_items")
@@ -636,8 +636,12 @@ func TestFreshFragmentedReplayPlanUsesBoundedOrderedFallback(t *testing.T) {
 	if len(plan.Steps) != 3 || !replayPlanHasSerialWork(plan) {
 		t.Fatalf("fixture is not fragmented parallel/serial work: %#v", plan.Steps)
 	}
-	if shouldUseConcurrentReplayPlan(nil, plan) {
-		t.Fatal("fresh fragmented plan would create a multi-commit concurrent claim")
+	// The small fixture has only one lane in each safe epoch. Admission depends
+	// on the planner's HasParallel capability bit; larger windows set it when an
+	// epoch contains two or more independent components.
+	plan.HasParallel = true
+	if !shouldUseConcurrentReplayPlan(nil, plan) {
+		t.Fatal("fresh fragmented plan discarded safe parallel epochs around its barrier")
 	}
 	resume := plan.Claim
 	if !shouldUseConcurrentReplayPlan(&resume, plan) {
@@ -804,6 +808,71 @@ func replayTestRelation(oid uint32, name string) *targetRelation {
 			},
 			{name: "value", quoted: `"value"`, oid: 25, arrayOID: 1009, sourceIndex: 1},
 		},
+	}
+}
+
+func TestCoalesceReplayLaneUpdatesKeepsNewestCompletePrimaryKeyImage(t *testing.T) {
+	t.Parallel()
+	relation := replayTestRelation(70, "coalesced_items")
+	changes := []Change{
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("a", "old"), New: replayTuple("a", "one")},
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("b", "old"), New: replayTuple("b", "other")},
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("a", "one"), New: replayTuple("a", "two")},
+	}
+	items := make([]relationBatchedChange, len(changes))
+	for i := range changes {
+		items[i] = relationBatchedChange{change: &changes[i], relation: relation}
+	}
+	got, err := coalesceReplayLaneUpdates(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].change != &changes[1] || got[1].change != &changes[2] {
+		t.Fatalf("coalesced changes = %#v, want other key and newest a image", got)
+	}
+}
+
+func TestCoalesceReplayLaneUpdatesDoesNotCrossDeleteSelectiveOrConflictBoundaries(t *testing.T) {
+	t.Parallel()
+	relation := replayTestRelation(71, "ordered_items")
+	selectiveNew := replayTuple("a", "ignored")
+	(*selectiveNew)[1] = TupleDatum{Kind: DatumUnchangedToast}
+	changes := []Change{
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("a", "old"), New: replayTuple("a", "one")},
+		{RelationOID: relation.source.OID, Kind: ChangeDelete, Old: replayTuple("a", "one")},
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("a", "one"), New: replayTuple("a", "two")},
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("a", "two"), New: selectiveNew},
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("a", "two"), New: replayTuple("a", "three")},
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("a", "three"), New: replayTuple("renamed", "three")},
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("a", "three"), New: replayTuple("a", "four")},
+	}
+	items := make([]relationBatchedChange, len(changes))
+	for i := range changes {
+		items[i] = relationBatchedChange{change: &changes[i], relation: relation}
+	}
+	got, err := coalesceReplayLaneUpdates(items)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(items) {
+		t.Fatalf("boundary sequence coalesced %d changes to %d", len(items), len(got))
+	}
+
+	relation.capabilities.crossKeyConflicts = true
+	conflicting := []Change{
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("b", "old"), New: replayTuple("b", "one")},
+		{RelationOID: relation.source.OID, Kind: ChangeUpdate, Old: replayTuple("b", "one"), New: replayTuple("b", "two")},
+	}
+	conflictItems := []relationBatchedChange{
+		{change: &conflicting[0], relation: relation},
+		{change: &conflicting[1], relation: relation},
+	}
+	got, err = coalesceReplayLaneUpdates(conflictItems)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != len(conflictItems) {
+		t.Fatalf("cross-key relation coalesced %d changes to %d", len(conflictItems), len(got))
 	}
 }
 

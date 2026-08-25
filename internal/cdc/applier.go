@@ -318,16 +318,69 @@ func (a *Applier) applyAvailable(ctx context.Context, conn *pgx.Conn, progress L
 }
 
 const (
-	// Catch-up batches are bounded independently by source transaction count,
-	// row changes, and decoded payload size. A resident source transaction is
-	// never split: when it alone exceeds a bound it becomes a one-transaction
-	// replay claim, preserving its atomicity while retaining set-based DML and
-	// durable claim receipts. Only disk-spilled transactions keep the streaming
-	// standalone path.
+	// Catch-up scheduling slices are bounded independently by source transaction
+	// count, row changes, and decoded payload size. A four-slice durable window
+	// gives the key-affine executor enough work to keep every target session busy.
+	// A resident source transaction is never split: when it alone exceeds the
+	// window it becomes a one-transaction replay claim. Only disk-spilled
+	// transactions keep the streaming standalone path.
 	applyBatchMaxTransactions  = 16384
 	applyBatchDefaultChanges   = 131072
 	applyBatchDefaultDataBytes = 32 << 20
+
+	// Eight sessions is one replay scheduling slice. Four configured slices form
+	// the default durable target wave; higher session counts extend the wave so
+	// per-session work does not shrink. The claim format does not change, so an
+	// older binary can reconstruct and finish an active window from its stored
+	// EndLSN, lane count, manifest, and receipts.
+	replayWorkersPerClaimSlice = 8
 )
+
+func replayClaimWindowSlices(workers int) int {
+	if workers < replayWorkersPerClaimSlice {
+		return 1
+	}
+	// Match crdb-to-pg's four-claim target wave even at the conservative default
+	// of eight sessions. More than 32 sessions add one slice per additional
+	// eight sessions so per-session work does not shrink as concurrency grows.
+	return max(4, (workers+replayWorkersPerClaimSlice-1)/replayWorkersPerClaimSlice)
+}
+
+func replayClaimLaneCount(workers int) int {
+	if workers <= 1 {
+		return 1
+	}
+	// Extra logical lanes smooth hash-skew tails while worker counts are small.
+	// Once there are 32 real sessions, retain one deterministic lane per session
+	// instead of multiplying receipt transactions and synchronous commits.
+	return min(max(workers, workers*4), max(32, workers))
+}
+
+func replayClaimWindowLimits(workers, changes int, dataBytes int64) (int, int, int64) {
+	slices := replayClaimWindowSlices(workers)
+	maxInt := int(^uint(0) >> 1)
+	transactionsLimit := applyBatchMaxTransactions
+	changesLimit := changes
+	dataBytesLimit := dataBytes
+	if slices > 1 {
+		if transactionsLimit > maxInt/slices {
+			transactionsLimit = maxInt
+		} else {
+			transactionsLimit *= slices
+		}
+		if changesLimit > maxInt/slices {
+			changesLimit = maxInt
+		} else {
+			changesLimit *= slices
+		}
+		if dataBytesLimit > int64(^uint64(0)>>1)/int64(slices) {
+			dataBytesLimit = int64(^uint64(0) >> 1)
+		} else {
+			dataBytesLimit *= int64(slices)
+		}
+	}
+	return transactionsLimit, changesLimit, dataBytesLimit
+}
 
 func (a *Applier) applyFromReader(
 	ctx context.Context,
@@ -361,7 +414,10 @@ func (a *Applier) applyFromReader(
 			ctx, conn, relationCache, statementCache, workers, batch, progress, claim,
 		)
 	}
-	batch := make([]Transaction, 0, applyBatchMaxTransactions)
+	transactionsLimit, changesLimit, dataBytesLimit := replayClaimWindowLimits(
+		a.config.ReplayWorkers, a.config.BatchMaxChanges, a.config.BatchMaxDataBytes,
+	)
+	batch := make([]Transaction, 0, transactionsLimit)
 	batchChanges := 0
 	var batchDataBytes int64
 	for {
@@ -452,9 +508,9 @@ func (a *Applier) applyFromReader(
 		transactionChanges := int(transaction.ChangeCount())
 		transactionDataBytes := int64(transactionApplyDataBytes(&transaction))
 		if len(batch) != 0 &&
-			(batchChanges+transactionChanges > a.config.BatchMaxChanges ||
-				batchDataBytes+transactionDataBytes > a.config.BatchMaxDataBytes) {
-			// Keep the configured claim bound without splitting this source
+			(batchChanges+transactionChanges > changesLimit ||
+				batchDataBytes+transactionDataBytes > dataBytesLimit) {
+			// Keep the configured wave bound without splitting this source
 			// transaction. The next pass will claim it alone.
 			reader.pending = &transaction
 			return applyBatch(batch, nil)
@@ -462,9 +518,9 @@ func (a *Applier) applyFromReader(
 		batchChanges += transactionChanges
 		batchDataBytes += transactionDataBytes
 		batch = append(batch, transaction)
-		if len(batch) >= applyBatchMaxTransactions ||
-			batchChanges >= a.config.BatchMaxChanges ||
-			batchDataBytes >= a.config.BatchMaxDataBytes {
+		if len(batch) >= transactionsLimit ||
+			batchChanges >= changesLimit ||
+			batchDataBytes >= dataBytesLimit {
 			return applyBatch(batch, nil)
 		}
 	}
@@ -747,10 +803,9 @@ func (a *Applier) applyTransactionBatchWithWorkers(
 	if resume != nil {
 		laneCount = resume.LaneCount
 	} else if laneCount > 1 {
-		// More logical lanes than sessions reduce hash-skew tails without opening
-		// more target connections. Receipts remain keyed by the durable lane, and
-		// the executor size-balances those independent lanes across the workers.
-		laneCount = min(laneCount*4, migrationconfig.ReplayWorkersMax)
+		// Extra logical lanes reduce hash-skew tails at small worker counts. The
+		// executor size-balances those deterministic lanes across real sessions.
+		laneCount = replayClaimLaneCount(laneCount)
 	}
 	if laneCount > 1 && (resume != nil || len(workers) > 1) {
 		startGeneration := a.effectiveStreamGeneration()
@@ -872,7 +927,11 @@ func (a *Applier) applyTransactionBatchWithWorkers(
 }
 
 func shouldUseConcurrentReplayPlan(resume *replayClaim, plan replayPlan) bool {
-	return resume != nil || (plan.HasParallel && !replayPlanHasSerialWork(plan))
+	// executeReplayPlan treats every unsafe source transaction as an ordered
+	// barrier between parallel epochs. Keeping those barriers inside the durable
+	// window lets safe work on either side use all target sessions without moving
+	// the frontier past the barrier or splitting a source transaction.
+	return resume != nil || plan.HasParallel
 }
 
 type relationBatchedChange struct {
@@ -2488,6 +2547,118 @@ func (p *applyPipeline) copyFrom(
 
 const minimumTextCopyStageRows = 64
 
+const minimumBinaryCopyStageRows = 64
+
+// loadBinaryCopyStage is the built-in-type counterpart of loadTextCopyStage.
+// It mirrors crdb-to-pg's fast path: COPY a lane group into a transaction-local
+// typed stage, then consume it with one set-based statement. The stage and DML
+// live in the same replay-work transaction as the durable receipt.
+func (p *applyPipeline) loadBinaryCopyStage(
+	relation *targetRelation,
+	kind ChangeKind,
+	columns []targetColumn,
+	values []TupleDatum,
+	rowCount int,
+) (string, bool, error) {
+	if rowCount < minimumBinaryCopyStageRows || len(columns) == 0 ||
+		!relation.capabilities.binaryCopy {
+		return "", false, nil
+	}
+	data, supported, err := binaryCopyStageData(relation, kind, columns, values, rowCount)
+	if err != nil || !supported {
+		return "", supported, err
+	}
+	stage := textCopyStageName(relation, kind, columns)
+	var create strings.Builder
+	create.WriteString("CREATE TEMP TABLE IF NOT EXISTS ")
+	create.WriteString(stage)
+	create.WriteString(" ON COMMIT DELETE ROWS AS SELECT 0::bigint AS ordinal")
+	for i, column := range columns {
+		create.WriteByte(',')
+		create.WriteString("pgmigrate_target.")
+		create.WriteString(column.quoted)
+		fmt.Fprintf(&create, " AS column_%d", i)
+	}
+	create.WriteString(" FROM ")
+	create.WriteString(relation.quoted)
+	create.WriteString(" AS pgmigrate_target WITH NO DATA")
+	p.queueUnprepared(create.String(), nil, applyExpectation{
+		relation: relation, kind: kind,
+		description: "create binary replay stage for " + relation.quoted, expectedRows: -1,
+	})
+	p.queueUnprepared("TRUNCATE "+stage, nil, applyExpectation{
+		relation: relation, kind: kind,
+		description: "clear binary replay stage for " + relation.quoted, expectedRows: -1,
+	})
+
+	var copySQL strings.Builder
+	copySQL.WriteString("COPY ")
+	copySQL.WriteString(stage)
+	copySQL.WriteString(" (ordinal")
+	for i := range columns {
+		fmt.Fprintf(&copySQL, ",column_%d", i)
+	}
+	copySQL.WriteString(") FROM STDIN BINARY")
+	if err := p.copyFrom(
+		relation, kind, "binary copy into replay stage for "+relation.quoted,
+		copySQL.String(), data, rowCount,
+	); err != nil {
+		return "", true, err
+	}
+	return stage, true, nil
+}
+
+func binaryCopyStageData(
+	relation *targetRelation,
+	kind ChangeKind,
+	columns []targetColumn,
+	values []TupleDatum,
+	rowCount int,
+) ([]byte, bool, error) {
+	if rowCount < 0 || len(values) != rowCount*len(columns) {
+		return nil, true, divergenceFor(relation, kind, fmt.Sprintf(
+			"binary stage has %d values for %d rows of %d columns",
+			len(values), rowCount, len(columns),
+		))
+	}
+	estimatedBytes := 21 + rowCount*(14+len(columns)*4)
+	for row := 0; row < rowCount; row++ {
+		for columnIndex, column := range columns {
+			datum := values[row*len(columns)+columnIndex]
+			switch datum.Kind {
+			case DatumNull:
+			case DatumBinary:
+				if _, err := datumParamForColumn(relation, column, datum, kind); err != nil {
+					return nil, true, err
+				}
+				estimatedBytes += len(datum.Data)
+			default:
+				return nil, false, nil
+			}
+		}
+	}
+	data := make([]byte, 0, estimatedBytes)
+	data = append(data, []byte("PGCOPY\n\xff\r\n\x00")...)
+	data = binary.BigEndian.AppendUint32(data, 0)
+	data = binary.BigEndian.AppendUint32(data, 0)
+	for row := 0; row < rowCount; row++ {
+		data = binary.BigEndian.AppendUint16(data, uint16(len(columns)+1))
+		data = binary.BigEndian.AppendUint32(data, 8)
+		data = binary.BigEndian.AppendUint64(data, uint64(row))
+		for columnIndex := range columns {
+			datum := values[row*len(columns)+columnIndex]
+			if datum.Kind == DatumNull {
+				data = binary.BigEndian.AppendUint32(data, ^uint32(0))
+				continue
+			}
+			data = binary.BigEndian.AppendUint32(data, uint32(len(datum.Data)))
+			data = append(data, datum.Data...)
+		}
+	}
+	data = binary.BigEndian.AppendUint16(data, ^uint16(0))
+	return data, true, nil
+}
+
 // loadTextCopyStage copies text pgoutput values into a target-typed temporary
 // relation. This is the escape hatch that parameter arrays cannot provide
 // efficiently for user-defined types: PostgreSQL's COPY input functions do the
@@ -3133,6 +3304,9 @@ func applyPrimaryKeyUpsertChunk(
 	if len(changes) == 0 {
 		return nil
 	}
+	if applied, err := applyPrimaryKeyUpsertBinaryStage(replay, relation, changes); applied || err != nil {
+		return err
+	}
 	if applied, err := applyPrimaryKeyUpsertTextStage(replay, relation, changes); applied || err != nil {
 		return err
 	}
@@ -3147,6 +3321,46 @@ func applyPrimaryKeyUpsertChunk(
 		}
 	}
 	return nil
+}
+
+func applyPrimaryKeyUpsertBinaryStage(
+	replay *applyPipeline,
+	relation *targetRelation,
+	changes []Change,
+) (bool, error) {
+	values := make([]TupleDatum, 0, len(changes)*len(relation.columns))
+	for row := range changes {
+		if err := validateTuple(relation, changes[row].New, ChangeUpdate); err != nil {
+			return true, err
+		}
+		for _, column := range relation.columns {
+			values = append(values, (*changes[row].New)[column.sourceIndex])
+		}
+	}
+	stage, applied, err := replay.loadBinaryCopyStage(
+		relation, ChangeUpdate, relation.columns, values, len(changes),
+	)
+	if err != nil || !applied {
+		return applied, err
+	}
+	var sql strings.Builder
+	writePrimaryKeyUpsertPrefix(&sql, relation)
+	sql.WriteString(" SELECT ")
+	for i := range relation.columns {
+		if i != 0 {
+			sql.WriteByte(',')
+		}
+		fmt.Fprintf(&sql, "column_%d", i)
+	}
+	sql.WriteString(" FROM ")
+	sql.WriteString(stage)
+	sql.WriteString(" ORDER BY ordinal")
+	appendPrimaryKeyConflictClause(&sql, relation)
+	return true, replay.queue(sql.String(), nil, applyExpectation{
+		relation: relation, kind: ChangeUpdate,
+		description:  "binary-staged primary-key upsert into " + relation.quoted,
+		expectedRows: int64(len(changes)),
+	})
 }
 
 func applyPrimaryKeyUpsertTextStage(
