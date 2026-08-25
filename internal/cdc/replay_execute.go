@@ -397,6 +397,10 @@ func (a *Applier) executeReplayWork(
 }
 
 func queueParallelReplayLane(replay *applyPipeline, items []relationBatchedChange) error {
+	items, err := coalesceReplayLaneUpdates(items)
+	if err != nil {
+		return err
+	}
 	// Source transactions commonly interleave several relations. Preserve the
 	// first-seen relation order and exact per-relation change order, but collect
 	// each homogeneous relation into one lane before invoking the existing set
@@ -420,4 +424,88 @@ func queueParallelReplayLane(replay *applyPipeline, items []relationBatchedChang
 		}
 	}
 	return nil
+}
+
+// coalesceReplayLaneUpdates keeps only the newest complete-row update for a
+// primary key inside one lane transaction. All source transactions covered by
+// the lane still share one target commit and one exact receipt, so no
+// intermediate target state was observable before this optimization either.
+// Inserts, deletes, selective/unchanged-TOAST updates, and relations with
+// cross-key conflicts form hard per-key boundaries and are never coalesced.
+func coalesceReplayLaneUpdates(items []relationBatchedChange) ([]relationBatchedChange, error) {
+	if len(items) < 2 {
+		return items, nil
+	}
+	keep := make([]bool, len(items))
+	for i := range keep {
+		keep[i] = true
+	}
+	latest := make(map[string]int)
+	for i := range items {
+		item := &items[i]
+		if item.relation == nil || item.change == nil {
+			return nil, errors.New("cdc: replay lane contains missing relation or change")
+		}
+		key, keyed, err := coalescibleReplayPrimaryKey(item.relation, item.change)
+		if err != nil {
+			return nil, err
+		}
+		if !keyed {
+			// A PK mutation or another change whose exact key cannot be proven is a
+			// lane-wide ordering boundary. Forget every candidate rather than let
+			// a later update coalesce across that unknown dependency.
+			clear(latest)
+			continue
+		}
+		if item.change.Kind != ChangeUpdate ||
+			!item.relation.capabilities.relationLane ||
+			item.relation.capabilities.crossKeyConflicts ||
+			!canPrimaryKeyUpsert(item.relation, item.change) {
+			delete(latest, key)
+			continue
+		}
+		if previous, exists := latest[key]; exists {
+			keep[previous] = false
+		}
+		latest[key] = i
+	}
+	result := make([]relationBatchedChange, 0, len(items))
+	for i := range items {
+		if keep[i] {
+			result = append(result, items[i])
+		}
+	}
+	return result, nil
+}
+
+func coalescibleReplayPrimaryKey(relation *targetRelation, change *Change) (string, bool, error) {
+	if relation == nil || change == nil || len(primaryKeyColumns(relation)) == 0 {
+		return "", false, nil
+	}
+	var tuple *Tuple
+	switch change.Kind {
+	case ChangeInsert:
+		tuple = change.New
+	case ChangeUpdate:
+		if !canShardUpdateByPrimaryKey(relation, change) {
+			return "", false, nil
+		}
+		tuple = change.New
+	case ChangeDelete:
+		columns, safe := primaryKeyDeleteColumns(relation)
+		if !safe || !sameTargetColumns(primaryKeyColumns(relation), columns) {
+			return "", false, nil
+		}
+		tuple = change.Old
+	default:
+		return "", false, nil
+	}
+	if tuple == nil {
+		return "", false, nil
+	}
+	key, err := primaryKeyTupleKey(relation, tuple)
+	if err != nil {
+		return "", false, err
+	}
+	return fmt.Sprintf("%d:%s", relation.source.OID, key), true, nil
 }

@@ -4,6 +4,7 @@ package cdc
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
@@ -253,6 +254,109 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 				t.Fatalf("row %d/%s value=%q, want %q", i, suffix, value, want)
 			}
 		}
+	}
+}
+
+func TestPG17ReplayClaimResumesCoalescedBinaryStageWithoutRepeatingDML(t *testing.T) {
+	target := pgtest.Start(t, 17)
+	control := target.Connect(t)
+	ctx := context.Background()
+	if _, err := control.Exec(ctx, `
+		CREATE TABLE public.coalesced_binary_items (
+			id bigint PRIMARY KEY,
+			value bigint NOT NULL
+		);
+		INSERT INTO public.coalesced_binary_items
+		SELECT id, 0 FROM generate_series(1, 128) AS id
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	const streamID = "coalesced-binary-resume"
+	const generation = "coalesced-binary-resume-v1"
+	if err := EnsureStreamProgressIdentity(ctx, control, StreamIdentityConfig{
+		StreamID: streamID, Generation: generation,
+		FreshSetup: true, TargetHasCopiedData: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	source := Relation{
+		OID: 9_301, Namespace: "public", Name: "coalesced_binary_items", ReplicaIdentity: 'd',
+		Columns: []Column{
+			{Name: "id", Type: pgtype.Int8OID, Flags: 1},
+			{Name: "value", Type: pgtype.Int8OID},
+		},
+	}
+	loaded, err := loadTargetRelation(ctx, control, &source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binaryInt8 := func(value int64) TupleDatum {
+		return TupleDatum{Kind: DatumBinary, Data: binary.BigEndian.AppendUint64(nil, uint64(value))}
+	}
+	transactions := make([]Transaction, 0, 256)
+	resolved := make([]map[uint32]*targetRelation, 0, 256)
+	for round := int64(0); round < 2; round++ {
+		for id := int64(1); id <= 128; id++ {
+			oldTuple := Tuple{binaryInt8(id), binaryInt8(round)}
+			newTuple := Tuple{binaryInt8(id), binaryInt8(round + 1)}
+			endLSN := LSN(len(transactions) + 1)
+			transactions = append(transactions, Transaction{
+				CommitLSN: endLSN, EndLSN: endLSN,
+				Relations: []Relation{source},
+				Changes: []Change{{
+					RelationOID: source.OID, Kind: ChangeUpdate,
+					Old: &oldTuple, New: &newTuple,
+				}},
+			})
+			resolved = append(resolved, map[uint32]*targetRelation{source.OID: loaded})
+		}
+	}
+	plan, err := buildReplayPlan(streamID, generation, 0, 1, transactions, resolved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := ensureReplayClaim(ctx, control, plan.Claim, plan.Works)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan.Claim = claim
+	interrupted := errors.New("test: stop after coalesced binary lane commit")
+	applier := &Applier{config: ApplierConfig{
+		StreamID: streamID, StreamGeneration: generation,
+		afterReplayWork: func(replayClaim, replayClaimWork) error { return interrupted },
+	}}
+	cache := newApplyStatementCache(applyStatementCacheCapacity)
+	if err := configureApplySession(ctx, control); err != nil {
+		t.Fatal(err)
+	}
+	workers := []*applyWorker{{conn: control, statements: cache}}
+	if err := applier.executeReplayPlan(ctx, workers, plan, transactions, resolved); !errors.Is(err, interrupted) {
+		t.Fatalf("interrupted replay error = %v, want %v", err, interrupted)
+	}
+	assertReplayProgress(t, control, streamID, 0, 0, 0)
+	var finalRows int
+	if err := control.QueryRow(ctx, `
+		SELECT count(*) FROM public.coalesced_binary_items WHERE value = 2
+	`).Scan(&finalRows); err != nil {
+		t.Fatal(err)
+	}
+	if finalRows != 128 {
+		t.Fatalf("coalesced binary DML produced %d final rows, want 128", finalRows)
+	}
+
+	applier.config.afterReplayWork = nil
+	if err := applier.executeReplayPlan(ctx, workers, plan, transactions, resolved); err != nil {
+		t.Fatal(err)
+	}
+	assertReplayProgress(t, control, streamID, claim.EndLSN, 256, 256)
+	if err := control.QueryRow(ctx, `
+		SELECT count(*) FROM public.coalesced_binary_items WHERE value = 2
+	`).Scan(&finalRows); err != nil {
+		t.Fatal(err)
+	}
+	if finalRows != 128 {
+		t.Fatalf("resumed replay repeated binary DML; final rows = %d", finalRows)
 	}
 }
 

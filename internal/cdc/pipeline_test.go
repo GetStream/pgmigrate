@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -126,6 +127,49 @@ func TestApplierReplayBatchLimitsDefaultAndAllowOverrides(t *testing.T) {
 	base.ReplayWorkers = config.ReplayWorkersMax + 1
 	if _, err := NewApplier(base); err == nil {
 		t.Fatal("replay worker count above the shared maximum was accepted")
+	}
+}
+
+func TestReplayClaimWindowScalesOneConfiguredSlicePerEightSessions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		workers          int
+		wantSlices       int
+		wantTransactions int
+		wantChanges      int
+		wantBytes        int64
+	}{
+		{workers: 1, wantSlices: 1, wantTransactions: 16_384, wantChanges: 32_768, wantBytes: 8 << 20},
+		{workers: 8, wantSlices: 4, wantTransactions: 65_536, wantChanges: 131_072, wantBytes: 32 << 20},
+		{workers: 9, wantSlices: 4, wantTransactions: 65_536, wantChanges: 131_072, wantBytes: 32 << 20},
+		{workers: 32, wantSlices: 4, wantTransactions: 65_536, wantChanges: 131_072, wantBytes: 32 << 20},
+		{workers: 64, wantSlices: 8, wantTransactions: 131_072, wantChanges: 262_144, wantBytes: 64 << 20},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprint(test.workers), func(t *testing.T) {
+			t.Parallel()
+			if got := replayClaimWindowSlices(test.workers); got != test.wantSlices {
+				t.Fatalf("replayClaimWindowSlices(%d) = %d, want %d", test.workers, got, test.wantSlices)
+			}
+			transactions, changes, dataBytes := replayClaimWindowLimits(test.workers, 32_768, 8<<20)
+			if transactions != test.wantTransactions || changes != test.wantChanges || dataBytes != test.wantBytes {
+				t.Fatalf(
+					"window limits for %d workers = %d tx / %d changes / %d bytes, want %d / %d / %d",
+					test.workers, transactions, changes, dataBytes,
+					test.wantTransactions, test.wantChanges, test.wantBytes,
+				)
+			}
+		})
+	}
+}
+
+func TestReplayClaimLaneCountUsesThirtyTwoDeterministicLanesBeforeMoreSessions(t *testing.T) {
+	t.Parallel()
+	tests := map[int]int{1: 1, 2: 8, 4: 16, 8: 32, 16: 32, 32: 32, 64: 64}
+	for workers, want := range tests {
+		if got := replayClaimLaneCount(workers); got != want {
+			t.Errorf("replayClaimLaneCount(%d) = %d, want %d", workers, got, want)
+		}
 	}
 }
 
@@ -395,7 +439,11 @@ func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
 	writeDeleteIdentityPredicate(&sql, relation, primary, "identity_", 0)
 	want := `pgmigrate_target.ctid=(SELECT pgmigrate_lookup.ctid FROM "shard_schema"."messages" AS pgmigrate_lookup ` +
 		`WHERE pgmigrate_lookup."app_pk"=pgmigrate_batch.identity_0 AND ` +
-		`pgmigrate_lookup."id"=pgmigrate_batch.identity_1 OFFSET 0)`
+		`pgmigrate_lookup."id"=pgmigrate_batch.identity_1 AND ` +
+		`ROW(pgmigrate_lookup."app_pk",pgmigrate_lookup."id")>=` +
+		`ROW(pgmigrate_batch.identity_0,pgmigrate_batch.identity_1) AND ` +
+		`ROW(pgmigrate_lookup."app_pk",pgmigrate_lookup."id")<=` +
+		`ROW(pgmigrate_batch.identity_0,pgmigrate_batch.identity_1) OFFSET 0)`
 	if got := sql.String(); got != want {
 		t.Fatalf("delete predicate = %q, want forced target primary key %q", got, want)
 	}
@@ -403,6 +451,45 @@ func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
 	relation.columns[1].key = false
 	if _, safe := primaryKeyDeleteColumns(relation); safe {
 		t.Fatal("delete used a target primary key absent from the old pgoutput tuple")
+	}
+}
+
+func TestSinglePrimaryKeyDeleteAddsExactCatalogOrderedBounds(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		quoted:       `"shard_schema"."read_state"`,
+		capabilities: targetRelationCapabilities{keyedSetDML: true},
+		source: Relation{Columns: []Column{
+			{Name: "channel_cid"}, {Name: "app_pk"}, {Name: "user_id"},
+		}},
+		columns: []targetColumn{
+			{name: "channel_cid", quoted: `"channel_cid"`, sourceIndex: 0, key: true, primary: true, primaryPos: 3, notNull: true},
+			{name: "app_pk", quoted: `"app_pk"`, sourceIndex: 1, key: true, primary: true, primaryPos: 1, notNull: true},
+			{name: "user_id", quoted: `"user_id"`, sourceIndex: 2, key: true, primary: true, primaryPos: 2, notNull: true},
+		},
+	}
+	primary, safe := primaryKeyDeleteColumns(relation)
+	if !safe {
+		t.Fatal("complete primary key was not eligible for exact delete")
+	}
+	var sql strings.Builder
+	params := make([]rawParam, 0, len(primary))
+	tuple := Tuple{
+		{Kind: DatumText, Data: []byte("channel")},
+		{Kind: DatumText, Data: []byte("7")},
+		{Kind: DatumText, Data: []byte("user")},
+	}
+	if err := appendPrimaryKeyDeletePredicate(&sql, &params, relation, primary, tuple); err != nil {
+		t.Fatal(err)
+	}
+	want := `"app_pk" = $1 AND "user_id" = $2 AND "channel_cid" = $3` +
+		` AND ROW("app_pk","user_id","channel_cid")>=ROW($1,$2,$3)` +
+		` AND ROW("app_pk","user_id","channel_cid")<=ROW($1,$2,$3)`
+	if got := sql.String(); got != want {
+		t.Fatalf("single delete predicate = %q, want %q", got, want)
+	}
+	if got := []string{string(params[0].data), string(params[1].data), string(params[2].data)}; !slices.Equal(got, []string{"7", "user", "channel"}) {
+		t.Fatalf("single delete params = %v, want catalog primary-key order", got)
 	}
 }
 
@@ -594,6 +681,53 @@ func TestTextCopyStageDataEscapesNullEmptyAndControlBytes(t *testing.T) {
 	}
 	if supported {
 		t.Fatal("binary datum unexpectedly supported by text stage")
+	}
+}
+
+func TestBinaryCopyStageDataIncludesOrdinalAndExactBinaryValues(t *testing.T) {
+	t.Parallel()
+	relation := preparationRelation()
+	column := relation.columns[0]
+	data, supported, err := binaryCopyStageData(
+		relation,
+		ChangeUpdate,
+		[]targetColumn{column},
+		[]TupleDatum{{Kind: DatumBinary, Data: []byte{0, 0, 0, 7}}},
+		1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !supported {
+		t.Fatal("binary stage unexpectedly unsupported")
+	}
+	if len(data) < 43 || string(data[:11]) != "PGCOPY\n\xff\r\n\x00" {
+		t.Fatalf("binary stage header is invalid: %x", data)
+	}
+	if fields := binary.BigEndian.Uint16(data[19:21]); fields != 2 {
+		t.Fatalf("binary stage fields = %d, want ordinal plus one value", fields)
+	}
+	if ordinalBytes := binary.BigEndian.Uint32(data[21:25]); ordinalBytes != 8 ||
+		binary.BigEndian.Uint64(data[25:33]) != 0 {
+		t.Fatalf("binary stage ordinal is invalid: %x", data[21:33])
+	}
+	if valueBytes := binary.BigEndian.Uint32(data[33:37]); valueBytes != 4 ||
+		!slices.Equal(data[37:41], []byte{0, 0, 0, 7}) {
+		t.Fatalf("binary stage value is invalid: %x", data[33:])
+	}
+
+	_, supported, err = binaryCopyStageData(
+		relation,
+		ChangeUpdate,
+		[]targetColumn{column},
+		[]TupleDatum{{Kind: DatumText, Data: []byte("7")}},
+		1,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if supported {
+		t.Fatal("text datum unexpectedly supported by binary stage")
 	}
 }
 

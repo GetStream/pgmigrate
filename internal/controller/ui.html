@@ -112,10 +112,10 @@
               <label class="config-field">WAL sample duration <input data-config="wal_sample_duration" type="text" placeholder="1m" required></label>
               <label class="config-field">Segment prune interval <input data-config="segment_prune_interval" type="text" placeholder="1m" required></label>
               <label class="config-field">Replay workers <input data-config="replay_workers" type="number" min="1" max="64" step="1" required></label>
-              <label class="config-field">Replay batch bytes <input data-config="replay_batch_bytes" type="number" min="1" step="1" required></label>
-              <label class="config-field">Replay batch changes <input data-config="replay_batch_changes" type="number" min="1" step="1" required></label>
+              <label class="config-field">Replay slice bytes <input data-config="replay_batch_bytes" type="number" min="1" step="1" required></label>
+              <label class="config-field">Replay slice changes <input data-config="replay_batch_changes" type="number" min="1" step="1" required></label>
               <label class="config-field">CDC sample rows <input data-config="cdc_sample_rows" type="number" min="0" step="1" required></label>
-              <small>Replay workers apply small primary-key lanes concurrently. Each lane commits with its exact durable receipt; the resume LSN advances only after every receipt in the claim exists.</small>
+              <small>Four scheduling slices form one durable replay wave. Workers apply key-affine lanes concurrently; safe repeated full-row updates are coalesced, large built-in groups use binary COPY staging, and the resume LSN advances only after every receipt exists and matches exactly.</small>
               <label class="config-check"><input data-config="retry_base_copy" type="checkbox"> Retry failed base-copy parts</label>
             </div></details>
           </fieldset>
