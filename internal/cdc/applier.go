@@ -4111,6 +4111,35 @@ func writeCompositeIdentityCTIDPredicate(
 	batchColumnPrefix string,
 	batchColumnOffset int,
 ) {
+	writeCompositeIdentityCTIDPredicateMode(
+		sql, relation, identityColumns, batchColumnPrefix, batchColumnOffset, false,
+	)
+}
+
+// writeCompositePrimaryKeyCTIDPredicate adds equal lower and upper bounds in
+// the target primary-key order. The scalar equalities remain for exactness,
+// while the row bounds stop PostgreSQL from choosing a smaller prefix index
+// and filtering the remaining key columns after a potentially huge scan.
+func writeCompositePrimaryKeyCTIDPredicate(
+	sql *strings.Builder,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	batchColumnPrefix string,
+	batchColumnOffset int,
+) {
+	writeCompositeIdentityCTIDPredicateMode(
+		sql, relation, identityColumns, batchColumnPrefix, batchColumnOffset, true,
+	)
+}
+
+func writeCompositeIdentityCTIDPredicateMode(
+	sql *strings.Builder,
+	relation *targetRelation,
+	identityColumns []targetColumn,
+	batchColumnPrefix string,
+	batchColumnOffset int,
+	primaryKeyBounds bool,
+) {
 	sql.WriteString("pgmigrate_target.ctid=(SELECT pgmigrate_lookup.ctid FROM ")
 	sql.WriteString(relation.quoted)
 	sql.WriteString(" AS pgmigrate_lookup WHERE ")
@@ -4124,6 +4153,33 @@ func writeCompositeIdentityCTIDPredicate(
 			sql, "=pgmigrate_batch.%s%d",
 			batchColumnPrefix, batchColumnOffset+i,
 		)
+	}
+	if primaryKeyBounds && len(identityColumns) > 1 {
+		writeLookupPrimaryKeyBound := func(operator string) {
+			sql.WriteString(" AND ROW(")
+			for i, column := range identityColumns {
+				if i != 0 {
+					sql.WriteByte(',')
+				}
+				sql.WriteString("pgmigrate_lookup.")
+				sql.WriteString(column.quoted)
+			}
+			sql.WriteByte(')')
+			sql.WriteString(operator)
+			sql.WriteString("ROW(")
+			for i := range identityColumns {
+				if i != 0 {
+					sql.WriteByte(',')
+				}
+				fmt.Fprintf(
+					sql, "pgmigrate_batch.%s%d",
+					batchColumnPrefix, batchColumnOffset+i,
+				)
+			}
+			sql.WriteByte(')')
+		}
+		writeLookupPrimaryKeyBound(">=")
+		writeLookupPrimaryKeyBound("<=")
 	}
 	sql.WriteString(" OFFSET 0)")
 }
@@ -4634,10 +4690,62 @@ func writeDeleteIdentityPredicate(
 	offset int,
 ) {
 	if deleteUsesTargetPrimaryKey(relation, identityColumns) {
-		writeCompositeIdentityCTIDPredicate(sql, relation, identityColumns, prefix, offset)
+		writeCompositePrimaryKeyCTIDPredicate(sql, relation, identityColumns, prefix, offset)
 		return
 	}
 	writeBatchIdentityPredicate(sql, identityColumns, prefix, offset)
+}
+
+func appendPrimaryKeyDeletePredicate(
+	sql *strings.Builder,
+	params *[]rawParam,
+	relation *targetRelation,
+	primary []targetColumn,
+	tuple Tuple,
+) error {
+	positions := make([]int, len(primary))
+	for i, column := range primary {
+		datum := tuple[column.sourceIndex]
+		if datum.Kind == DatumUnchangedToast {
+			return divergenceFor(relation, ChangeDelete, "primary key contains unchanged TOAST")
+		}
+		param, err := datumParamForColumn(relation, column, datum, ChangeDelete)
+		if err != nil {
+			return err
+		}
+		*params = append(*params, param)
+		positions[i] = len(*params)
+		if i != 0 {
+			sql.WriteString(" AND ")
+		}
+		sql.WriteString(column.quoted)
+		fmt.Fprintf(sql, " = $%d", positions[i])
+	}
+	if len(primary) < 2 {
+		return nil
+	}
+	writeBound := func(operator string) {
+		sql.WriteString(" AND ROW(")
+		for i, column := range primary {
+			if i != 0 {
+				sql.WriteByte(',')
+			}
+			sql.WriteString(column.quoted)
+		}
+		sql.WriteByte(')')
+		sql.WriteString(operator)
+		sql.WriteString("ROW(")
+		for i, position := range positions {
+			if i != 0 {
+				sql.WriteByte(',')
+			}
+			fmt.Fprintf(sql, "$%d", position)
+		}
+		sql.WriteByte(')')
+	}
+	writeBound(">=")
+	writeBound("<=")
+	return nil
 }
 
 func batchDeleteIdentityKey(
@@ -4866,8 +4974,16 @@ func applyDelete(replay *applyPipeline, relation *targetRelation, change *Change
 	sql.WriteString(relation.quoted)
 	sql.WriteString(" WHERE ")
 	params := make([]rawParam, 0, len(relation.columns))
-	if err := appendPredicate(&sql, &params, relation, *change.Old, ChangeDelete); err != nil {
-		return err
+	if primary, safe := primaryKeyDeleteColumns(relation); safe {
+		if err := appendPrimaryKeyDeletePredicate(
+			&sql, &params, relation, primary, *change.Old,
+		); err != nil {
+			return err
+		}
+	} else {
+		if err := appendPredicate(&sql, &params, relation, *change.Old, ChangeDelete); err != nil {
+			return err
+		}
 	}
 	return replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeDelete,

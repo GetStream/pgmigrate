@@ -395,7 +395,11 @@ func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
 	writeDeleteIdentityPredicate(&sql, relation, primary, "identity_", 0)
 	want := `pgmigrate_target.ctid=(SELECT pgmigrate_lookup.ctid FROM "shard_schema"."messages" AS pgmigrate_lookup ` +
 		`WHERE pgmigrate_lookup."app_pk"=pgmigrate_batch.identity_0 AND ` +
-		`pgmigrate_lookup."id"=pgmigrate_batch.identity_1 OFFSET 0)`
+		`pgmigrate_lookup."id"=pgmigrate_batch.identity_1 AND ` +
+		`ROW(pgmigrate_lookup."app_pk",pgmigrate_lookup."id")>=` +
+		`ROW(pgmigrate_batch.identity_0,pgmigrate_batch.identity_1) AND ` +
+		`ROW(pgmigrate_lookup."app_pk",pgmigrate_lookup."id")<=` +
+		`ROW(pgmigrate_batch.identity_0,pgmigrate_batch.identity_1) OFFSET 0)`
 	if got := sql.String(); got != want {
 		t.Fatalf("delete predicate = %q, want forced target primary key %q", got, want)
 	}
@@ -403,6 +407,45 @@ func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
 	relation.columns[1].key = false
 	if _, safe := primaryKeyDeleteColumns(relation); safe {
 		t.Fatal("delete used a target primary key absent from the old pgoutput tuple")
+	}
+}
+
+func TestSinglePrimaryKeyDeleteAddsExactCatalogOrderedBounds(t *testing.T) {
+	t.Parallel()
+	relation := &targetRelation{
+		quoted:       `"shard_schema"."read_state"`,
+		capabilities: targetRelationCapabilities{keyedSetDML: true},
+		source: Relation{Columns: []Column{
+			{Name: "channel_cid"}, {Name: "app_pk"}, {Name: "user_id"},
+		}},
+		columns: []targetColumn{
+			{name: "channel_cid", quoted: `"channel_cid"`, sourceIndex: 0, key: true, primary: true, primaryPos: 3, notNull: true},
+			{name: "app_pk", quoted: `"app_pk"`, sourceIndex: 1, key: true, primary: true, primaryPos: 1, notNull: true},
+			{name: "user_id", quoted: `"user_id"`, sourceIndex: 2, key: true, primary: true, primaryPos: 2, notNull: true},
+		},
+	}
+	primary, safe := primaryKeyDeleteColumns(relation)
+	if !safe {
+		t.Fatal("complete primary key was not eligible for exact delete")
+	}
+	var sql strings.Builder
+	params := make([]rawParam, 0, len(primary))
+	tuple := Tuple{
+		{Kind: DatumText, Data: []byte("channel")},
+		{Kind: DatumText, Data: []byte("7")},
+		{Kind: DatumText, Data: []byte("user")},
+	}
+	if err := appendPrimaryKeyDeletePredicate(&sql, &params, relation, primary, tuple); err != nil {
+		t.Fatal(err)
+	}
+	want := `"app_pk" = $1 AND "user_id" = $2 AND "channel_cid" = $3` +
+		` AND ROW("app_pk","user_id","channel_cid")>=ROW($1,$2,$3)` +
+		` AND ROW("app_pk","user_id","channel_cid")<=ROW($1,$2,$3)`
+	if got := sql.String(); got != want {
+		t.Fatalf("single delete predicate = %q, want %q", got, want)
+	}
+	if got := []string{string(params[0].data), string(params[1].data), string(params[2].data)}; !slices.Equal(got, []string{"7", "user", "channel"}) {
+		t.Fatalf("single delete params = %v, want catalog primary-key order", got)
 	}
 }
 
