@@ -454,7 +454,7 @@ func TestPrimaryKeyDeleteUsesCatalogIndexOrder(t *testing.T) {
 	}
 }
 
-func TestSinglePrimaryKeyDeleteAddsExactCatalogOrderedBounds(t *testing.T) {
+func TestSinglePrimaryKeyDeleteUsesExactCatalogOrderedEqualities(t *testing.T) {
 	t.Parallel()
 	relation := &targetRelation{
 		quoted:       `"shard_schema"."read_state"`,
@@ -482,9 +482,7 @@ func TestSinglePrimaryKeyDeleteAddsExactCatalogOrderedBounds(t *testing.T) {
 	if err := appendPrimaryKeyDeletePredicate(&sql, &params, relation, primary, tuple); err != nil {
 		t.Fatal(err)
 	}
-	want := `"app_pk" = $1 AND "user_id" = $2 AND "channel_cid" = $3` +
-		` AND ROW("app_pk","user_id","channel_cid")>=ROW($1,$2,$3)` +
-		` AND ROW("app_pk","user_id","channel_cid")<=ROW($1,$2,$3)`
+	want := `"app_pk" = $1 AND "user_id" = $2 AND "channel_cid" = $3`
 	if got := sql.String(); got != want {
 		t.Fatalf("single delete predicate = %q, want %q", got, want)
 	}

@@ -4917,7 +4917,6 @@ func appendPrimaryKeyDeletePredicate(
 	primary []targetColumn,
 	tuple Tuple,
 ) error {
-	positions := make([]int, len(primary))
 	for i, column := range primary {
 		datum := tuple[column.sourceIndex]
 		if datum.Kind == DatumUnchangedToast {
@@ -4928,37 +4927,12 @@ func appendPrimaryKeyDeletePredicate(
 			return err
 		}
 		*params = append(*params, param)
-		positions[i] = len(*params)
 		if i != 0 {
 			sql.WriteString(" AND ")
 		}
 		sql.WriteString(column.quoted)
-		fmt.Fprintf(sql, " = $%d", positions[i])
+		fmt.Fprintf(sql, " = $%d", len(*params))
 	}
-	if len(primary) < 2 {
-		return nil
-	}
-	writeBound := func(operator string) {
-		sql.WriteString(" AND ROW(")
-		for i, column := range primary {
-			if i != 0 {
-				sql.WriteByte(',')
-			}
-			sql.WriteString(column.quoted)
-		}
-		sql.WriteByte(')')
-		sql.WriteString(operator)
-		sql.WriteString("ROW(")
-		for i, position := range positions {
-			if i != 0 {
-				sql.WriteByte(',')
-			}
-			fmt.Fprintf(sql, "$%d", position)
-		}
-		sql.WriteByte(')')
-	}
-	writeBound(">=")
-	writeBound("<=")
 	return nil
 }
 
