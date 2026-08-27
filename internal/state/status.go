@@ -103,9 +103,34 @@ func (s *Store) Snapshot(ctx context.Context) (Status, error) {
 
 // Migration returns current singleton metadata.
 func (s *Store) Migration(ctx context.Context) (Migration, error) {
-	status, err := s.Snapshot(ctx)
-	if err != nil {
-		return Migration{}, err
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return Migration{}, ErrClosed
 	}
-	return status.Migration, nil
+
+	// CDC reads the cutover boundary for every message; do not scan progress here.
+	var migration Migration
+	var createdAt, updatedAt int64
+	if err := s.db.QueryRowContext(
+		ctx, `
+		SELECT source_fingerprint, filter_fingerprint, slot_name, snapshot_name,
+			consistent_point, phase, end_position, created_at, updated_at
+		FROM migration WHERE id=1`,
+	).Scan(
+		&migration.SourceFingerprint,
+		&migration.FilterFingerprint,
+		&migration.SlotName,
+		&migration.SnapshotName,
+		&migration.ConsistentPoint,
+		&migration.Phase,
+		&migration.EndPosition,
+		&createdAt,
+		&updatedAt,
+	); err != nil {
+		return Migration{}, fmt.Errorf("read migration status: %w", err)
+	}
+	migration.CreatedAt = fromUnixNano(createdAt)
+	migration.UpdatedAt = fromUnixNano(updatedAt)
+	return migration, nil
 }
