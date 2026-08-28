@@ -202,7 +202,7 @@ PGMIGRATE_BIN="$binary" PGMIGRATE_SOURCE="$source_url" \
 
 echo "running preflight"
 if [ "$driver" = controller ]; then
-    PGMIGRATE_SOURCE= PGMIGRATE_TARGET= "$binary" controller \
+    PGMIGRATE_SOURCE= PGMIGRATE_TARGET= "${PGMIGRATE_INITIAL_BIN:-$binary}" controller \
         --dir "$migration_dir" \
         --listen "$controller_listen" \
         --token "$controller_token" >"$migration_dir/controller.log" 2>&1 &
@@ -477,6 +477,42 @@ if [ "$driver" = controller ]; then
         fi
         echo "controller survived replay worker kill; resumed at $resumed_stats"
     fi
+fi
+
+# Replace the whole controller in follow, not just its child worker. An optional
+# initial binary lets this rehearse an upgrade against the same durable state.
+if [ "$driver" = controller ]; then
+    saved_config=$(cksum <"$migration_dir/controller-config.json")
+    kill -TERM "$controller_pid"
+    wait "$controller_pid"
+    controller_pid=
+    stopped_stats=$(target_sql -Atqc "SELECT transactions_applied::text || '|' || rows_applied::text FROM pgmigrate_internal.replication_progress LIMIT 1")
+    PGMIGRATE_SOURCE="$source_url" PGMIGRATE_TARGET="$target_url" "$binary" controller \
+        --dir "$migration_dir" --listen "$controller_listen" --token "$controller_token" \
+        >"$migration_dir/controller-resumed.log" 2>&1 &
+    controller_pid=$!
+    deadline=$(( $(date +%s) + timeout ))
+    until controller_status >/dev/null 2>&1; do
+        if ! kill -0 "$controller_pid" 2>/dev/null || [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "replacement controller did not start" >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    if [ "$(cksum <"$migration_dir/controller-config.json")" != "$saved_config" ]; then
+        echo "saved configuration changed across controller replacement" >&2
+        exit 1
+    fi
+    restored_config=$(curl -fsS -H "X-PGMigrate-Token: $controller_token" "$controller_url/api/config")
+    controller_revision=$(printf '%s\n' "$restored_config" | sed -n 's/.*"revision":"\([^"]*\)".*/\1/p')
+    controller_action run
+    sleep 1
+    resumed_stats=$(target_sql -Atqc "SELECT transactions_applied::text || '|' || rows_applied::text FROM pgmigrate_internal.replication_progress LIMIT 1")
+    if [ "${resumed_stats%%|*}" -lt "${stopped_stats%%|*}" ] || [ "${resumed_stats#*|}" -lt "${stopped_stats#*|}" ]; then
+        echo "durable replay counters regressed after controller replacement" >&2
+        exit 1
+    fi
+    echo "controller replacement preserved configuration and replay: $stopped_stats -> $resumed_stats"
 fi
 
 # Verification while the source is still taking writes. A row read from a live

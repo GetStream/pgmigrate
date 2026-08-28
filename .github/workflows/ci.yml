@@ -37,6 +37,8 @@ jobs:
       # Compiles the integration-tagged files without running them; those and the
       # Compose end-to-end suites need PostgreSQL and are run by hand.
       - run: make test
+      - name: Controller JavaScript regression tests
+        run: make ui-test
       # Apply, the copy workers, and the CDC handoff are concurrent, and a race
       # between them is not something anyone reproduces by hand twice.
       - run: make race

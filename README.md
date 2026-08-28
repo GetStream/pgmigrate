@@ -349,6 +349,40 @@ first durable part completion. The lifecycle bar is stage progress, not an
 elapsed-time estimate; the object and verification bars use the recorded
 completed and total work.
 
+The **WAL positions and gaps** panel compares current primary WAL with the
+recorded durable capture and apply checkpoints. It shows source minus captured
+(not yet captured), captured minus applied (staged replay), and source minus
+applied (end-to-end gap). LSNs and decimal byte differences preserve all 64 bits.
+These are WAL-byte distances, not row counts or CDC file sizes. Source WAL is
+sampled after the local checkpoints, so live gaps are conservative and include
+sampling delay. A zero staged gap or `follow` phase does **not** establish that
+the source has been caught up. Even zero end-to-end gap is not data validation
+or authorization to cut over.
+
+Source generation, capture, and replay rates are measured separately over a
+rolling window; end-to-end ETA uses replay minus actual source generation and
+is shown only when that net rate is positive. Missing, inconsistent, or stale
+samples show unavailable, not zero. The source identity must match the durable
+migration before its LSN is compared.
+
+The **VACUUM and index-build progress** panel reads PostgreSQL's progress views
+in each configured database, including autovacuum, `CREATE INDEX`/`REINDEX`
+and their concurrent variants, and `VACUUM FULL`. It shows table/index, current
+phase, PID, elapsed time, waits and phase-specific block/tuple/locker counters.
+A phase bar reaching 100% is not overall completion; some phases have no
+measurable total and vacuum phases may repeat. Completed jobs disappear from
+the live views. See [PostgreSQL progress reporting](https://www.postgresql.org/docs/current/progress-reporting.html).
+
+These authenticated, read-only diagnostics use `GET /api/diagnostics`, separate
+from durable status and replay. All tabs share a five-second sample; collection
+has a three-second deadline, at most two database connections per sample, 1.5-second SQL
+timeouts, and at most 100 maintenance jobs per database. No table data or query
+text is read, and no maintenance commands are issued. `pg_read_all_stats` is
+needed to see other users' job details; source identity checking also needs
+permission to execute `pg_control_system()`. Insufficient permissions remain
+visible as unavailable/restricted results; the controller never grants them.
+Source and target monitoring failures are independent and do not stop replay.
+
 The lifecycle is also rendered as an ordered, numbered ten-step path from
 preflight through completion, with cutover marked CLI-only. Findings are
 collapsed by default and classified as blockers, accepted risks,

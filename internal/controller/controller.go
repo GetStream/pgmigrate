@@ -36,7 +36,7 @@ const (
 	outputLimit = 64 << 10
 )
 
-//go:embed ui.html
+//go:embed ui.html progress.js
 var assets embed.FS
 
 // Action is one operation the controller may supervise.
@@ -78,6 +78,7 @@ type Server struct {
 	configRevision    uint64
 	configurationPath string
 	copySample        copySample
+	diagnostics       diagnosticsCache
 }
 
 type copySample struct {
@@ -320,6 +321,8 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /", s.index)
 	mux.HandleFunc("GET /api/status", s.status)
+	mux.HandleFunc("GET /api/diagnostics", s.serveDiagnostics)
+	mux.HandleFunc("GET /progress.js", s.progressScript)
 	mux.HandleFunc("GET /api/config", s.getConfiguration)
 	mux.HandleFunc("PUT /api/config", s.putConfiguration)
 	mux.HandleFunc("POST /api/actions/{action}", s.action)

@@ -1,7 +1,8 @@
 GO ?= go
 GOFLAGS ?=
+NODE ?= node
 
-.PHONY: fmt vet test race integration bench cdc-bench e2e controller-e2e restart-e2e crash-e2e
+.PHONY: fmt vet test race ui-test integration bench cdc-bench e2e controller-e2e restart-e2e crash-e2e
 
 fmt:
 	$(GO) $(GOFLAGS) fmt ./...
@@ -14,6 +15,9 @@ test:
 
 race:
 	$(GO) $(GOFLAGS) test -race ./...
+
+ui-test:
+	$(NODE) --test internal/controller/progress_test.cjs
 
 integration:
 	$(GO) $(GOFLAGS) test -tags=integration ./...
