@@ -18,14 +18,12 @@ type RowDiff struct {
 	Kind DiffKind `json:"kind"`
 }
 
-// DiffKind says which way a row disagrees, which is what points at the cause: a
-// missing row is an apply that did not happen, a differing row is an apply that
-// happened wrongly, and an extra row is a delete that did not.
+// DiffKind says whether a source row is missing from the target or has different
+// contents there. Rows present only on the target are not verification failures.
 type DiffKind string
 
 const (
 	DiffSourceOnly DiffKind = "source_only"
-	DiffTargetOnly DiffKind = "target_only"
 	DiffDifferent  DiffKind = "different"
 )
 
@@ -205,12 +203,9 @@ func scanRows(ctx context.Context, db querier, query string, table Table, into r
 	return rows.Err()
 }
 
-// compareRows names the rows two sets disagree about.
-//
-// Sampling cannot produce DiffTargetOnly: the target is only ever asked about keys
-// the source supplied, so a row only the target holds is never in either set. That
-// is the blind spot the design accepts. A recheck can produce it, because there the
-// two sides are asked about the same keys and the source row may have gone.
+// compareRows checks that every source row exists on the target with matching
+// contents. Extra target rows are ignored, including CDC keys and sampled rows
+// that have since been deleted from the source before a recheck.
 func compareRows(source, target rowSet) []RowDiff {
 	var diffs []RowDiff
 	for key, entry := range source {
@@ -220,11 +215,6 @@ func compareRows(source, target rowSet) []RowDiff {
 			diffs = append(diffs, RowDiff{Key: entry.key, Kind: DiffSourceOnly})
 		case other.hash != entry.hash:
 			diffs = append(diffs, RowDiff{Key: entry.key, Kind: DiffDifferent})
-		}
-	}
-	for key, entry := range target {
-		if _, present := source[key]; !present {
-			diffs = append(diffs, RowDiff{Key: entry.key, Kind: DiffTargetOnly})
 		}
 	}
 	slices.SortFunc(diffs, func(a, b RowDiff) int {

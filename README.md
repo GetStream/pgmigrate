@@ -173,7 +173,7 @@ verify e2e.orders: checking cdc, 119 of 119 applied rows
 verify e2e.orders: done 1115 of 1115 rows (100.0%), 12 pages read, measuring rate
 verify e2e.metrics: done 0 of 0 rows (0.0%), 0 pages read, measuring rate
 warning: "e2e"."metrics" was not compared, because it has no primary key and no usable unique index, and a sampled row can only be found on the target by key
-verified 11 tables: 5236 of 5236 rows sampled, 978 of 978 applied rows checked (101 deletions), 0 divergent, 1 not compared for want of a key
+verified 11 tables: 5236 of 5236 rows sampled, 978 of 978 applied rows checked (101 recorded delete keys; target-only rows ignored), 0 divergent, 1 not compared for want of a key
 ```
 
 The progress lines and the summary go to standard error; the full result goes to
@@ -675,10 +675,10 @@ The heap sample cannot reach the rows the applier wrote. It samples by physical
 position, and on a bloated heap position says nothing about write time: measured
 on a production shard, none of the sample's 128 windows intersected the band
 holding nine hours of applied changes, so the sample was validating `pg_restore`
-and skipping the applier, which is the new code. Deletions make the case
-strongest, because a row the source deleted and the target kept is absent from
-every read of the source: on that shard, 8,201 of 8,984 recorded changes on the
-busiest table were deletions from a retention job.
+and skipping the applier, which is the new code. The recorded keys let verification
+check those rows directly when they still exist on the source. Keys deleted from
+the source do not require absence on the target: verification only checks source
+rows against the target.
 
 So the applier records the identity of the rows it writes, as a reservoir sample
 capped at `--cdc-sample-rows` per relation, kept uniform over the whole change
@@ -795,8 +795,10 @@ with a collatable partition key, where rows can route to a different partition.
 
 ## Verification
 
-`verify` checks each selected table two ways, and reports them separately
-because they answer different questions.
+`verify` checks **source → target only**: each checked source row must be present
+on the target with matching column values. Extra target rows do not cause a
+mismatch. It uses two samples, reported separately because they cover different
+rows.
 
 It **samples the heap**: it reads about a million rows from the source and looks
 those exact rows up on the target by key. Both sides return a hash of the whole
@@ -814,13 +816,15 @@ opposite things. A relation whose recorded key does not cover the columns
 `verify` keys rows on — the applier keys a change on the replica identity, which
 may differ from the primary key — is skipped with that reason.
 
+The same one-way rule applies to CDC keys and rechecks. A key absent from the
+source is ignored even if the target still holds it, including recorded deletes.
+If the key was reinserted on the source, its current row must match on the target.
+The reported delete count describes recorded operations, not verified removals.
+
 **Read this for what a pass does and does not mean.** It is a smoke test, not a
-proof: it finds divergence and never proves its absence. The heap sample is also
-blind in one direction, because it walks the source, so a row the target holds and
-the source does not — an unapplied delete, or a duplicate — is never looked at. A
-*recorded* delete is asked about on both sides and so is caught; a target-only row
-nobody recorded a change for is still invisible, and finding it would need a
-target-side scan.
+proof: it finds divergence and never proves its absence. It does not enforce
+equal table counts or target → source inclusion, and does not detect unapplied
+deletes. A clean result means the source rows checked matched the target.
 
 The row budget is spread over `--verify-sample-windows` evenly spaced places in
 the heap, with the last window pinned to the end of it, because that is where
@@ -830,7 +834,7 @@ of the same production table, so a budget spent in one place is a sample of that
 place rather than of the table. Each window is bounded twice, by its page interval
 and by a row limit, so a dense region stops early and a sparse one returns less. A
 table small enough to fit inside the budget is read whole, so `verify` on a small
-database compares everything it holds.
+database compares every row in its keyed source tables.
 
 A table with no primary key and no `NOT NULL` unique index **cannot be checked at
 all**, because there is nothing to look its rows up on the target by. It is
@@ -998,8 +1002,8 @@ controlled by `PGMIGRATE_CDC_BENCH_TRANSACTIONS` and
 - The delivered e2e bed is PostgreSQL 17 to 17. Cross-major compatibility has
   focused integration probes but no full cross-major Compose migration.
 - Verification samples, and reports 64-bit server-side hashes rather than a
-  cryptographic proof. It cannot see a target-only row nobody recorded a change
-  for, cannot check a table with no primary key and no `NOT NULL` unique index at
+  cryptographic proof. It ignores all target-only rows, including unapplied
+  deletes, cannot check a table with no primary key and no `NOT NULL` unique index at
   all, and checks the rows replication wrote as a capped sample of what the
   applier reported rather than exhaustively from the decoded stream.
 - Cutover enforces nothing. It does not check that application writes stopped and

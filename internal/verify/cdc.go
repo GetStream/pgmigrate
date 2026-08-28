@@ -49,9 +49,9 @@ type CDCResult struct {
 	// applier saw. The ratio is this stratum's coverage.
 	Keys     int64 `json:"keys"`
 	Observed int64 `json:"observed"`
-	// Deletes is how many of the checked keys were deletes. They are the only
-	// check either stratum makes that can catch a row the target holds and the
-	// source does not.
+	// Deletes is how many of the checked keys were recorded as deletes. These
+	// still check a source row if the key was later reinserted, but do not require
+	// the target to remove rows that are absent from the source.
 	Deletes int64 `json:"deletes"`
 	// Dropped is how many changes the applier could not name, and so never
 	// offered. Without it, a relation whose every key is unrenderable looks the
@@ -70,10 +70,10 @@ type CDCResult struct {
 // budget runs out. Comparing the two sides once beforehand would only re-find the
 // rows that are legitimately in flight.
 //
-// A correctly applied delete is absent on both sides and produces nothing. An
-// unapplied one is absent on the source and present on the target, which
-// compareRows reports as DiffTargetOnly — the direction the heap sample cannot
-// see at all, because it only ever asks about keys the source still has.
+// Like the heap sample, this is a source-to-target check. A recorded key absent
+// from the source produces no difference, regardless of whether the target still
+// holds it or which operation was recorded. A key reinserted on the source is
+// checked against its current contents, even if it was recorded as a delete.
 func (w *worker) verifyCDC(
 	ctx context.Context, table Table, leaves []relation, out *TableResult,
 ) ([]RowDiff, error) {

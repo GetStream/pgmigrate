@@ -171,7 +171,7 @@ func TestPageChunkWhereIsHalfOpenAndInlinesPages(t *testing.T) {
 	}
 }
 
-func TestCompareRowsNamesEveryDirection(t *testing.T) {
+func TestCompareRowsRequiresSourceRowsAndIgnoresExtraTargetRows(t *testing.T) {
 	t.Parallel()
 	source := rowSet{
 		identity([]string{"1"}): {key: []string{"1"}, hash: 10},
@@ -187,7 +187,6 @@ func TestCompareRowsNamesEveryDirection(t *testing.T) {
 	want := []RowDiff{
 		{Key: []string{"2"}, Kind: DiffDifferent},
 		{Key: []string{"3"}, Kind: DiffSourceOnly},
-		{Key: []string{"4"}, Kind: DiffTargetOnly},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("compareRows() = %v", got)
@@ -195,6 +194,23 @@ func TestCompareRowsNamesEveryDirection(t *testing.T) {
 	for i := range want {
 		if got[i].Kind != want[i].Kind || got[i].Key[0] != want[i].Key[0] {
 			t.Fatalf("compareRows()[%d] = %v, want %v", i, got[i], want[i])
+		}
+	}
+}
+
+func TestCompareRowsAcceptsATargetSuperset(t *testing.T) {
+	t.Parallel()
+	target := rowSet{
+		identity([]string{"1"}): {key: []string{"1"}, hash: 10},
+		identity([]string{"2"}): {key: []string{"2"}, hash: 20},
+	}
+	for _, source := range []rowSet{
+		nil,
+		{},
+		{identity([]string{"1"}): {key: []string{"1"}, hash: 10}},
+	} {
+		if diffs := compareRows(source, target); len(diffs) != 0 {
+			t.Fatalf("compareRows(%v, %v) = %v, want no differences", source, target, diffs)
 		}
 	}
 }

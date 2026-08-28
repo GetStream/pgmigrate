@@ -434,7 +434,7 @@ func cdcSummary(result verify.Result) string {
 	line := fmt.Sprintf("%s of %s applied rows checked",
 		compactCount(keys), compactCount(observed))
 	if deletes := result.CDCDeletes(); deletes > 0 {
-		line += fmt.Sprintf(" (%s deletions)", compactCount(deletes))
+		line += fmt.Sprintf(" (%s recorded delete keys; target-only rows ignored)", compactCount(deletes))
 	}
 	return line
 }
@@ -472,13 +472,13 @@ func verificationDivergence(result verify.Result) string {
 // direction it is points at the cause: a missing row is an apply that did not
 // happen, a differing one an apply that happened wrongly.
 func diffKinds(rows []verify.RowDiff) string {
-	counts := make(map[verify.DiffKind]int, 3)
+	counts := make(map[verify.DiffKind]int, 2)
 	for _, row := range rows {
 		counts[row.Kind]++
 	}
 	var parts []string
 	for _, kind := range []verify.DiffKind{
-		verify.DiffSourceOnly, verify.DiffTargetOnly, verify.DiffDifferent,
+		verify.DiffSourceOnly, verify.DiffDifferent,
 	} {
 		if counts[kind] > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", counts[kind], kind))

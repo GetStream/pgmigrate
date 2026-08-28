@@ -12,11 +12,10 @@
 // 330M row hashes for a 66-minute answer on one production shard, 57 minutes of it
 // a single table. See docs/design-verify-sampled.md.
 //
-// What a sample cannot do is prove that two tables match. It finds divergence and
-// it never proves its absence, and it is blind in one direction: it walks the
-// source, so a row the target holds and the source does not — an unapplied delete,
-// or a duplicate — is never looked at. A clean result means the rows that were
-// compared agreed.
+// Verification is one-way: source rows must exist on the target with matching
+// contents. Extra target rows are ignored, including during CDC checks and
+// rechecks. A sample cannot prove that every source row matches; a clean result
+// means only that the source rows compared agreed.
 package verify
 
 import (
