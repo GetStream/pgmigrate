@@ -388,10 +388,10 @@ func verificationWarnings(result verify.Result) string {
 // hide it.
 func verificationSummary(result verify.Result) string {
 	var (
-		compared, skipped  int
-		sampled, estimated int64
-		leastName          string
-		least              = 1.0
+		compared, skipped, ignored int
+		sampled, estimated         int64
+		leastName                  string
+		least                      = 1.0
 	)
 	for _, table := range result.Tables {
 		if len(table.Table.Key.Columns) == 0 {
@@ -399,6 +399,7 @@ func verificationSummary(result verify.Result) string {
 			continue
 		}
 		compared++
+		ignored += table.IgnoredRows
 		sampled += table.Source.Rows
 		// An unanalyzed table estimates zero rows, and a stale estimate can be
 		// under what was read. Neither is a denominator.
@@ -418,6 +419,9 @@ func verificationSummary(result verify.Result) string {
 	}
 	if skipped > 0 {
 		line += fmt.Sprintf(", %d not compared for want of a key", skipped)
+	}
+	if ignored > 0 {
+		line += fmt.Sprintf("; %d mismatches ignored by application scope (audited)", ignored)
 	}
 	return line + "\n"
 }
@@ -447,7 +451,7 @@ func cdcSummary(result verify.Result) string {
 		advanced += table.CDC.Advanced
 	}
 	if changed > 0 {
-		line += fmt.Sprintf("; %d source-changed CDC rows required target advancement", changed)
+		line += fmt.Sprintf("; %d source-changed CDC rows checked for convergence or target advancement", changed)
 	}
 	if advanced > 0 {
 		line += fmt.Sprintf("; %d CDC target rows advanced without matching; accepted as progressing", advanced)

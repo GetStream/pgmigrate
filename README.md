@@ -459,8 +459,9 @@ standard error. A named divergence, or a table stopped early, exits non-zero.
 | `--verify-batch-rows <n>` | `5000` | keys per target lookup statement, clamped down for a very wide key to stay under the bind-parameter limit |
 | `--verify-duty-cycle <fraction>` | `1` | fraction of the wall clock verification may spend querying, sleeping between windows to stay under it. Must be greater than 0 and at most 1 |
 | `--verify-table-timeout <duration>` | `20m` | active time one table's check may take, including the single CDC recheck, excluding its delay and queue time. `0` disables it. A table stopped here reports incomplete and cannot report convergence |
-| `--verify-converge-timeout <duration>` | `1m` | how long a heap-sample row that appears to differ is given to settle against a fixed WAL position before it is reported; CDC mismatches use the separate one-minute deferred check |
+| `--verify-converge-timeout <duration>` | `1m` | heap convergence budget and maximum replay confirmation wait during the single deferred CDC check; confirmation timeout reports incomplete |
 | `--verify-cdc-rows <n>` | `100000` | applier-recorded keys per table checked alongside the heap sample. `0` falls back to the default |
+| `--verify-ignore-apps <ids>` | empty | comma-separated positive `app_pk` IDs whose mismatches are audited but excluded from verification verdicts; copy, capture and replay are unchanged |
 
 ### pgmigrate sequences
 
@@ -829,8 +830,11 @@ The reported delete count describes recorded operations, not verified removals.
 **CDC mismatches are deferred for at least one minute.** The initial observation
 captures each candidate's source hash and row version (`xmin`), and audits both
 source and target hashes/presence. A dedicated worker rechecks those exact keys
-after the delay while other tables continue scanning. It reads the source, then
-the target, then the source again. **A matching target passes first**, provided
+after the delay while other tables continue scanning. It reads the source, emits
+a source WAL marker, waits for replay to pass that marker, then reads the target
+and the source again. This confirms replay has seen the fresh source snapshot;
+elapsed time alone does not establish that. Without a live applier, the marker
+and wait are omitted. **A matching target passes first**, provided
 the source hash and version stayed stable across the bracketed reads. This also
 passes when the source changed since the initial observation and the target
 already held the matching value in its initial snapshot; no further target
@@ -856,9 +860,23 @@ rows are not queued again. Source changes are counted and flagged in the audit;
 they never grant an automatic skip. Advancing targets are counted separately
 from matched rows.
 The result finishes once those outcomes are recorded. The one-minute delay and
-queue time do not consume `--verify-table-timeout`, but the reads do. Cancellation
-or timeout reports incomplete. `--verify-converge-timeout` only controls the
-separate heap-sample retries.
+queue time do not consume `--verify-table-timeout`, but reads and replay
+confirmation do. Confirmation also has a hard `--verify-converge-timeout` limit,
+even with table timeouts disabled. Failure to reach the marker within that budget
+reports incomplete, retaining pending keys for audit, not divergence or success.
+Cancellation and execution errors also cannot pass. No candidate is requeued.
+
+**Optional app exclusions affect verification only.** Configure
+`--verify-ignore-apps 7,42`, or `verify_ignore_apps` in the controller settings, to
+exclude mismatches belonging to those source `app_pk` values. The column can be
+part of the key or an ordinary column. Tables without `app_pk` and rows with a
+NULL or other source app remain in scope; a target app value cannot exempt them.
+No rows are skipped by copy, capture, or replay. Samples are still read and
+compared, and every excluded mismatch is recorded as `ignored_app` with `app_id`
+and snapshots. `ignored_rows` counts observations, so a key checked by both heap
+and CDC can contribute twice. The run audit records `ignored_apps`; the summary
+and controller configuration banner disclose the exclusion. A clean result
+applies only to the non-excluded scope. Empty settings clear the exclusion.
 
 **Every observed mismatch is audited**, including ones that later converge or
 are accepted as advancing, in `<dir>/log/verify-audit.jsonl`. This append-only JSONL file is
@@ -867,7 +885,8 @@ Records carry a run ID, UTC timestamp, table, key, stratum, mismatch kind, row
 presence, hashes, and row versions where applicable. CDC outcome records also
 carry the original source metadata, initial target metadata, and both later
 source reads, a `source_changed` flag, and outcomes `converged`, `advanced`,
-`unresolved`, or `incomplete`. Incomplete outcomes retain the original source
+`unresolved`, `ignored_app`, or `incomplete`, and the replay confirmation boundary
+when one was established. Incomplete outcomes retain the original source
 metadata; earlier records retain the last observed target. Run start/end records
 distinguish clean, divergent, and incomplete runs; an interrupted process may
 leave a start without an end. All initial heap mismatches are logged before the

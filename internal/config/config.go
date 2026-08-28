@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -76,6 +78,9 @@ type Config struct {
 	VerifyTableTimeout    time.Duration
 	VerifyConvergeTimeout time.Duration
 	VerifyCDCRows         int64
+	// VerifyIgnoreApps only excludes app_pk mismatches from verification verdicts.
+	// It never changes base copy, CDC capture, or replay.
+	VerifyIgnoreApps string
 
 	// CDCSampleRows bounds the reservoir of applied keys the run keeps per
 	// relation, which is what lets verification check the replication path at
@@ -107,7 +112,25 @@ func (c Config) ValidateVerify() error {
 	case c.VerifyCDCRows < 0:
 		return errors.New("verify-cdc-rows must not be negative (0 falls back to the default)")
 	}
-	return nil
+	_, err := c.IgnoredVerificationApps()
+	return err
+}
+
+// IgnoredVerificationApps validates and canonicalizes comma-separated app IDs.
+func (c Config) IgnoredVerificationApps() ([]string, error) {
+	if strings.TrimSpace(c.VerifyIgnoreApps) == "" {
+		return nil, nil
+	}
+	var apps []string
+	for _, value := range strings.Split(c.VerifyIgnoreApps, ",") {
+		id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		if err != nil || id <= 0 {
+			return nil, errors.New("verify-ignore-apps must contain comma-separated positive bigint app IDs")
+		}
+		apps = append(apps, strconv.FormatInt(id, 10))
+	}
+	slices.Sort(apps)
+	return slices.Compact(apps), nil
 }
 
 // TuningOverrides returns the operator-supplied target tuning values, validated.

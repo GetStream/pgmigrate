@@ -68,21 +68,23 @@ type CDCResult struct {
 	baseline       rowSet
 	recheckAt      time.Time
 	targetBaseline rowSet
+	replayBoundary string
 	// Advanced counts rows accepted because the target changed during the delay.
 	// These are progressing, not verified equal to the source.
 	Advanced int `json:"advanced_rows,omitempty"`
-	// SourceChanged counts touched source rows. Each requires target advancement,
-	// and contributes to either matched/advanced or unresolved; none is skipped.
+	// SourceChanged counts touched source rows. Unless excluded by app scope,
+	// each requires a stable match or target advancement; a touch alone cannot pass.
 	SourceChanged int `json:"source_changed_rows,omitempty"`
 }
 
 // verifyCDC checks the rows the applier reported writing.
 //
 // The first pass snapshots each differing source row, including xmin. A separate
-// worker rechecks it after one minute. Rows touched on the source in that interval
-// require target advancement; a source change alone cannot clear a mismatch.
-// A target that advanced is accepted as progressing even if it does not yet
-// match. A stalled target fails. There is exactly one deferred check, no retries.
+// worker rechecks it after one minute, confirming replay has passed the fresh
+// source read before reading the target. A stable match passes; otherwise target
+// advancement is required, even when the source changed. Advancement is accepted
+// as progress, not equality. Confirmation timeout is incomplete, not divergence.
+// There is exactly one deferred check, no retries.
 //
 // Like the heap sample, this is a source-to-target check. A recorded key absent
 // from the source at the initial read produces no difference, whether the target still
@@ -143,6 +145,11 @@ func (w *worker) verifyCDC(
 		return nil, err
 	}
 	candidates := compareRows(source, target)
+	candidates, ignored, err := w.excludeDiffs(table, "cdc", candidates, source, target)
+	if err != nil {
+		return nil, err
+	}
+	out.IgnoredRows += ignored
 	out.CDC.Candidates = len(candidates)
 	out.CDC.recheckAt = time.Now().Add(w.cfg.CDCRecheckDelay)
 	out.CDC.baseline = make(rowSet, len(candidates))

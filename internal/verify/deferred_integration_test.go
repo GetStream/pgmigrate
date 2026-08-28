@@ -36,6 +36,254 @@ func (a *auditRecorder) all() []AuditEvent {
 	return append([]AuditEvent(nil), a.events...)
 }
 
+func TestCDCDeferredReplayConfirmationIsBounded(t *testing.T) {
+	s, d := pgtest.Start(t, 17), pgtest.Start(t, 17)
+	source, target := s.Connect(t), d.Connect(t)
+	for _, c := range []*pgx.Conn{source, target} {
+		exec(t, c, `CREATE TABLE public.items(id bigint PRIMARY KEY,payload text)`)
+	}
+	tables := inventoryOf(t, source, "public", "items")
+	for _, mode := range []string{"converged", "advanced", "stalled", "timeout", "boundary error", "wait error", "cancel"} {
+		t.Run(mode, func(t *testing.T) {
+			for _, c := range []*pgx.Conn{source, target} {
+				exec(t, c, `TRUNCATE public.items`, `INSERT INTO public.items VALUES(1,'new')`)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var audit auditRecorder
+			var boundaries, waits atomic.Int32
+			confirmationErr := errors.New("confirmation unavailable")
+			cfg := Config{Source: connector(s.URI), Target: connector(d.URI), Tables: tables,
+				CDCRecheckDelay: time.Millisecond, ConvergeTimeout: 50 * time.Millisecond}
+			cfg.CDCKeys = func(ctx context.Context, _, _ string) (CDCRecorded, error) {
+				_, err := target.Exec(ctx, `UPDATE public.items SET payload='old'`)
+				return CDCRecorded{Observed: 1, Keys: []CDCKey{{Key: map[string]string{"id": "1"}}}}, err
+			}
+			cfg.Audit = func(events []AuditEvent) error {
+				audit.record(events)
+				if events[0].Outcome == "deferred" {
+					_, err := source.Exec(ctx, `UPDATE public.items SET payload='newer'`)
+					return err
+				}
+				return nil
+			}
+			cfg.Boundary = func(ctx context.Context, conn *pgx.Conn) (string, error) {
+				boundaries.Add(1)
+				if len(audit.all()) != 1 || audit.all()[0].Outcome != "deferred" {
+					return "", errors.New("confirmation ran before deferral")
+				}
+				if mode == "boundary error" {
+					return "", confirmationErr
+				}
+				return "0/123", nil
+			}
+			cfg.WaitApplied = func(ctx context.Context, position string) error {
+				waits.Add(1)
+				if position != "0/123" {
+					return errors.New("wrong confirmation boundary")
+				}
+				switch mode {
+				case "converged", "advanced":
+					value := "newer"
+					if mode == "advanced" {
+						value = "middle"
+					}
+					_, err := target.Exec(ctx, `UPDATE public.items SET payload=$1`, value)
+					return err
+				case "timeout", "cancel":
+					if mode == "cancel" {
+						cancel()
+					}
+					<-ctx.Done()
+					return ctx.Err()
+				case "wait error":
+					return confirmationErr
+				}
+				return nil
+			}
+			got, err := Run(ctx, cfg)
+			wantWaits := int32(1)
+			if mode == "boundary error" {
+				wantWaits = 0
+			}
+			if boundaries.Load() != 1 || waits.Load() != wantWaits {
+				t.Fatalf("confirmation retried: boundaries=%d waits=%d", boundaries.Load(), waits.Load())
+			}
+			wantOutcome := mode
+			switch mode {
+			case "boundary error", "wait error":
+				if !errors.Is(err, confirmationErr) {
+					t.Fatalf("confirmation error lost: %v", err)
+				}
+				wantOutcome = "incomplete"
+			case "cancel":
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("cancellation lost: %v", err)
+				}
+				wantOutcome = "incomplete"
+			default:
+				if err != nil {
+					t.Fatal(err)
+				}
+				table := got.Tables[0]
+				if mode == "timeout" {
+					if got.Complete || got.Converged || table.CDC.Pending != 1 || len(table.Unresolved) != 0 || table.CutShort != "CDC replay confirmation timeout" {
+						t.Fatalf("timeout was classified as final: %+v", got)
+					}
+					wantOutcome = "incomplete"
+				} else if !got.Complete || got.Converged != (mode != "stalled") || table.CDC.Pending != 0 {
+					t.Fatalf("wrong confirmed result: %+v", got)
+				}
+				if mode == "stalled" {
+					wantOutcome = "unresolved"
+					if len(table.Unresolved) != 1 || table.Unresolved[0].Kind != DiffTargetStalled {
+						t.Fatalf("confirmed stalled target was hidden: %+v", table)
+					}
+				}
+			}
+			events := audit.all()
+			if len(events) != 2 || events[1].Outcome != wantOutcome {
+				t.Fatalf("missing final audit: %+v", events)
+			}
+			if mode != "boundary error" && events[1].ReplayBoundary != "0/123" {
+				t.Fatalf("confirmation boundary missing: %+v", events[1])
+			}
+			if mode == "converged" && (events[1].Source.Hash != events[1].Target.Hash || !events[1].SourceChanged) {
+				t.Fatalf("target was read before replay reached fresh source: %+v", events[1])
+			}
+		})
+	}
+}
+
+func TestVerificationIgnoresOnlyConfiguredSourceAppsAndAuditsBothStrata(t *testing.T) {
+	s, d := pgtest.Start(t, 17), pgtest.Start(t, 17)
+	source, target := s.Connect(t), d.Connect(t)
+	for _, mode := range []string{"key", "column", "absent"} {
+		t.Run(mode, func(t *testing.T) {
+			definition := `id bigint PRIMARY KEY, app_pk bigint, payload text`
+			if mode == "key" {
+				definition = `id bigint, app_pk bigint, payload text, PRIMARY KEY(app_pk,id)`
+			}
+			if mode == "absent" {
+				definition = `id bigint PRIMARY KEY, payload text`
+			}
+			for _, c := range []*pgx.Conn{source, target} {
+				exec(t, c, `DROP TABLE IF EXISTS public.items`, `CREATE TABLE public.items(`+definition+`)`)
+				if mode == "absent" {
+					exec(t, c, `INSERT INTO public.items VALUES(1,'new'),(2,'new'),(3,'new'),(4,'new')`)
+				} else {
+					exec(t, c, `INSERT INTO public.items VALUES(1,10,'new'),(2,10,'new'),(3,20,'new'),(4,20,'new')`)
+				}
+				if mode == "column" {
+					exec(t, c, `UPDATE public.items SET app_pk=NULL WHERE id=4`)
+				}
+			}
+			exec(t, target, `UPDATE public.items SET payload='old'`, `DELETE FROM public.items WHERE id=2`)
+			// A target-owned app must not exempt a row whose source app is in scope.
+			if mode != "absent" {
+				exec(t, target, `UPDATE public.items SET app_pk=10 WHERE id=3`)
+			}
+			var audit auditRecorder
+			cfg := Config{Source: connector(s.URI), Target: connector(d.URI), Tables: inventoryOf(t, source, "public", "items"),
+				IgnoreApps: []string{"10"}, CDCRecheckDelay: time.Millisecond, Audit: audit.record}
+			cfg.CDCKeys = func(context.Context, string, string) (CDCRecorded, error) {
+				return CDCRecorded{Observed: 4, Keys: []CDCKey{
+					{Key: map[string]string{"id": "1", "app_pk": "10"}}, {Key: map[string]string{"id": "2", "app_pk": "10"}},
+					{Key: map[string]string{"id": "3", "app_pk": "20"}}, {Key: map[string]string{"id": "4", "app_pk": "20"}},
+				}}, nil
+			}
+			got, err := Run(context.Background(), cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ignored, unresolved := 4, 4 // two observations per row, heap plus CDC
+			if mode == "absent" {
+				ignored, unresolved = 0, 8
+			}
+			if !got.Complete || got.Converged || got.Tables[0].IgnoredRows != ignored || len(got.Tables[0].Unresolved) != unresolved {
+				t.Fatalf("app scope leaked: %+v", got)
+			}
+			counts := map[string]int{}
+			for _, event := range audit.all() {
+				if event.Outcome == "ignored_app" {
+					if event.AppID != "10" || !event.Source.Present || event.Target == nil {
+						t.Fatalf("invalid ignored audit: %+v", event)
+					}
+					counts[event.Stratum]++
+				}
+			}
+			if counts["heap"] != ignored/2 || counts["cdc"] != ignored/2 {
+				t.Fatalf("lost ignored observations: %v", counts)
+			}
+			if mode == "absent" {
+				return
+			}
+			exec(t, target, `UPDATE public.items SET app_pk=20 WHERE id=3`, `UPDATE public.items SET payload='new' WHERE id IN (3,4)`)
+			got, err = Run(context.Background(), cfg)
+			if err != nil || !got.Complete || !got.Converged || got.Tables[0].IgnoredRows != 4 || got.Tables[0].CDC.Pending != 0 {
+				t.Fatalf("ignored app still blocks scoped verification: %+v, %v", got, err)
+			}
+			auditErr := errors.New("ignored audit unavailable")
+			cfg.Audit = func(events []AuditEvent) error {
+				if events[0].Outcome == "ignored_app" {
+					return auditErr
+				}
+				return nil
+			}
+			if _, err := Run(context.Background(), cfg); !errors.Is(err, auditErr) {
+				t.Fatalf("ignored app silently lost its audit: %v", err)
+			}
+		})
+	}
+}
+
+func TestVerificationRechecksSourceAppOwnership(t *testing.T) {
+	s, d := pgtest.Start(t, 17), pgtest.Start(t, 17)
+	source, target := s.Connect(t), d.Connect(t)
+	for _, c := range []*pgx.Conn{source, target} {
+		exec(t, c, `CREATE TABLE public.items(id bigint PRIMARY KEY,app_pk bigint,payload text)`)
+	}
+	for _, stratum := range []string{"heap", "cdc"} {
+		t.Run(stratum, func(t *testing.T) {
+			for _, c := range []*pgx.Conn{source, target} {
+				exec(t, c, `TRUNCATE public.items`, `INSERT INTO public.items VALUES(1,20,'new')`)
+			}
+			if stratum == "heap" {
+				exec(t, target, `UPDATE public.items SET payload='old'`)
+			}
+			var audit auditRecorder
+			cfg := Config{Source: connector(s.URI), Target: connector(d.URI), Tables: inventoryOf(t, source, "public", "items"),
+				IgnoreApps: []string{"10"}, CDCRecheckDelay: time.Millisecond}
+			if stratum == "cdc" {
+				cfg.CDCKeys = func(ctx context.Context, _, _ string) (CDCRecorded, error) {
+					_, err := target.Exec(ctx, `UPDATE public.items SET payload='old'`)
+					return CDCRecorded{Observed: 1, Keys: []CDCKey{{Key: map[string]string{"id": "1"}}}}, err
+				}
+			}
+			cfg.Audit = func(events []AuditEvent) error {
+				audit.record(events)
+				if events[0].Outcome == "observed" || events[0].Outcome == "deferred" {
+					_, err := source.Exec(context.Background(), `UPDATE public.items SET app_pk=10`)
+					return err
+				}
+				return nil
+			}
+			got, err := Run(context.Background(), cfg)
+			if err != nil || !got.Complete || !got.Converged {
+				t.Fatalf("source ownership was not rechecked: %+v, %v", got, err)
+			}
+			table := got.Tables[0]
+			if table.IgnoredRows != 1 || table.InFlight != 0 || table.CDC.InFlight != 0 || table.CDC.Advanced != 0 {
+				t.Fatalf("exclusion mislabeled as matching or progressing: %+v", table)
+			}
+			events := audit.all()
+			if last := events[len(events)-1]; last.Outcome != "ignored_app" || last.AppID != "10" {
+				t.Fatalf("source ownership audit missing: %+v", last)
+			}
+		})
+	}
+}
+
 func TestCDCDeferredOutcomesAndAudit(t *testing.T) {
 	s, d := pgtest.Start(t, 17), pgtest.Start(t, 17)
 	source, target := s.Connect(t), d.Connect(t)
@@ -101,10 +349,6 @@ func TestCDCDeferredOutcomesAndAudit(t *testing.T) {
 					rechecking.Add(1)
 				}
 			})
-			cfg.Boundary = func(context.Context, *pgx.Conn) (string, error) {
-				return "", errors.New("CDC must defer rather than wait on a WAL marker")
-			}
-			cfg.WaitApplied = func(context.Context, string) error { return errors.New("unexpected WAL wait") }
 			got, err := Run(context.Background(), cfg)
 			if err != nil {
 				t.Fatal(err)

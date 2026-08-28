@@ -36,10 +36,18 @@ func TestDeferredCDCProgressIsNotCompleteOrDivergent(t *testing.T) {
 func TestCDCSummaryDistinguishesChangedAdvancedAndPending(t *testing.T) {
 	result := verify.Result{Tables: []verify.TableResult{{CDC: verify.CDCResult{Keys: 10, Observed: 20, SourceChanged: 2, Pending: 3, Advanced: 4}}}}
 	got := cdcSummary(result)
-	for _, want := range []string{"10 of 20 applied rows checked", "2 source-changed CDC rows required target advancement", "3 CDC rows still pending", "4 CDC target rows advanced without matching; accepted as progressing"} {
+	for _, want := range []string{"10 of 20 applied rows checked", "2 source-changed CDC rows checked for convergence or target advancement", "3 CDC rows still pending", "4 CDC target rows advanced without matching; accepted as progressing"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("summary %q missing %q", got, want)
 		}
+	}
+}
+
+func TestVerificationSummaryDisclosesIgnoredMismatches(t *testing.T) {
+	table := verify.Table{Key: verify.Key{Columns: []verify.KeyColumn{{Name: "id"}}}}
+	result := verify.Result{Tables: []verify.TableResult{{Table: table, IgnoredRows: 2}, {Table: table, IgnoredRows: 3}}}
+	if got := verificationSummary(result); !strings.Contains(got, "5 mismatches ignored by application scope (audited)") {
+		t.Fatalf("missing exclusion summary: %s", got)
 	}
 }
 

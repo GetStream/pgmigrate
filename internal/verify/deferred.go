@@ -30,7 +30,7 @@ func advancedTarget(key string, previous, current rowSet) bool {
 func (w *worker) recheckCDC(ctx context.Context, out TableResult) (result TableResult, err error) {
 	defer func() {
 		if err != nil || result.CutShort != "" {
-			auditErr := w.auditDiffs(out.Table, "cdc", "incomplete", out.CDC.pending, nil, nil, out.CDC.baseline)
+			auditErr := w.auditDiffs(out.Table, "cdc", "incomplete", out.CDC.pending, nil, nil, out.CDC.baseline, out.CDC.replayBoundary)
 			err = errors.Join(err, auditErr)
 		}
 	}()
@@ -69,6 +69,26 @@ func (w *worker) recheckCDC(ctx context.Context, out TableResult) (result TableR
 	if err != nil {
 		return finishError(err)
 	}
+	if w.cfg.Boundary != nil && w.cfg.WaitApplied != nil {
+		// A minute is a minimum defer, not proof that replay has seen this fresh
+		// source snapshot. Fence that snapshot before the single target read.
+		// The confirmation stays bounded even with table timeouts disabled.
+		confirmCtx, cancel := context.WithTimeout(tableCtx, w.cfg.ConvergeTimeout)
+		position, confirmErr := w.cfg.Boundary(confirmCtx, w.source)
+		if confirmErr == nil {
+			out.CDC.replayBoundary = position
+			confirmErr = w.cfg.WaitApplied(confirmCtx, position)
+		}
+		timedOut := errors.Is(confirmCtx.Err(), context.DeadlineExceeded) && tableCtx.Err() == nil
+		cancel()
+		if confirmErr != nil {
+			if timedOut {
+				w.close()
+				return w.finish(out, started.Add(-previous), "CDC replay confirmation timeout"), nil
+			}
+			return finishError(fmt.Errorf("confirm replay for CDC recheck of %s: %w", out.Table.Identifier(), confirmErr))
+		}
+	}
 	target, err := readRowsVersioned(tableCtx, w.target, out.Table, keys, w.cfg.BatchRows, true)
 	if err != nil {
 		return finishError(err)
@@ -85,6 +105,7 @@ func (w *worker) recheckCDC(ctx context.Context, out TableResult) (result TableR
 		original := out.CDC.baseline[id]
 		other, present := target[id]
 		e := AuditEvent{Time: time.Now().UTC(), Table: out.Table.Schema + "." + out.Table.Name, Key: key, Stratum: "cdc", OriginalSource: snapshot(out.CDC.baseline, id), PreviousTarget: snapshot(out.CDC.targetBaseline, id), Source: snapshot(before, id), SourceAfter: snapshot(after, id), Target: snapshot(target, id)}
+		e.ReplayBoundary = out.CDC.replayBoundary
 		e.SourceChanged = !unchangedSource(original, before) || !unchangedSource(original, after)
 		if e.SourceChanged {
 			changed++
@@ -98,6 +119,13 @@ func (w *worker) recheckCDC(ctx context.Context, out TableResult) (result TableR
 		}
 		matched := sourcePresent && present && unchangedSource(currentSource, before) && other.hash == currentSource.hash
 		switch {
+		case !matched && w.cfg.ignoredApps[rowApp(out.Table, currentSource)]:
+			e.Outcome, e.AppID = "ignored_app", rowApp(out.Table, currentSource)
+			e.Kind = DiffDifferent
+			if !present {
+				e.Kind = DiffSourceOnly
+			}
+			out.IgnoredRows++
 		case matched:
 			// The target may already have caught up between the initial source
 			// and target reads. Equal rows need no further target write.

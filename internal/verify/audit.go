@@ -29,6 +29,9 @@ type AuditEvent struct {
 	OriginalSource *RowSnapshot `json:"original_source,omitempty"`
 	PreviousTarget *RowSnapshot `json:"previous_target,omitempty"`
 	SourceAfter    *RowSnapshot `json:"source_after,omitempty"`
+	AppID          string       `json:"app_id,omitempty"`
+	IgnoredApps    []string     `json:"ignored_apps,omitempty"`
+	ReplayBoundary string       `json:"replay_boundary,omitempty"`
 }
 
 func snapshot(rows rowSet, key string) *RowSnapshot {
@@ -51,7 +54,7 @@ func (w *worker) audit(events []AuditEvent) error {
 	return nil
 }
 
-func (w *worker) auditDiffs(table Table, stratum, outcome string, diffs []RowDiff, source, target, original rowSet) error {
+func (w *worker) auditDiffs(table Table, stratum, outcome string, diffs []RowDiff, source, target, original rowSet, boundary ...string) error {
 	if w.cfg.Audit == nil {
 		return nil
 	}
@@ -59,6 +62,9 @@ func (w *worker) auditDiffs(table Table, stratum, outcome string, diffs []RowDif
 	for _, diff := range diffs {
 		id := identity(diff.Key)
 		e := AuditEvent{Time: time.Now().UTC(), Table: table.Schema + "." + table.Name, Key: diff.Key, Stratum: stratum, Outcome: outcome, Kind: diff.Kind}
+		if len(boundary) > 0 {
+			e.ReplayBoundary = boundary[0]
+		}
 		if source != nil {
 			e.Source = snapshot(source, id)
 		}

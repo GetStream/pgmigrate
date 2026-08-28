@@ -34,6 +34,7 @@ type rowEntry struct {
 	key     []string
 	hash    int64
 	version string
+	appID   string
 }
 
 // rowSet holds rows by a rendering of their key tuple.
@@ -58,8 +59,11 @@ func keyProjection(table Table) []string {
 	for _, column := range table.Key.Columns {
 		projected = append(projected, "t."+QuoteIdentifier(column.Name)+"::text")
 	}
-	return append(projected,
-		fmt.Sprintf("pg_catalog.hashtextextended(%s,%d)", renderedRow, hashSeed))
+	projected = append(projected, fmt.Sprintf("pg_catalog.hashtextextended(%s,%d)", renderedRow, hashSeed))
+	if table.appColumn {
+		projected = append(projected, `t."app_pk"::text`)
+	}
+	return projected
 }
 
 // sampleWindow reads the key and row hash of the rows in one page interval.
@@ -197,11 +201,15 @@ func scanRows(ctx context.Context, db querier, query string, table Table, into r
 		key := make([]*string, len(table.Key.Columns))
 		var hash int64
 		var version string
+		var appID *string
 		dest := make([]any, 0, len(key)+1)
 		for i := range key {
 			dest = append(dest, &key[i])
 		}
 		dest = append(dest, &hash)
+		if table.appColumn {
+			dest = append(dest, &appID)
+		}
 		if versioned {
 			dest = append(dest, &version)
 		}
@@ -214,7 +222,11 @@ func scanRows(ctx context.Context, db querier, query string, table Table, into r
 				rendered[i] = *value
 			}
 		}
-		into[identity(rendered)] = rowEntry{key: rendered, hash: hash, version: version}
+		entry := rowEntry{key: rendered, hash: hash, version: version}
+		if appID != nil {
+			entry.appID = *appID
+		}
+		into[identity(rendered)] = entry
 	}
 	return rows.Err()
 }
@@ -293,6 +305,11 @@ func (w *worker) compareWindows(
 		if err := w.auditDiffs(table, "heap", "observed", diffs, sourceRows, targetRows, nil); err != nil {
 			return nil, err
 		}
+		diffs, ignored, err := w.excludeDiffs(table, "heap", diffs, sourceRows, targetRows)
+		if err != nil {
+			return nil, err
+		}
+		out.IgnoredRows += ignored
 		candidates = append(candidates, diffs...)
 
 		w.report(Progress{
@@ -333,7 +350,7 @@ func (w *worker) compareWindows(
 // latency the loop waited out, which is worth reporting on its own: a stratum
 // whose rows all settle is watching a healthy applier, and one whose rows never
 // do is watching a broken one.
-func (w *worker) resolve(ctx context.Context, table Table, keys [][]string) ([]RowDiff, int, error) {
+func (w *worker) resolve(ctx context.Context, table Table, keys [][]string) ([]RowDiff, int, int, error) {
 	batch := keyBatch(w.cfg.BatchRows, len(table.Key.Columns))
 	budget := w.cfg.ConvergeTimeout
 	if w.cfg.Boundary == nil || w.cfg.WaitApplied == nil {
@@ -343,43 +360,49 @@ func (w *worker) resolve(ctx context.Context, table Table, keys [][]string) ([]R
 	}
 	deadline := time.Now().Add(budget)
 	var (
-		diffs []RowDiff
-		first = -1
+		diffs        []RowDiff
+		first        = -1
+		ignoredTotal int
 	)
 	for {
 		if len(keys) == 0 {
-			return nil, max(first, 0), nil
+			return nil, max(first, 0), ignoredTotal, nil
 		}
 		source, err := readRows(ctx, w.source, table, keys, batch)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		if w.cfg.Boundary != nil && w.cfg.WaitApplied != nil {
 			// The marker is emitted after the read, so every row the read saw was
 			// committed at or before the position it reports.
 			position, err := w.cfg.Boundary(ctx, w.source)
 			if err != nil {
-				return nil, 0, fmt.Errorf("mark the source position for a recheck of %s: %w",
+				return nil, 0, 0, fmt.Errorf("mark the source position for a recheck of %s: %w",
 					table.Identifier(), err)
 			}
 			if err := w.cfg.WaitApplied(ctx, position); err != nil {
-				return nil, 0, fmt.Errorf("wait for apply to reach %s while rechecking %s: %w",
+				return nil, 0, 0, fmt.Errorf("wait for apply to reach %s while rechecking %s: %w",
 					position, table.Identifier(), err)
 			}
 		}
 		target, err := readRows(ctx, w.target, table, keys, batch)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		diffs = compareRows(source, target)
 		if err := w.auditRecheck(table, keys, source, target); err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
+		diffs, ignored, err := w.excludeDiffs(table, "heap", diffs, source, target)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		ignoredTotal += ignored
 		if first < 0 {
 			first = len(diffs)
 		}
 		if len(diffs) == 0 || time.Now().After(deadline) {
-			return diffs, first, nil
+			return diffs, first, ignoredTotal, nil
 		}
 		keys = keys[:0]
 		for _, diff := range diffs {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -17,7 +18,7 @@ func TestVerificationAuditAppendsEveryConcurrentObservation(t *testing.T) {
 	dir := t.TempDir()
 	var ids []string
 	for run := 0; run < 2; run++ {
-		audit, err := newVerificationAudit(dir)
+		audit, err := newVerificationAudit(dir, "7", "42")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -69,6 +70,9 @@ func TestVerificationAuditAppendsEveryConcurrentObservation(t *testing.T) {
 		}
 		if event.Time.IsZero() {
 			t.Fatal("missing timestamp")
+		}
+		if event.Outcome == "run_started" && !slices.Equal(event.IgnoredApps, []string{"7", "42"}) {
+			t.Fatalf("run scope missing from audit: %+v", event)
 		}
 		if counts[event.RunID] == nil {
 			counts[event.RunID] = make(map[string]int)

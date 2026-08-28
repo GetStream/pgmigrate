@@ -31,6 +31,19 @@ test('controller script parses', () => {
   assert.doesNotThrow(() => new vm.Script(script));
 });
 
+test('configured app exclusions remain visible and can be cleared', () => {
+  const scope = element();
+  const context = vm.createContext({ el: () => scope });
+  vm.runInContext(html.match(/^function renderVerificationScope\(.*$/m)[0], context);
+  context.renderVerificationScope('7,42');
+  assert.equal(scope.hidden, false);
+  assert.match(scope.textContent, /app_pk: 7,42/);
+  assert.match(scope.textContent, /audited; replication is unchanged/);
+  context.renderVerificationScope('');
+  assert.equal(scope.hidden, true);
+  assert.equal(scope.textContent, '');
+});
+
 for (const stage of ['pending cdc recheck', 'rechecking cdc']) {
   test(`${stage} remains pending`, () => {
     const result = resultCell({ stage, complete: false, converged: false });

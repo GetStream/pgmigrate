@@ -40,6 +40,23 @@ func TestReplayWorkersFlagDefaultsConservatively(t *testing.T) {
 	}
 }
 
+func TestVerificationIgnoreAppsFlagParsesAndValidates(t *testing.T) {
+	root := NewRootCommand()
+	if err := root.ParseFlags([]string{"--verify-ignore-apps=7,42"}); err != nil {
+		t.Fatal(err)
+	}
+	value, err := root.PersistentFlags().GetString("verify-ignore-apps")
+	if err != nil || value != "7,42" {
+		t.Fatalf("ignore apps flag = %q, %v", value, err)
+	}
+	cfg := config.FromEnvironment()
+	cfg.Source, cfg.Target, cfg.Dir = "postgres://source/db", "postgres://target/db", t.TempDir()
+	cfg.VerifyIgnoreApps = "invalid"
+	if err := validateDatabaseConfig(cfg); err == nil || !strings.Contains(err.Error(), "verify-ignore-apps") {
+		t.Fatalf("invalid app IDs accepted: %v", err)
+	}
+}
+
 func TestDatabaseConfigurationBoundsReplayWorkers(t *testing.T) {
 	cfg := config.FromEnvironment()
 	cfg.Source = "postgres://source/db"

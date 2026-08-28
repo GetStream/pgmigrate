@@ -22,7 +22,7 @@ type verificationAudit struct {
 	runID string
 }
 
-func newVerificationAudit(dir string) (*verificationAudit, error) {
+func newVerificationAudit(dir string, ignoredApps ...string) (*verificationAudit, error) {
 	path := filepath.Join(dir, "log", "verify-audit.jsonl")
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, err
@@ -37,7 +37,7 @@ func newVerificationAudit(dir string) (*verificationAudit, error) {
 		return nil, err
 	}
 	out := &verificationAudit{file: file, runID: hex.EncodeToString(id[:])}
-	if err := out.write([]verify.AuditEvent{{Time: time.Now().UTC(), Outcome: "run_started"}}); err != nil {
+	if err := out.write([]verify.AuditEvent{{Time: time.Now().UTC(), Outcome: "run_started", IgnoredApps: ignoredApps}}); err != nil {
 		file.Close()
 		return nil, err
 	}

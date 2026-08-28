@@ -2373,7 +2373,11 @@ func verification(ctx context.Context, cfg config.Config, store *state.Store, pr
 	// These two hooks are what tell that apart from a defect: mark a source
 	// position, wait for apply to pass it, look again.
 	mark, wait := recheckHooks(cfg, boundary, migration.SlotName, migration.Phase)
-	audit, err := newVerificationAudit(cfg.Dir)
+	ignoredApps, err := cfg.IgnoredVerificationApps()
+	if err != nil {
+		return verify.Result{}, err
+	}
+	audit, err := newVerificationAudit(cfg.Dir, ignoredApps...)
 	if err != nil {
 		return verify.Result{}, err
 	}
@@ -2391,6 +2395,7 @@ func verification(ctx context.Context, cfg config.Config, store *state.Store, pr
 		ConvergeTimeout: cfg.VerifyConvergeTimeout,
 		CDCKeys:         recordedCDCKeys(store),
 		CDCRows:         cfg.VerifyCDCRows,
+		IgnoreApps:      ignoredApps,
 		Boundary:        mark,
 		WaitApplied:     wait,
 	})
