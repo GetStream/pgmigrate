@@ -12,11 +12,10 @@
 // 330M row hashes for a 66-minute answer on one production shard, 57 minutes of it
 // a single table. See docs/design-verify-sampled.md.
 //
-// What a sample cannot do is prove that two tables match. It finds divergence and
-// it never proves its absence, and it is blind in one direction: it walks the
-// source, so a row the target holds and the source does not — an unapplied delete,
-// or a duplicate — is never looked at. A clean result means the rows that were
-// compared agreed.
+// Verification is one-way: source rows must exist on the target with matching
+// contents. Extra target rows are ignored, including during CDC checks and
+// rechecks. A sample cannot prove that every source row matches; a clean result
+// means only that the source rows compared agreed.
 package verify
 
 import (
@@ -43,9 +42,10 @@ const (
 	sampleHeadroom = 2.0
 	// defaultBatchRows is how many keys one target lookup carries.
 	defaultBatchRows int64 = 5000
-	// defaultConvergeTimeout bounds the loop that waits for rows in flight to
-	// settle. Reaching it means the rows are reported as divergence.
+	// defaultConvergeTimeout bounds heap convergence and the single deferred CDC
+	// replay confirmation. CDC confirmation timeout means incomplete, not divergence.
 	defaultConvergeTimeout = time.Minute
+	defaultCDCRecheckDelay = time.Minute
 	// defaultRowThreshold bounds how many differing rows one table names.
 	defaultRowThreshold int64 = 1000
 )
@@ -65,6 +65,9 @@ type Table struct {
 	// Such a table cannot be compared at all: the check finds rows on the target by
 	// key, and there is nothing to look them up by.
 	Keyless string `json:"keyless,omitempty"`
+	// appColumn adds an app_pk projection only when exclusions need it and the
+	// verification key does not already carry the application ID.
+	appColumn bool
 }
 
 func (t Table) Identifier() string { return QuoteIdentifier(t.Schema, t.Name) }
@@ -165,7 +168,10 @@ type TableResult struct {
 	// Unresolved names the rows that still differed when the convergence budget
 	// ran out. These are the divergence.
 	Unresolved []RowDiff `json:"unresolved,omitempty"`
-	Warnings   []string  `json:"warnings,omitempty"`
+	// IgnoredRows counts mismatch observations excluded by app scope. Heap and
+	// CDC may observe the same key, so this is not a count of unique rows.
+	IgnoredRows int      `json:"ignored_rows,omitempty"`
+	Warnings    []string `json:"warnings,omitempty"`
 	// Coverage is the fraction of the table that was looked at, and for anything
 	// large it is a small number. A converged table means "the rows I sampled
 	// matched", never "the two tables match".
@@ -191,7 +197,8 @@ type Config struct {
 	Source, Target Connector
 	Tables         []Table
 	// Workers verify whole tables in parallel. One is the default because two
-	// concurrent scans saturated a two-vCPU production source.
+	// concurrent scans saturated a two-vCPU production source. A separate worker
+	// handles deferred CDC key lookups using at most one additional connection pair.
 	Workers int
 	// SampleRows is how many rows per table the source pass reads.
 	SampleRows int64
@@ -202,11 +209,16 @@ type Config struct {
 	// DutyCycle is the fraction of the time verification may spend querying,
 	// between 0 and 1. It sleeps between windows to stay under it.
 	DutyCycle float64
-	// TableTimeout bounds one table's check; zero disables it.
+	// TableTimeout bounds active work on one table, including the deferred CDC
+	// recheck, excluding its delay and queue time. Zero disables it.
 	TableTimeout time.Duration
-	// ConvergeTimeout bounds the wait for rows in flight to settle.
+	// ConvergeTimeout bounds heap-sample rechecks and the deferred CDC replay confirmation.
 	ConvergeTimeout time.Duration
-	// RowThreshold bounds how many differing rows one table names.
+	// CDCRecheckDelay is the minimum time between a CDC mismatch snapshot and its
+	// deferred check. Zero selects one minute.
+	CDCRecheckDelay time.Duration
+	// RowThreshold bounds heap candidate rechecks. CDC candidates and the audit
+	// of initial mismatches are not truncated by this threshold.
 	RowThreshold int64
 	// CDCKeys supplies the rows the applier recorded writing, which is the only
 	// way to check the replication path: a physical sample of the source finds
@@ -215,8 +227,12 @@ type Config struct {
 	CDCKeys CDCKeys
 	// CDCRows bounds how many recorded keys one table's check looks at.
 	CDCRows int64
+	// IgnoreApps excludes mismatches for these source app_pk values from the
+	// verdict, while retaining the observations and explicit ignore decisions.
+	IgnoreApps  []string
+	ignoredApps map[string]bool
 
-	// Boundary and WaitApplied are what let a row that differs be attributed to
+	// Boundary and WaitApplied let a sampled row that differs be attributed to
 	// replication latency rather than to corruption. Both nil means nothing is
 	// applying, which is the case at cutover, and a row that differs is reported
 	// as it stands.
@@ -224,9 +240,16 @@ type Config struct {
 	WaitApplied WaitApplied
 
 	Progress ProgressSink
+	// Audit receives all mismatches and deferred outcomes and must support
+	// concurrent calls. Failure aborts the run rather than silently losing the audit trail.
+	Audit func([]AuditEvent) error
 }
 
 func (c *Config) applyDefaults() {
+	c.ignoredApps = make(map[string]bool, len(c.IgnoreApps))
+	for _, app := range c.IgnoreApps {
+		c.ignoredApps[app] = true
+	}
 	if c.Workers <= 0 {
 		c.Workers = 1
 	}
@@ -244,6 +267,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RowThreshold <= 0 {
 		c.RowThreshold = defaultRowThreshold
+	}
+	if c.CDCRecheckDelay <= 0 {
+		c.CDCRecheckDelay = defaultCDCRecheckDelay
 	}
 	if c.CDCRows <= 0 {
 		c.CDCRows = defaultCDCKeys
@@ -270,9 +296,26 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	jobs := make(chan int)
 	results := make(chan item, len(cfg.Tables))
+	deferred := make(chan item, len(cfg.Tables))
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	shared := &rate{}
+	// A single rechecker handles due CDC candidates while the initial table
+	// workers keep scanning. It never scans a heap or blocks their job queue.
+	var rechecks sync.WaitGroup
+	rechecks.Add(1)
+	go func() {
+		defer rechecks.Done()
+		worker := &worker{cfg: &cfg, rate: shared}
+		defer worker.close()
+		for job := range deferred {
+			job.result, job.err = worker.recheckCDC(runCtx, job.result)
+			results <- job
+			if job.err != nil {
+				cancel()
+			}
+		}
+	}()
 	var wg sync.WaitGroup
 	for range min(cfg.Workers, max(1, len(cfg.Tables))) {
 		wg.Add(1)
@@ -282,7 +325,12 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			defer worker.close()
 			for index := range jobs {
 				result, err := worker.verifyTable(runCtx, cfg.Tables[index])
-				results <- item{index: index, result: result, err: err}
+				job := item{index: index, result: result, err: err}
+				if err == nil && result.CDC.Pending > 0 {
+					deferred <- job
+				} else {
+					results <- job
+				}
 				if err != nil {
 					cancel()
 					return
@@ -301,6 +349,8 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		}
 	}()
 	wg.Wait()
+	close(deferred)
+	rechecks.Wait()
 	close(results)
 	out := Result{
 		Tables:    make([]TableResult, len(cfg.Tables)),
@@ -312,12 +362,21 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			first = item.err
 		}
 		out.Tables[item.index] = item.result
-		out.Converged = out.Converged && item.result.Converged
-		out.Complete = out.Complete && item.result.Complete
-		out.Warnings = append(out.Warnings, item.result.Warnings...)
 	}
 	if first != nil {
 		return Result{}, first
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	for i := range out.Tables {
+		out.Converged = out.Converged && out.Tables[i].Converged
+		out.Complete = out.Complete && out.Tables[i].Complete
+		out.Warnings = append(out.Warnings, out.Tables[i].Warnings...)
+	}
+
+	if len(cfg.IgnoreApps) > 0 {
+		out.Warnings = append(out.Warnings, fmt.Sprintf("verification ignores app_pk mismatches for %v; ignored observations are audited and replication is unchanged", cfg.IgnoreApps))
 	}
 	slices.Sort(out.Warnings)
 	out.Warnings = slices.Compact(out.Warnings)
@@ -335,9 +394,11 @@ type worker struct {
 func (w *worker) close() {
 	if w.source != nil {
 		w.source.Close(context.Background())
+		w.source = nil
 	}
 	if w.target != nil {
 		w.target.Close(context.Background())
+		w.target = nil
 	}
 }
 
@@ -347,20 +408,20 @@ func (w *worker) connect(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("connect source verifier: %w", err)
 		}
+		w.source = source
 		if err := pinSerialization(ctx, source); err != nil {
 			return err
 		}
-		w.source = source
 	}
 	if w.target == nil {
 		target, err := w.cfg.Target(ctx)
 		if err != nil {
 			return fmt.Errorf("connect target verifier: %w", err)
 		}
+		w.target = target
 		if err := pinSerialization(ctx, target); err != nil {
 			return err
 		}
-		w.target = target
 	}
 	return nil
 }
@@ -378,6 +439,15 @@ func (w *worker) verifyTable(ctx context.Context, table Table) (TableResult, err
 		var cancel context.CancelFunc
 		tableCtx, cancel = context.WithTimeout(ctx, w.cfg.TableTimeout)
 		defer cancel()
+	}
+	if len(w.cfg.ignoredApps) > 0 && appKeyIndex(table) < 0 {
+		if err := w.source.QueryRow(tableCtx, `SELECT EXISTS (
+			SELECT 1 FROM pg_catalog.pg_attribute
+			WHERE attrelid=$1 AND attname='app_pk' AND attnum>0 AND NOT attisdropped
+		)`, table.OID).Scan(&table.appColumn); err != nil {
+			return TableResult{}, fmt.Errorf("inspect application column of %s: %w", table.Identifier(), err)
+		}
+		out.Table = table
 	}
 	if !table.Key.present() {
 		// A sampled row is found on the target by key, so a table without one
@@ -420,7 +490,7 @@ func (w *worker) verifyTable(ctx context.Context, table Table) (TableResult, err
 			Rows: out.Source.Rows, Estimated: out.Source.Estimated,
 			Candidates: len(candidates), Coverage: out.Coverage,
 		})
-		resolved, _, err := w.resolve(tableCtx, table, candidateKeys(candidates, w.cfg.RowThreshold))
+		resolved, _, ignored, err := w.resolve(tableCtx, table, candidateKeys(candidates, w.cfg.RowThreshold))
 		if err != nil {
 			if reason := cutShort(ctx, tableCtx, err); reason != "" {
 				out.Converged = false
@@ -428,7 +498,8 @@ func (w *worker) verifyTable(ctx context.Context, table Table) (TableResult, err
 			}
 			return TableResult{}, err
 		}
-		out.InFlight = len(candidates) - len(resolved)
+		out.IgnoredRows += ignored
+		out.InFlight = len(candidates) - len(resolved) - ignored
 		unresolved = resolved
 	}
 
@@ -443,9 +514,10 @@ func (w *worker) verifyTable(ctx context.Context, table Table) (TableResult, err
 		}
 		return TableResult{}, err
 	}
-	unresolved = append(unresolved, cdcDiffs...)
 	out.Unresolved = unresolved
-	out.Converged = len(unresolved) == 0
+	out.CDC.pending = cdcDiffs
+	out.CDC.Pending = len(cdcDiffs)
+	out.Converged = len(unresolved) == 0 && len(cdcDiffs) == 0
 	return w.finish(out, started, ""), nil
 }
 
@@ -472,16 +544,22 @@ func sampledCoverage(side SourceResult) float64 {
 // finish records the outcome and reports it, so a status in another process sees
 // the same figures as the caller.
 func (w *worker) finish(out TableResult, started time.Time, cut string) TableResult {
+	stage := StageDone
+	if out.CDC.Pending > 0 && cut == "" {
+		stage = StageCDCDeferred
+		out.Complete, out.Converged = false, false
+	}
 	if cut != "" {
 		out.Complete, out.CutShort, out.Converged = false, cut, false
 	}
 	out.Duration = time.Since(started)
 	w.report(Progress{
-		Table: out.Table.Schema + "." + out.Table.Name, Side: sideSource, Stage: StageDone,
+		Table: out.Table.Schema + "." + out.Table.Name, Side: sideSource, Stage: stage,
 		Pages: out.Source.Pages, PagesTotal: out.Source.PagesTotal,
 		Rows: out.Source.Rows, Estimated: out.Source.Estimated,
 		TargetRows: out.Target.Rows, Coverage: out.Coverage,
 		CDCKeys: out.CDC.Keys, CDCObserved: out.CDC.Observed,
+		CDCPending: out.CDC.Pending,
 		Candidates: out.Candidates, Unresolved: len(out.Unresolved),
 		Converged: out.Converged, Complete: out.Complete,
 	})

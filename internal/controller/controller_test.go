@@ -410,6 +410,7 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 		"verify_table_timeout":"1h30m",
 		"verify_converge_timeout":"90s",
 		"verify_cdc_rows":120,
+		"verify_ignore_apps":"7,42",
 		"cdc_sample_rows":300
 	}`
 	got := requestJSON(t, server, http.MethodPut, "/api/config", body, "secret")
@@ -424,7 +425,7 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 	if view.Workers != 7 || view.SplitThreshold != 2048 || view.RestoreJobs != 3 ||
 		view.WALSampleDuration != "45s" || view.SegmentPruneInterval != "2m0s" ||
 		view.ReplayWorkers != 12 || view.ReplayBatchBytes != 67_108_864 || view.ReplayBatchChanges != 262_144 ||
-		view.VerifyWorkers != 2 || view.VerifyTableTimeout != "1h30m0s" || view.VerifyConvergeTimeout != "1m30s" {
+		view.VerifyWorkers != 2 || view.VerifyTableTimeout != "1h30m0s" || view.VerifyConvergeTimeout != "1m30s" || view.VerifyIgnoreApps != "7,42" {
 		t.Fatalf("updated view = %#v", view)
 	}
 	expected := cfg
@@ -459,6 +460,7 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 	expected.VerifyTableTimeout = 90 * time.Minute
 	expected.VerifyConvergeTimeout = 90 * time.Second
 	expected.VerifyCDCRows = 120
+	expected.VerifyIgnoreApps = "7,42"
 	expected.CDCSampleRows = 300
 	if updated := server.configurationSnapshot(); updated != expected {
 		t.Fatalf("complete update did not round trip\nwant: %#v\ngot:  %#v", expected, updated)
@@ -474,11 +476,15 @@ func TestConfigurationUpdateParsesValuesAndPreservesDefaults(t *testing.T) {
 	if updated.Source != "postgres://new-source/database" || updated.Target != "postgres://new-target/database" {
 		t.Fatalf("credentials changed after blank update: source=%q target=%q", updated.Source, updated.Target)
 	}
-	if updated.Workers != 7 || updated.AckWarnings {
+	if updated.Workers != 7 || updated.AckWarnings || updated.VerifyIgnoreApps != "7,42" {
 		t.Fatalf("partial update lost values: workers=%d ack=%v", updated.Workers, updated.AckWarnings)
 	}
 	if updated.Dir != cfg.Dir || !updated.NoCleanup || updated.SequenceOffset != 1234 || updated.EndPosition != "0/123" {
 		t.Fatalf("startup/CLI-only configuration changed: %#v", updated)
+	}
+	got = requestJSON(t, server, http.MethodPut, "/api/config", `{"verify_ignore_apps":""}`, "secret")
+	if got.Code != http.StatusOK || server.configurationSnapshot().VerifyIgnoreApps != "" {
+		t.Fatalf("explicitly clearing ignored apps failed: %s", got.Body.String())
 	}
 }
 
@@ -495,7 +501,8 @@ func TestControllerConfigurationPersistsNonSecretsAcrossRestart(t *testing.T) {
 		"target":"postgres://replacement-target:replacement-password@target/database",
 		"replay_workers":24,
 		"replay_batch_bytes":4194304,
-		"replay_batch_changes":8192
+		"replay_batch_changes":8192,
+		"verify_ignore_apps":"7,42"
 	}`, "controller-token-secret")
 	if got.Code != http.StatusOK {
 		t.Fatalf("PUT config status = %d, body = %s", got.Code, got.Body.String())
@@ -530,7 +537,7 @@ func TestControllerConfigurationPersistsNonSecretsAcrossRestart(t *testing.T) {
 	restarted.EndPosition = "0/BEEF"
 	second := newTestServer(t, restarted, "new-runtime-token", noOpActions())
 	loaded := second.configurationSnapshot()
-	if loaded.ReplayWorkers != 24 || loaded.ReplayBatchBytes != 4_194_304 || loaded.ReplayBatchChanges != 8192 {
+	if loaded.ReplayWorkers != 24 || loaded.ReplayBatchBytes != 4_194_304 || loaded.ReplayBatchChanges != 8192 || loaded.VerifyIgnoreApps != "7,42" {
 		t.Fatalf("persisted replay configuration was not restored: %#v", loaded)
 	}
 	if loaded.Source != restarted.Source || loaded.Target != restarted.Target || loaded.Dir != restarted.Dir ||
@@ -584,6 +591,7 @@ func TestInvalidConfigurationDoesNotReplaceCurrentConfiguration(t *testing.T) {
 		`{"replay_batch_changes":0}`,
 		`{"wal_sample_duration":"tomorrow"}`,
 		`{"verify_duty_cycle":2}`,
+		`{"verify_ignore_apps":"7,,42"}`,
 		`{"unknown_setting":true}`,
 	} {
 		got := requestJSON(t, server, http.MethodPut, "/api/config", body, "")
@@ -773,6 +781,7 @@ func TestIndexContainsControllerProgressUI(t *testing.T) {
 	for _, want := range []string{
 		"pgmigrate controller", "Object completion", "lifecycleBar", "Stop migration",
 		"confirmDialog", "data-action=\"run\" disabled", "no rows compared",
+		"pending CDC recheck", "pending cdc recheck", "rechecking cdc",
 		"latestCDCRecovery", "CDC files checked", "CDC validation read throughput",
 		"Validating durable CDC segments before reconnecting source capture and target replay.",
 		"replayTrendWarmupSeconds=15", "trend and ETA after", "resetReplaySamplesForOperation",
@@ -868,7 +877,7 @@ func TestIndexContainsCompleteWriteOnlyConfigurationUI(t *testing.T) {
 		"maintenance_work_mem", "max_parallel_maintenance_workers", "max_wal_size",
 		"checkpoint_timeout", "verify_workers", "verify_sample_rows",
 		"verify_sample_windows", "verify_batch_rows", "verify_duty_cycle",
-		"verify_table_timeout", "verify_converge_timeout", "verify_cdc_rows",
+		"verify_table_timeout", "verify_converge_timeout", "verify_cdc_rows", "verify_ignore_apps",
 		"cdc_sample_rows",
 	} {
 		if !strings.Contains(body, `data-config="`+field+`"`) {

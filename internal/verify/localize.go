@@ -18,21 +18,23 @@ type RowDiff struct {
 	Kind DiffKind `json:"kind"`
 }
 
-// DiffKind says which way a row disagrees, which is what points at the cause: a
-// missing row is an apply that did not happen, a differing row is an apply that
-// happened wrongly, and an extra row is a delete that did not.
+// DiffKind says whether a source row is missing from the target or has different
+// contents there, or whether a deferred CDC candidate failed to advance on the
+// target after its source changed. Extra target rows are not failures.
 type DiffKind string
 
 const (
-	DiffSourceOnly DiffKind = "source_only"
-	DiffTargetOnly DiffKind = "target_only"
-	DiffDifferent  DiffKind = "different"
+	DiffSourceOnly    DiffKind = "source_only"
+	DiffDifferent     DiffKind = "different"
+	DiffTargetStalled DiffKind = "target_stalled"
 )
 
 // rowEntry is one row reduced to its key and a hash of its contents.
 type rowEntry struct {
-	key  []string
-	hash int64
+	key     []string
+	hash    int64
+	version string
+	appID   string
 }
 
 // rowSet holds rows by a rendering of their key tuple.
@@ -57,8 +59,11 @@ func keyProjection(table Table) []string {
 	for _, column := range table.Key.Columns {
 		projected = append(projected, "t."+QuoteIdentifier(column.Name)+"::text")
 	}
-	return append(projected,
-		fmt.Sprintf("pg_catalog.hashtextextended(%s,%d)", renderedRow, hashSeed))
+	projected = append(projected, fmt.Sprintf("pg_catalog.hashtextextended(%s,%d)", renderedRow, hashSeed))
+	if table.appColumn {
+		projected = append(projected, `t."app_pk"::text`)
+	}
+	return projected
 }
 
 // sampleWindow reads the key and row hash of the rows in one page interval.
@@ -70,7 +75,7 @@ func sampleWindow(
 	ctx context.Context, db querier, table Table, chunk pageChunk,
 ) (rowSet, int64, error) {
 	found := make(rowSet, chunk.Limit)
-	if err := scanRows(ctx, db, sampleQuery(table, chunk), table, found, nil); err != nil {
+	if err := scanRows(ctx, db, sampleQuery(table, chunk), table, found, nil, false); err != nil {
 		return nil, 0, fmt.Errorf("sample %s: %w", chunk, err)
 	}
 	return found, int64(len(found)), nil
@@ -112,13 +117,19 @@ func keyBatch(requested int64, columns int) int64 {
 func readRows(
 	ctx context.Context, db querier, table Table, keys [][]string, batch int64,
 ) (rowSet, error) {
+	return readRowsVersioned(ctx, db, table, keys, batch, false)
+}
+
+// readRowsVersioned optionally captures the source xmin, which detects even a
+// no-op update or a change followed by a revert during the CDC defer interval.
+func readRowsVersioned(ctx context.Context, db querier, table Table, keys [][]string, batch int64, versioned bool) (rowSet, error) {
 	found := make(rowSet, len(keys))
 	if !table.Key.present() || len(keys) == 0 {
 		return found, nil
 	}
 	size := int(keyBatch(batch, len(table.Key.Columns)))
 	for start := 0; start < len(keys); start += size {
-		part, err := readRowBatch(ctx, db, table, keys[start:min(start+size, len(keys))])
+		part, err := readRowBatch(ctx, db, table, keys[start:min(start+size, len(keys))], versioned)
 		if err != nil {
 			return nil, err
 		}
@@ -131,10 +142,13 @@ func readRows(
 //
 // The keys are joined against rather than listed in an IN, so one statement reads
 // all of them through the key's own index whatever the key's width.
-func readRowBatch(ctx context.Context, db querier, table Table, keys [][]string) (rowSet, error) {
+func readRowBatch(ctx context.Context, db querier, table Table, keys [][]string, versioned bool) (rowSet, error) {
 	found := make(rowSet, len(keys))
 	columns := table.Key.Columns
 	projected := keyProjection(table)
+	if versioned {
+		projected = append(projected, "t.xmin::text")
+	}
 	var (
 		tuples []string
 		args   []any
@@ -170,14 +184,14 @@ func readRowBatch(ctx context.Context, db querier, table Table, keys [][]string)
 	query := fmt.Sprintf("SELECT %s FROM (VALUES %s) AS k(%s) JOIN %s AS t ON %s",
 		strings.Join(projected, ","), strings.Join(tuples, ","),
 		strings.Join(columnNames, ","), table.Identifier(), strings.Join(conditions, " AND "))
-	if err := scanRows(ctx, db, query, table, found, args); err != nil {
+	if err := scanRows(ctx, db, query, table, found, args, versioned); err != nil {
 		return nil, fmt.Errorf("re-read rows of %s: %w", table.Identifier(), err)
 	}
 	return found, nil
 }
 
 // scanRows reads key columns followed by a row hash into a set.
-func scanRows(ctx context.Context, db querier, query string, table Table, into rowSet, args []any) error {
+func scanRows(ctx context.Context, db querier, query string, table Table, into rowSet, args []any, versioned bool) error {
 	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return err
@@ -186,11 +200,19 @@ func scanRows(ctx context.Context, db querier, query string, table Table, into r
 	for rows.Next() {
 		key := make([]*string, len(table.Key.Columns))
 		var hash int64
+		var version string
+		var appID *string
 		dest := make([]any, 0, len(key)+1)
 		for i := range key {
 			dest = append(dest, &key[i])
 		}
 		dest = append(dest, &hash)
+		if table.appColumn {
+			dest = append(dest, &appID)
+		}
+		if versioned {
+			dest = append(dest, &version)
+		}
 		if err := rows.Scan(dest...); err != nil {
 			return err
 		}
@@ -200,17 +222,18 @@ func scanRows(ctx context.Context, db querier, query string, table Table, into r
 				rendered[i] = *value
 			}
 		}
-		into[identity(rendered)] = rowEntry{key: rendered, hash: hash}
+		entry := rowEntry{key: rendered, hash: hash, version: version}
+		if appID != nil {
+			entry.appID = *appID
+		}
+		into[identity(rendered)] = entry
 	}
 	return rows.Err()
 }
 
-// compareRows names the rows two sets disagree about.
-//
-// Sampling cannot produce DiffTargetOnly: the target is only ever asked about keys
-// the source supplied, so a row only the target holds is never in either set. That
-// is the blind spot the design accepts. A recheck can produce it, because there the
-// two sides are asked about the same keys and the source row may have gone.
+// compareRows checks that every source row exists on the target with matching
+// contents. Extra target rows are ignored, including CDC keys and sampled rows
+// that have since been deleted from the source before a recheck.
 func compareRows(source, target rowSet) []RowDiff {
 	var diffs []RowDiff
 	for key, entry := range source {
@@ -220,11 +243,6 @@ func compareRows(source, target rowSet) []RowDiff {
 			diffs = append(diffs, RowDiff{Key: entry.key, Kind: DiffSourceOnly})
 		case other.hash != entry.hash:
 			diffs = append(diffs, RowDiff{Key: entry.key, Kind: DiffDifferent})
-		}
-	}
-	for key, entry := range target {
-		if _, present := source[key]; !present {
-			diffs = append(diffs, RowDiff{Key: entry.key, Kind: DiffTargetOnly})
 		}
 	}
 	slices.SortFunc(diffs, func(a, b RowDiff) int {
@@ -283,7 +301,16 @@ func (w *worker) compareWindows(
 		out.Target.Batches += int((int64(len(keys)) + batch - 1) / batch)
 		out.Target.Keys += int64(len(keys))
 		out.Target.Rows += int64(len(targetRows))
-		candidates = append(candidates, compareRows(sourceRows, targetRows)...)
+		diffs := compareRows(sourceRows, targetRows)
+		if err := w.auditDiffs(table, "heap", "observed", diffs, sourceRows, targetRows, nil); err != nil {
+			return nil, err
+		}
+		diffs, ignored, err := w.excludeDiffs(table, "heap", diffs, sourceRows, targetRows)
+		if err != nil {
+			return nil, err
+		}
+		out.IgnoredRows += ignored
+		candidates = append(candidates, diffs...)
 
 		w.report(Progress{
 			Table: name, Side: sideSource, Stage: StageSampling,
@@ -323,7 +350,7 @@ func (w *worker) compareWindows(
 // latency the loop waited out, which is worth reporting on its own: a stratum
 // whose rows all settle is watching a healthy applier, and one whose rows never
 // do is watching a broken one.
-func (w *worker) resolve(ctx context.Context, table Table, keys [][]string) ([]RowDiff, int, error) {
+func (w *worker) resolve(ctx context.Context, table Table, keys [][]string) ([]RowDiff, int, int, error) {
 	batch := keyBatch(w.cfg.BatchRows, len(table.Key.Columns))
 	budget := w.cfg.ConvergeTimeout
 	if w.cfg.Boundary == nil || w.cfg.WaitApplied == nil {
@@ -333,40 +360,49 @@ func (w *worker) resolve(ctx context.Context, table Table, keys [][]string) ([]R
 	}
 	deadline := time.Now().Add(budget)
 	var (
-		diffs []RowDiff
-		first = -1
+		diffs        []RowDiff
+		first        = -1
+		ignoredTotal int
 	)
 	for {
 		if len(keys) == 0 {
-			return nil, max(first, 0), nil
+			return nil, max(first, 0), ignoredTotal, nil
 		}
 		source, err := readRows(ctx, w.source, table, keys, batch)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		if w.cfg.Boundary != nil && w.cfg.WaitApplied != nil {
 			// The marker is emitted after the read, so every row the read saw was
 			// committed at or before the position it reports.
 			position, err := w.cfg.Boundary(ctx, w.source)
 			if err != nil {
-				return nil, 0, fmt.Errorf("mark the source position for a recheck of %s: %w",
+				return nil, 0, 0, fmt.Errorf("mark the source position for a recheck of %s: %w",
 					table.Identifier(), err)
 			}
 			if err := w.cfg.WaitApplied(ctx, position); err != nil {
-				return nil, 0, fmt.Errorf("wait for apply to reach %s while rechecking %s: %w",
+				return nil, 0, 0, fmt.Errorf("wait for apply to reach %s while rechecking %s: %w",
 					position, table.Identifier(), err)
 			}
 		}
 		target, err := readRows(ctx, w.target, table, keys, batch)
 		if err != nil {
-			return nil, 0, err
+			return nil, 0, 0, err
 		}
 		diffs = compareRows(source, target)
+		if err := w.auditRecheck(table, keys, source, target); err != nil {
+			return nil, 0, 0, err
+		}
+		diffs, ignored, err := w.excludeDiffs(table, "heap", diffs, source, target)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		ignoredTotal += ignored
 		if first < 0 {
 			first = len(diffs)
 		}
 		if len(diffs) == 0 || time.Now().After(deadline) {
-			return diffs, first, nil
+			return diffs, first, ignoredTotal, nil
 		}
 		keys = keys[:0]
 		for _, diff := range diffs {

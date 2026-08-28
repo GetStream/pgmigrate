@@ -188,6 +188,7 @@ type configurationView struct {
 	VerifyTableTimeout     string  `json:"verify_table_timeout"`
 	VerifyConvergeTimeout  string  `json:"verify_converge_timeout"`
 	VerifyCDCRows          int64   `json:"verify_cdc_rows"`
+	VerifyIgnoreApps       string  `json:"verify_ignore_apps"`
 	CDCSampleRows          int64   `json:"cdc_sample_rows"`
 }
 
@@ -227,6 +228,7 @@ type configurationUpdate struct {
 	VerifyTableTimeout     *string  `json:"verify_table_timeout"`
 	VerifyConvergeTimeout  *string  `json:"verify_converge_timeout"`
 	VerifyCDCRows          *int64   `json:"verify_cdc_rows"`
+	VerifyIgnoreApps       *string  `json:"verify_ignore_apps"`
 	CDCSampleRows          *int64   `json:"cdc_sample_rows"`
 }
 
@@ -717,6 +719,7 @@ func applyConfigurationUpdate(candidate *config.Config, update configurationUpda
 	setIfPresent(&candidate.VerifyBatchRows, update.VerifyBatchRows)
 	setIfPresent(&candidate.VerifyDutyCycle, update.VerifyDutyCycle)
 	setIfPresent(&candidate.VerifyCDCRows, update.VerifyCDCRows)
+	setIfPresent(&candidate.VerifyIgnoreApps, update.VerifyIgnoreApps)
 	setIfPresent(&candidate.CDCSampleRows, update.CDCSampleRows)
 	setIfPresent(&candidate.ReplayWorkers, update.ReplayWorkers)
 	setIfPresent(&candidate.ReplayBatchBytes, update.ReplayBatchBytes)
@@ -800,7 +803,8 @@ func viewConfiguration(cfg config.Config, revision string) configurationView {
 		VerifySampleWindows: cfg.VerifySampleWindows, VerifyBatchRows: cfg.VerifyBatchRows,
 		VerifyDutyCycle: cfg.VerifyDutyCycle, VerifyTableTimeout: cfg.VerifyTableTimeout.String(),
 		VerifyConvergeTimeout: cfg.VerifyConvergeTimeout.String(), VerifyCDCRows: cfg.VerifyCDCRows,
-		CDCSampleRows: cfg.CDCSampleRows,
+		VerifyIgnoreApps: cfg.VerifyIgnoreApps,
+		CDCSampleRows:    cfg.CDCSampleRows,
 	}
 }
 

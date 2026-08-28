@@ -55,6 +55,7 @@ type persistedConfiguration struct {
 	VerifyTableTimeout     time.Duration `json:"verify_table_timeout"`
 	VerifyConvergeTimeout  time.Duration `json:"verify_converge_timeout"`
 	VerifyCDCRows          int64         `json:"verify_cdc_rows"`
+	VerifyIgnoreApps       string        `json:"verify_ignore_apps,omitempty"`
 	CDCSampleRows          int64         `json:"cdc_sample_rows"`
 }
 
@@ -76,7 +77,8 @@ func persistedConfigurationFrom(cfg config.Config) persistedConfiguration {
 		VerifySampleWindows: cfg.VerifySampleWindows, VerifyBatchRows: cfg.VerifyBatchRows,
 		VerifyDutyCycle: cfg.VerifyDutyCycle, VerifyTableTimeout: cfg.VerifyTableTimeout,
 		VerifyConvergeTimeout: cfg.VerifyConvergeTimeout, VerifyCDCRows: cfg.VerifyCDCRows,
-		CDCSampleRows: cfg.CDCSampleRows,
+		VerifyIgnoreApps: cfg.VerifyIgnoreApps,
+		CDCSampleRows:    cfg.CDCSampleRows,
 	}
 }
 
@@ -111,6 +113,7 @@ func (persisted persistedConfiguration) merge(base config.Config) config.Config 
 	base.VerifyTableTimeout = persisted.VerifyTableTimeout
 	base.VerifyConvergeTimeout = persisted.VerifyConvergeTimeout
 	base.VerifyCDCRows = persisted.VerifyCDCRows
+	base.VerifyIgnoreApps = persisted.VerifyIgnoreApps
 	base.CDCSampleRows = persisted.CDCSampleRows
 	return base
 }

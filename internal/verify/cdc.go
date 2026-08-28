@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 )
 
 // defaultCDCKeys is how many recorded keys one table's CDC check looks at.
@@ -49,9 +50,9 @@ type CDCResult struct {
 	// applier saw. The ratio is this stratum's coverage.
 	Keys     int64 `json:"keys"`
 	Observed int64 `json:"observed"`
-	// Deletes is how many of the checked keys were deletes. They are the only
-	// check either stratum makes that can catch a row the target holds and the
-	// source does not.
+	// Deletes is how many of the checked keys were recorded as deletes. These
+	// still check a source row if the key was later reinserted, but do not require
+	// the target to remove rows that are absent from the source.
 	Deletes int64 `json:"deletes"`
 	// Dropped is how many changes the applier could not name, and so never
 	// offered. Without it, a relation whose every key is unrenderable looks the
@@ -60,20 +61,35 @@ type CDCResult struct {
 	Candidates int    `json:"candidate_rows,omitempty"`
 	InFlight   int    `json:"in_flight_rows,omitempty"`
 	Skipped    string `json:"skipped,omitempty"`
+	// Pending counts initial differences awaiting the deferred check. They are not
+	// divergence until rechecked; a canceled or incomplete check cannot clear them.
+	Pending        int `json:"pending_rows,omitempty"`
+	pending        []RowDiff
+	baseline       rowSet
+	recheckAt      time.Time
+	targetBaseline rowSet
+	replayBoundary string
+	// Advanced counts rows accepted because the target changed during the delay.
+	// These are progressing, not verified equal to the source.
+	Advanced int `json:"advanced_rows,omitempty"`
+	// SourceChanged counts touched source rows. Unless excluded by app scope,
+	// each requires a stable match or target advancement; a touch alone cannot pass.
+	SourceChanged int `json:"source_changed_rows,omitempty"`
 }
 
 // verifyCDC checks the rows the applier reported writing.
 //
-// The whole check is one call to resolve. That is not a shortcut: resolve already
-// reads both sides by key, fixes a WAL position between the two reads, waits for
-// apply to pass it, and re-reads whatever still differs until the convergence
-// budget runs out. Comparing the two sides once beforehand would only re-find the
-// rows that are legitimately in flight.
+// The first pass snapshots each differing source row, including xmin. A separate
+// worker rechecks it after one minute, confirming replay has passed the fresh
+// source read before reading the target. A stable match passes; otherwise target
+// advancement is required, even when the source changed. Advancement is accepted
+// as progress, not equality. Confirmation timeout is incomplete, not divergence.
+// There is exactly one deferred check, no retries.
 //
-// A correctly applied delete is absent on both sides and produces nothing. An
-// unapplied one is absent on the source and present on the target, which
-// compareRows reports as DiffTargetOnly — the direction the heap sample cannot
-// see at all, because it only ever asks about keys the source still has.
+// Like the heap sample, this is a source-to-target check. A recorded key absent
+// from the source at the initial read produces no difference, whether the target still
+// holds it or which operation was recorded. A key reinserted on the source is
+// checked against its current contents, even if it was recorded as a delete.
 func (w *worker) verifyCDC(
 	ctx context.Context, table Table, leaves []relation, out *TableResult,
 ) ([]RowDiff, error) {
@@ -120,13 +136,35 @@ func (w *worker) verifyCDC(
 		Table: table.Schema + "." + table.Name, Stage: StageCDC,
 		CDCKeys: out.CDC.Keys, CDCObserved: out.CDC.Observed,
 	})
-	unresolved, candidates, err := w.resolve(ctx, table, keys)
+	source, err := readRowsVersioned(ctx, w.source, table, keys, w.cfg.BatchRows, true)
 	if err != nil {
 		return nil, err
 	}
-	out.CDC.Candidates = candidates
-	out.CDC.InFlight = candidates - len(unresolved)
-	return unresolved, nil
+	target, err := readRowsVersioned(ctx, w.target, table, keys, w.cfg.BatchRows, true)
+	if err != nil {
+		return nil, err
+	}
+	candidates := compareRows(source, target)
+	candidates, ignored, err := w.excludeDiffs(table, "cdc", candidates, source, target)
+	if err != nil {
+		return nil, err
+	}
+	out.IgnoredRows += ignored
+	out.CDC.Candidates = len(candidates)
+	out.CDC.recheckAt = time.Now().Add(w.cfg.CDCRecheckDelay)
+	out.CDC.baseline = make(rowSet, len(candidates))
+	out.CDC.targetBaseline = make(rowSet, len(candidates))
+	for _, diff := range candidates {
+		id := identity(diff.Key)
+		out.CDC.baseline[id] = source[id]
+		if row, ok := target[id]; ok {
+			out.CDC.targetBaseline[id] = row
+		}
+	}
+	if err := w.auditDiffs(table, "cdc", "deferred", candidates, source, target, nil); err != nil {
+		return nil, err
+	}
+	return candidates, nil
 }
 
 // collectRecorded reads every leaf's reservoir up to the budget.

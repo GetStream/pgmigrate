@@ -1,11 +1,39 @@
 package config_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/GetStream/pgmigrate/internal/config"
 )
+
+func TestIgnoredVerificationApps(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  []string
+	}{
+		{"", nil}, {" \t", nil}, {"7", []string{"7"}},
+		{" 7,42,007 ", []string{"42", "7"}},
+	} {
+		cfg := config.FromEnvironment()
+		cfg.VerifyIgnoreApps = tc.input
+		got, err := cfg.IgnoredVerificationApps()
+		if err != nil || !slices.Equal(got, tc.want) {
+			t.Errorf("IgnoredVerificationApps(%q) = %v, %v; want %v", tc.input, got, err, tc.want)
+		}
+		if err := cfg.ValidateVerify(); err != nil {
+			t.Errorf("ValidateVerify(%q): %v", tc.input, err)
+		}
+	}
+	for _, input := range []string{"0", "-1", "1,", ",1", "1,,2", "foo", "1.5", "9223372036854775808", "1); DROP TABLE items"} {
+		cfg := config.FromEnvironment()
+		cfg.VerifyIgnoreApps = input
+		if err := cfg.ValidateVerify(); err == nil || !strings.Contains(err.Error(), "verify-ignore-apps") {
+			t.Errorf("ValidateVerify(%q) = %v, want app ID validation error", input, err)
+		}
+	}
+}
 
 func TestFromEnvironment(t *testing.T) {
 	t.Setenv(config.SourceEnv, "postgres://source/db")

@@ -41,22 +41,16 @@ func TestProjectKeyRefusesAKeyItCannotCover(t *testing.T) {
 	}
 }
 
-// TestCompareRowsNamesAnUnappliedDelete is the whole reason the CDC stratum
-// carries delete keys. The heap sample walks the source, so a row the target
-// holds and the source does not is invisible to it by construction; asking both
-// sides about the same key is what makes it visible.
-func TestCompareRowsNamesAnUnappliedDelete(t *testing.T) {
+// A recorded key that is absent on the source is not required to be absent on
+// the target, even when the CDC check asks both sides about it.
+func TestCompareRowsIgnoresAnUnappliedDelete(t *testing.T) {
 	t.Parallel()
 	target := rowSet{
 		identity([]string{"1", "gone"}): {key: []string{"1", "gone"}, hash: 7},
 	}
 	diffs := compareRows(rowSet{}, target)
-	if len(diffs) != 1 {
-		t.Fatalf("compareRows() found %d differences, want 1", len(diffs))
-	}
-	if diffs[0].Kind != DiffTargetOnly {
-		t.Errorf("compareRows() = %s, want %s: a row only the target holds is a delete that did not apply",
-			diffs[0].Kind, DiffTargetOnly)
+	if len(diffs) != 0 {
+		t.Fatalf("compareRows() found %v for a row absent on the source, want none", diffs)
 	}
 }
 

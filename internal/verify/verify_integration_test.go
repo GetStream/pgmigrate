@@ -423,18 +423,26 @@ func TestPostgres17RecheckAttributesAnInFlightRowToReplicationLatency(t *testing
 	if elapsed := time.Since(began); elapsed < cfg.ConvergeTimeout {
 		t.Fatalf("the row was given up on after %s, before its %s budget", elapsed, cfg.ConvergeTimeout)
 	}
+
+	// If a candidate disappears from the source while rechecking, retaining it
+	// on the target must not turn it into a reverse-direction mismatch.
+	cfg.WaitApplied = func(ctx context.Context, _ string) error {
+		_, err := source.Exec(ctx, `DELETE FROM public.items WHERE id=11`)
+		return err
+	}
+	deleted, err := Run(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !deleted.Complete || !deleted.Converged || deleted.Tables[0].Candidates != 1 ||
+		len(deleted.Tables[0].Unresolved) != 0 {
+		t.Fatalf("a candidate deleted from the source should converge: %#v", deleted.Tables[0])
+	}
 }
 
-// TestCDCStratumFindsTheDeleteTheHeapSampleCannotSee is the whole reason this
-// stratum exists.
-//
-// The heap sample walks the source, so it only ever asks the target about keys
-// the source still has. A row the source deleted and the target kept is therefore
-// invisible to it by construction — the one direction an unapplied delete shows
-// up in. Asking both sides about a key the applier recorded is what makes it
-// visible, and this test asserts both halves: the sample stays clean and the
-// stratum reports the row.
-func TestCDCStratumFindsTheDeleteTheHeapSampleCannotSee(t *testing.T) {
+// CDC checks obey the same source-to-target rule as the heap sample, regardless
+// of the recorded operation. They still reject missing or changed source rows.
+func TestCDCStratumRequiresOnlyCurrentSourceRows(t *testing.T) {
 	sourceInstance := pgtest.Start(t, 17)
 	targetInstance := pgtest.Start(t, 17)
 	ctx := context.Background()
@@ -447,9 +455,9 @@ func TestCDCStratumFindsTheDeleteTheHeapSampleCannotSee(t *testing.T) {
 	exec(t, source, ddl, insert, "ANALYZE public.notes")
 	exec(t, target, ddl, insert, "ANALYZE public.notes")
 
-	// The source drops a row and the target does not, which is what an applier
-	// that failed to replay a delete leaves behind.
-	exec(t, source, `DELETE FROM public.notes WHERE app_pk=1 AND id='n42'`)
+	// Rows retained only by the target are allowed, including keys recorded as
+	// inserts or updates that were subsequently deleted on the source.
+	exec(t, source, `DELETE FROM public.notes WHERE app_pk=1 AND id IN ('n42','n43','n44')`)
 
 	tables := inventoryOf(t, source, "public", "notes")
 	base := Config{
@@ -470,12 +478,15 @@ func TestCDCStratumFindsTheDeleteTheHeapSampleCannotSee(t *testing.T) {
 
 	// Now the applier reports what it applied, including the delete.
 	withCDC := base
+	withCDC.CDCRecheckDelay = 10 * time.Millisecond
 	withCDC.CDCRows = 100
 	withCDC.CDCKeys = func(context.Context, string, string) (CDCRecorded, error) {
 		return CDCRecorded{
-			Observed: 3,
+			Observed: 5,
 			Keys: []CDCKey{
 				{Key: map[string]string{"app_pk": "1", "id": "n42"}, Kind: "delete"},
+				{Key: map[string]string{"app_pk": "1", "id": "n43"}, Kind: "insert"},
+				{Key: map[string]string{"app_pk": "1", "id": "n44"}, Kind: "update"},
 				{Key: map[string]string{"app_pk": "1", "id": "n7"}, Kind: "insert"},
 				{Key: map[string]string{"app_pk": "1", "id": "n99"}, Kind: "update"},
 			},
@@ -485,24 +496,14 @@ func TestCDCStratumFindsTheDeleteTheHeapSampleCannotSee(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if seen.Converged {
-		t.Fatal("the CDC stratum missed a delete the target never applied")
+	if !seen.Converged || !seen.Complete || len(seen.Tables[0].Unresolved) != 0 {
+		t.Fatalf("target-only rows should not fail CDC verification: %#v", seen.Tables[0])
 	}
-	unresolved := seen.Tables[0].Unresolved
-	if len(unresolved) != 1 {
-		t.Fatalf("unresolved = %#v, want only the unapplied delete", unresolved)
+	if cdc := seen.Tables[0].CDC; cdc.Keys != 5 || cdc.Observed != 5 || cdc.Deletes != 1 || cdc.Candidates != 0 {
+		t.Errorf("CDC result = %+v, want 5 keys of 5 observed with 1 delete and no candidates", cdc)
 	}
-	if unresolved[0].Kind != DiffTargetOnly {
-		t.Errorf("unapplied delete reported as %q, want %q", unresolved[0].Kind, DiffTargetOnly)
-	}
-	if got := unresolved[0].Key; len(got) != 2 || got[0] != "1" || got[1] != "n42" {
-		t.Errorf("unapplied delete named %v, want [1 n42]", got)
-	}
-	if cdc := seen.Tables[0].CDC; cdc.Keys != 3 || cdc.Observed != 3 || cdc.Deletes != 1 {
-		t.Errorf("CDC result = %+v, want 3 keys of 3 observed with 1 delete", cdc)
-	}
-	if seen.CDCKeys() != 3 || seen.CDCObserved() != 3 {
-		t.Errorf("run totals = %d of %d, want 3 of 3", seen.CDCKeys(), seen.CDCObserved())
+	if seen.CDCKeys() != 5 || seen.CDCObserved() != 5 {
+		t.Errorf("run totals = %d of %d, want 5 of 5", seen.CDCKeys(), seen.CDCObserved())
 	}
 
 	// A delete both sides applied is absent on both, and absent on both is
@@ -514,5 +515,31 @@ func TestCDCStratumFindsTheDeleteTheHeapSampleCannotSee(t *testing.T) {
 	}
 	if !clean.Converged {
 		t.Fatalf("a correctly applied delete was reported: %#v", clean.Tables[0].Unresolved)
+	}
+
+	// A recorded delete key can now exist again. Check its current value along
+	// with ordinary insert/update keys; the operation must not bypass comparison.
+	exec(t, source, `INSERT INTO public.notes VALUES (1,'n42','reinserted')`)
+	exec(t, target,
+		`INSERT INTO public.notes VALUES (1,'n42','stale')`,
+		`DELETE FROM public.notes WHERE app_pk=1 AND id='n7'`,
+		`UPDATE public.notes SET body='wrong' WHERE app_pk=1 AND id='n99'`)
+	diverged, err := Run(ctx, withCDC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diverged.Converged || !diverged.Complete || diverged.Tables[0].CDC.Candidates != 3 {
+		t.Fatalf("CDC should reject all three mismatching source rows: %#v", diverged.Tables[0])
+	}
+	want := map[string]DiffKind{"n42": DiffDifferent, "n7": DiffSourceOnly, "n99": DiffDifferent}
+	found := make(map[string]bool)
+	for _, diff := range diverged.Tables[0].Unresolved {
+		if len(diff.Key) != 2 || diff.Key[0] != "1" || want[diff.Key[1]] != diff.Kind {
+			t.Fatalf("unexpected divergence: %#v", diff)
+		}
+		found[diff.Key[1]] = true
+	}
+	if len(found) != len(want) {
+		t.Fatalf("divergent keys = %v, want %v", found, want)
 	}
 }

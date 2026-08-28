@@ -78,8 +78,9 @@ func NewRootCommand() *cobra.Command {
 	flags.Int64Var(&cfg.VerifyBatchRows, "verify-batch-rows", cfg.VerifyBatchRows, "keys per target lookup statement")
 	flags.Float64Var(&cfg.VerifyDutyCycle, "verify-duty-cycle", cfg.VerifyDutyCycle, "fraction of the time verification may spend querying, sleeping between windows to stay under it")
 	flags.DurationVar(&cfg.VerifyTableTimeout, "verify-table-timeout", cfg.VerifyTableTimeout, "time one table's check may take (0 disables)")
-	flags.DurationVar(&cfg.VerifyConvergeTimeout, "verify-converge-timeout", cfg.VerifyConvergeTimeout, "how long a differing row is given to settle before it is reported")
+	flags.DurationVar(&cfg.VerifyConvergeTimeout, "verify-converge-timeout", cfg.VerifyConvergeTimeout, "budget for heap convergence and deferred CDC replay confirmation")
 	flags.Int64Var(&cfg.VerifyCDCRows, "verify-cdc-rows", cfg.VerifyCDCRows, "applier-recorded keys per table checked alongside the heap sample")
+	flags.StringVar(&cfg.VerifyIgnoreApps, "verify-ignore-apps", cfg.VerifyIgnoreApps, "comma-separated app_pk IDs whose mismatches are audited but excluded from verification; replication is unchanged")
 	flags.Int64Var(&cfg.CDCSampleRows, "cdc-sample-rows", cfg.CDCSampleRows, "applied keys kept per relation for verification to check the replication path (0 records none)")
 
 	application := app.App{Out: root.OutOrStdout()}

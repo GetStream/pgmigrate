@@ -229,7 +229,8 @@ func (p *verifyProgress) Update(update verify.Progress) {
 		"rows_per_second": update.Rate, "eta": update.ETA.String(),
 		"coverage": update.Coverage, "candidate_rows": update.Candidates,
 		"cdc_keys": update.CDCKeys, "cdc_observed": update.CDCObserved,
-		"unresolved": update.Unresolved,
+		"cdc_pending_rows": update.CDCPending,
+		"unresolved":       update.Unresolved,
 	})
 	if p.store == nil || record == nil {
 		return
@@ -285,15 +286,18 @@ func (p *verifyProgress) record(update verify.Progress) *state.VerifyTable {
 		into.CDCObserved = update.CDCObserved
 	}
 	into.Unresolved = int64(update.Unresolved)
-	if update.Stage == verify.StageDone {
-		into.Converged, into.Complete = update.Converged, update.Complete
-	}
+	into.Converged, into.Complete = update.Converged, update.Complete
 	copied := *into
 	return &copied
 }
 
 func (p *verifyProgress) render(update verify.Progress) {
 	if p.out == nil {
+		return
+	}
+	if update.Stage == verify.StageCDCDeferred || update.Stage == verify.StageCDCRechecking {
+		p.line(fmt.Sprintf("verify %s: %s, %d CDC rows pending (not final divergence)",
+			update.Table, update.Stage, update.CDCPending))
 		return
 	}
 	// The CDC stratum checks rows the heap sample cannot reach, so it reports its
@@ -384,10 +388,10 @@ func verificationWarnings(result verify.Result) string {
 // hide it.
 func verificationSummary(result verify.Result) string {
 	var (
-		compared, skipped  int
-		sampled, estimated int64
-		leastName          string
-		least              = 1.0
+		compared, skipped, ignored int
+		sampled, estimated         int64
+		leastName                  string
+		least                      = 1.0
 	)
 	for _, table := range result.Tables {
 		if len(table.Table.Key.Columns) == 0 {
@@ -395,6 +399,7 @@ func verificationSummary(result verify.Result) string {
 			continue
 		}
 		compared++
+		ignored += table.IgnoredRows
 		sampled += table.Source.Rows
 		// An unanalyzed table estimates zero rows, and a stale estimate can be
 		// under what was read. Neither is a denominator.
@@ -415,6 +420,9 @@ func verificationSummary(result verify.Result) string {
 	if skipped > 0 {
 		line += fmt.Sprintf(", %d not compared for want of a key", skipped)
 	}
+	if ignored > 0 {
+		line += fmt.Sprintf("; %d mismatches ignored by application scope (audited)", ignored)
+	}
 	return line + "\n"
 }
 
@@ -434,7 +442,22 @@ func cdcSummary(result verify.Result) string {
 	line := fmt.Sprintf("%s of %s applied rows checked",
 		compactCount(keys), compactCount(observed))
 	if deletes := result.CDCDeletes(); deletes > 0 {
-		line += fmt.Sprintf(" (%s deletions)", compactCount(deletes))
+		line += fmt.Sprintf(" (%s recorded delete keys; target-only rows ignored)", compactCount(deletes))
+	}
+	var changed, pending, advanced int
+	for _, table := range result.Tables {
+		changed += table.CDC.SourceChanged
+		pending += table.CDC.Pending
+		advanced += table.CDC.Advanced
+	}
+	if changed > 0 {
+		line += fmt.Sprintf("; %d source-changed CDC rows checked for convergence or target advancement", changed)
+	}
+	if advanced > 0 {
+		line += fmt.Sprintf("; %d CDC target rows advanced without matching; accepted as progressing", advanced)
+	}
+	if pending > 0 {
+		line += fmt.Sprintf("; %d CDC rows still pending", pending)
 	}
 	return line
 }
@@ -472,13 +495,13 @@ func verificationDivergence(result verify.Result) string {
 // direction it is points at the cause: a missing row is an apply that did not
 // happen, a differing one an apply that happened wrongly.
 func diffKinds(rows []verify.RowDiff) string {
-	counts := make(map[verify.DiffKind]int, 3)
+	counts := make(map[verify.DiffKind]int, 2)
 	for _, row := range rows {
 		counts[row.Kind]++
 	}
 	var parts []string
 	for _, kind := range []verify.DiffKind{
-		verify.DiffSourceOnly, verify.DiffTargetOnly, verify.DiffDifferent,
+		verify.DiffSourceOnly, verify.DiffDifferent, verify.DiffTargetStalled,
 	} {
 		if counts[kind] > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", counts[kind], kind))
