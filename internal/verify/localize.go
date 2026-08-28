@@ -19,18 +19,21 @@ type RowDiff struct {
 }
 
 // DiffKind says whether a source row is missing from the target or has different
-// contents there. Rows present only on the target are not verification failures.
+// contents there, or whether a deferred CDC candidate failed to advance on the
+// target after its source changed. Extra target rows are not failures.
 type DiffKind string
 
 const (
-	DiffSourceOnly DiffKind = "source_only"
-	DiffDifferent  DiffKind = "different"
+	DiffSourceOnly    DiffKind = "source_only"
+	DiffDifferent     DiffKind = "different"
+	DiffTargetStalled DiffKind = "target_stalled"
 )
 
 // rowEntry is one row reduced to its key and a hash of its contents.
 type rowEntry struct {
-	key  []string
-	hash int64
+	key     []string
+	hash    int64
+	version string
 }
 
 // rowSet holds rows by a rendering of their key tuple.
@@ -68,7 +71,7 @@ func sampleWindow(
 	ctx context.Context, db querier, table Table, chunk pageChunk,
 ) (rowSet, int64, error) {
 	found := make(rowSet, chunk.Limit)
-	if err := scanRows(ctx, db, sampleQuery(table, chunk), table, found, nil); err != nil {
+	if err := scanRows(ctx, db, sampleQuery(table, chunk), table, found, nil, false); err != nil {
 		return nil, 0, fmt.Errorf("sample %s: %w", chunk, err)
 	}
 	return found, int64(len(found)), nil
@@ -110,13 +113,19 @@ func keyBatch(requested int64, columns int) int64 {
 func readRows(
 	ctx context.Context, db querier, table Table, keys [][]string, batch int64,
 ) (rowSet, error) {
+	return readRowsVersioned(ctx, db, table, keys, batch, false)
+}
+
+// readRowsVersioned optionally captures the source xmin, which detects even a
+// no-op update or a change followed by a revert during the CDC defer interval.
+func readRowsVersioned(ctx context.Context, db querier, table Table, keys [][]string, batch int64, versioned bool) (rowSet, error) {
 	found := make(rowSet, len(keys))
 	if !table.Key.present() || len(keys) == 0 {
 		return found, nil
 	}
 	size := int(keyBatch(batch, len(table.Key.Columns)))
 	for start := 0; start < len(keys); start += size {
-		part, err := readRowBatch(ctx, db, table, keys[start:min(start+size, len(keys))])
+		part, err := readRowBatch(ctx, db, table, keys[start:min(start+size, len(keys))], versioned)
 		if err != nil {
 			return nil, err
 		}
@@ -129,10 +138,13 @@ func readRows(
 //
 // The keys are joined against rather than listed in an IN, so one statement reads
 // all of them through the key's own index whatever the key's width.
-func readRowBatch(ctx context.Context, db querier, table Table, keys [][]string) (rowSet, error) {
+func readRowBatch(ctx context.Context, db querier, table Table, keys [][]string, versioned bool) (rowSet, error) {
 	found := make(rowSet, len(keys))
 	columns := table.Key.Columns
 	projected := keyProjection(table)
+	if versioned {
+		projected = append(projected, "t.xmin::text")
+	}
 	var (
 		tuples []string
 		args   []any
@@ -168,14 +180,14 @@ func readRowBatch(ctx context.Context, db querier, table Table, keys [][]string)
 	query := fmt.Sprintf("SELECT %s FROM (VALUES %s) AS k(%s) JOIN %s AS t ON %s",
 		strings.Join(projected, ","), strings.Join(tuples, ","),
 		strings.Join(columnNames, ","), table.Identifier(), strings.Join(conditions, " AND "))
-	if err := scanRows(ctx, db, query, table, found, args); err != nil {
+	if err := scanRows(ctx, db, query, table, found, args, versioned); err != nil {
 		return nil, fmt.Errorf("re-read rows of %s: %w", table.Identifier(), err)
 	}
 	return found, nil
 }
 
 // scanRows reads key columns followed by a row hash into a set.
-func scanRows(ctx context.Context, db querier, query string, table Table, into rowSet, args []any) error {
+func scanRows(ctx context.Context, db querier, query string, table Table, into rowSet, args []any, versioned bool) error {
 	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return err
@@ -184,11 +196,15 @@ func scanRows(ctx context.Context, db querier, query string, table Table, into r
 	for rows.Next() {
 		key := make([]*string, len(table.Key.Columns))
 		var hash int64
+		var version string
 		dest := make([]any, 0, len(key)+1)
 		for i := range key {
 			dest = append(dest, &key[i])
 		}
 		dest = append(dest, &hash)
+		if versioned {
+			dest = append(dest, &version)
+		}
 		if err := rows.Scan(dest...); err != nil {
 			return err
 		}
@@ -198,7 +214,7 @@ func scanRows(ctx context.Context, db querier, query string, table Table, into r
 				rendered[i] = *value
 			}
 		}
-		into[identity(rendered)] = rowEntry{key: rendered, hash: hash}
+		into[identity(rendered)] = rowEntry{key: rendered, hash: hash, version: version}
 	}
 	return rows.Err()
 }
@@ -273,7 +289,11 @@ func (w *worker) compareWindows(
 		out.Target.Batches += int((int64(len(keys)) + batch - 1) / batch)
 		out.Target.Keys += int64(len(keys))
 		out.Target.Rows += int64(len(targetRows))
-		candidates = append(candidates, compareRows(sourceRows, targetRows)...)
+		diffs := compareRows(sourceRows, targetRows)
+		if err := w.auditDiffs(table, "heap", "observed", diffs, sourceRows, targetRows, nil); err != nil {
+			return nil, err
+		}
+		candidates = append(candidates, diffs...)
 
 		w.report(Progress{
 			Table: name, Side: sideSource, Stage: StageSampling,
@@ -352,6 +372,9 @@ func (w *worker) resolve(ctx context.Context, table Table, keys [][]string) ([]R
 			return nil, 0, err
 		}
 		diffs = compareRows(source, target)
+		if err := w.auditRecheck(table, keys, source, target); err != nil {
+			return nil, 0, err
+		}
 		if first < 0 {
 			first = len(diffs)
 		}

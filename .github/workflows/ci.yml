@@ -27,6 +27,8 @@ jobs:
             echo "$unformatted" >&2
             exit 1
           fi
+      - name: controller verification UI
+        run: node --test internal/controller/ui_test.mjs
       - run: make vet
       # Reachability, not Dependabot's module list: the released binary, not the
       # integration-tagged testcontainers graph.

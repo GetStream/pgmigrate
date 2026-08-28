@@ -17,10 +17,12 @@ const sideSource Side = "source"
 type Stage string
 
 const (
-	StageSampling   Stage = "sampling"
-	StageRechecking Stage = "rechecking"
-	StageCDC        Stage = "checking cdc"
-	StageDone       Stage = "done"
+	StageSampling      Stage = "sampling"
+	StageRechecking    Stage = "rechecking"
+	StageCDC           Stage = "checking cdc"
+	StageCDCDeferred   Stage = "pending cdc recheck"
+	StageCDCRechecking Stage = "rechecking cdc"
+	StageDone          Stage = "done"
 )
 
 // Progress is one observation of a running check.
@@ -53,6 +55,7 @@ type Progress struct {
 	// CDCObserved is how many changes the applier saw for the table, which is
 	// what makes CDCKeys interpretable as coverage rather than as a bare count.
 	CDCObserved int64 `json:"cdc_observed,omitempty"`
+	CDCPending  int   `json:"cdc_pending_rows,omitempty"`
 	Unresolved  int   `json:"unresolved,omitempty"`
 	Converged   bool  `json:"converged,omitempty"`
 	Complete    bool  `json:"complete,omitempty"`

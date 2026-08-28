@@ -773,6 +773,7 @@ func TestIndexContainsControllerProgressUI(t *testing.T) {
 	for _, want := range []string{
 		"pgmigrate controller", "Object completion", "lifecycleBar", "Stop migration",
 		"confirmDialog", "data-action=\"run\" disabled", "no rows compared",
+		"pending CDC recheck", "pending cdc recheck", "rechecking cdc",
 		"latestCDCRecovery", "CDC files checked", "CDC validation read throughput",
 		"Validating durable CDC segments before reconnecting source capture and target replay.",
 		"replayTrendWarmupSeconds=15", "trend and ETA after", "resetReplaySamplesForOperation",

@@ -45,6 +45,7 @@ const (
 	// defaultConvergeTimeout bounds the loop that waits for rows in flight to
 	// settle. Reaching it means the rows are reported as divergence.
 	defaultConvergeTimeout = time.Minute
+	defaultCDCRecheckDelay = time.Minute
 	// defaultRowThreshold bounds how many differing rows one table names.
 	defaultRowThreshold int64 = 1000
 )
@@ -190,7 +191,8 @@ type Config struct {
 	Source, Target Connector
 	Tables         []Table
 	// Workers verify whole tables in parallel. One is the default because two
-	// concurrent scans saturated a two-vCPU production source.
+	// concurrent scans saturated a two-vCPU production source. A separate worker
+	// handles deferred CDC key lookups using at most one additional connection pair.
 	Workers int
 	// SampleRows is how many rows per table the source pass reads.
 	SampleRows int64
@@ -201,11 +203,16 @@ type Config struct {
 	// DutyCycle is the fraction of the time verification may spend querying,
 	// between 0 and 1. It sleeps between windows to stay under it.
 	DutyCycle float64
-	// TableTimeout bounds one table's check; zero disables it.
+	// TableTimeout bounds active work on one table, including the deferred CDC
+	// recheck, excluding its delay and queue time. Zero disables it.
 	TableTimeout time.Duration
-	// ConvergeTimeout bounds the wait for rows in flight to settle.
+	// ConvergeTimeout bounds heap-sample rechecks against a WAL boundary.
 	ConvergeTimeout time.Duration
-	// RowThreshold bounds how many differing rows one table names.
+	// CDCRecheckDelay is the minimum time between a CDC mismatch snapshot and its
+	// deferred check. Zero selects one minute.
+	CDCRecheckDelay time.Duration
+	// RowThreshold bounds heap candidate rechecks. CDC candidates and the audit
+	// of initial mismatches are not truncated by this threshold.
 	RowThreshold int64
 	// CDCKeys supplies the rows the applier recorded writing, which is the only
 	// way to check the replication path: a physical sample of the source finds
@@ -215,7 +222,7 @@ type Config struct {
 	// CDCRows bounds how many recorded keys one table's check looks at.
 	CDCRows int64
 
-	// Boundary and WaitApplied are what let a row that differs be attributed to
+	// Boundary and WaitApplied let a heap-sample row that differs be attributed to
 	// replication latency rather than to corruption. Both nil means nothing is
 	// applying, which is the case at cutover, and a row that differs is reported
 	// as it stands.
@@ -223,6 +230,9 @@ type Config struct {
 	WaitApplied WaitApplied
 
 	Progress ProgressSink
+	// Audit receives all mismatches and deferred outcomes and must support
+	// concurrent calls. Failure aborts the run rather than silently losing the audit trail.
+	Audit func([]AuditEvent) error
 }
 
 func (c *Config) applyDefaults() {
@@ -243,6 +253,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RowThreshold <= 0 {
 		c.RowThreshold = defaultRowThreshold
+	}
+	if c.CDCRecheckDelay <= 0 {
+		c.CDCRecheckDelay = defaultCDCRecheckDelay
 	}
 	if c.CDCRows <= 0 {
 		c.CDCRows = defaultCDCKeys
@@ -269,9 +282,26 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	jobs := make(chan int)
 	results := make(chan item, len(cfg.Tables))
+	deferred := make(chan item, len(cfg.Tables))
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	shared := &rate{}
+	// A single rechecker handles due CDC candidates while the initial table
+	// workers keep scanning. It never scans a heap or blocks their job queue.
+	var rechecks sync.WaitGroup
+	rechecks.Add(1)
+	go func() {
+		defer rechecks.Done()
+		worker := &worker{cfg: &cfg, rate: shared}
+		defer worker.close()
+		for job := range deferred {
+			job.result, job.err = worker.recheckCDC(runCtx, job.result)
+			results <- job
+			if job.err != nil {
+				cancel()
+			}
+		}
+	}()
 	var wg sync.WaitGroup
 	for range min(cfg.Workers, max(1, len(cfg.Tables))) {
 		wg.Add(1)
@@ -281,7 +311,12 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			defer worker.close()
 			for index := range jobs {
 				result, err := worker.verifyTable(runCtx, cfg.Tables[index])
-				results <- item{index: index, result: result, err: err}
+				job := item{index: index, result: result, err: err}
+				if err == nil && result.CDC.Pending > 0 {
+					deferred <- job
+				} else {
+					results <- job
+				}
 				if err != nil {
 					cancel()
 					return
@@ -300,6 +335,8 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 		}
 	}()
 	wg.Wait()
+	close(deferred)
+	rechecks.Wait()
 	close(results)
 	out := Result{
 		Tables:    make([]TableResult, len(cfg.Tables)),
@@ -311,13 +348,19 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 			first = item.err
 		}
 		out.Tables[item.index] = item.result
-		out.Converged = out.Converged && item.result.Converged
-		out.Complete = out.Complete && item.result.Complete
-		out.Warnings = append(out.Warnings, item.result.Warnings...)
 	}
 	if first != nil {
 		return Result{}, first
 	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	for i := range out.Tables {
+		out.Converged = out.Converged && out.Tables[i].Converged
+		out.Complete = out.Complete && out.Tables[i].Complete
+		out.Warnings = append(out.Warnings, out.Tables[i].Warnings...)
+	}
+
 	slices.Sort(out.Warnings)
 	out.Warnings = slices.Compact(out.Warnings)
 	return out, nil
@@ -334,9 +377,11 @@ type worker struct {
 func (w *worker) close() {
 	if w.source != nil {
 		w.source.Close(context.Background())
+		w.source = nil
 	}
 	if w.target != nil {
 		w.target.Close(context.Background())
+		w.target = nil
 	}
 }
 
@@ -346,20 +391,20 @@ func (w *worker) connect(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("connect source verifier: %w", err)
 		}
+		w.source = source
 		if err := pinSerialization(ctx, source); err != nil {
 			return err
 		}
-		w.source = source
 	}
 	if w.target == nil {
 		target, err := w.cfg.Target(ctx)
 		if err != nil {
 			return fmt.Errorf("connect target verifier: %w", err)
 		}
+		w.target = target
 		if err := pinSerialization(ctx, target); err != nil {
 			return err
 		}
-		w.target = target
 	}
 	return nil
 }
@@ -442,9 +487,10 @@ func (w *worker) verifyTable(ctx context.Context, table Table) (TableResult, err
 		}
 		return TableResult{}, err
 	}
-	unresolved = append(unresolved, cdcDiffs...)
 	out.Unresolved = unresolved
-	out.Converged = len(unresolved) == 0
+	out.CDC.pending = cdcDiffs
+	out.CDC.Pending = len(cdcDiffs)
+	out.Converged = len(unresolved) == 0 && len(cdcDiffs) == 0
 	return w.finish(out, started, ""), nil
 }
 
@@ -471,16 +517,22 @@ func sampledCoverage(side SourceResult) float64 {
 // finish records the outcome and reports it, so a status in another process sees
 // the same figures as the caller.
 func (w *worker) finish(out TableResult, started time.Time, cut string) TableResult {
+	stage := StageDone
+	if out.CDC.Pending > 0 && cut == "" {
+		stage = StageCDCDeferred
+		out.Complete, out.Converged = false, false
+	}
 	if cut != "" {
 		out.Complete, out.CutShort, out.Converged = false, cut, false
 	}
 	out.Duration = time.Since(started)
 	w.report(Progress{
-		Table: out.Table.Schema + "." + out.Table.Name, Side: sideSource, Stage: StageDone,
+		Table: out.Table.Schema + "." + out.Table.Name, Side: sideSource, Stage: stage,
 		Pages: out.Source.Pages, PagesTotal: out.Source.PagesTotal,
 		Rows: out.Source.Rows, Estimated: out.Source.Estimated,
 		TargetRows: out.Target.Rows, Coverage: out.Coverage,
 		CDCKeys: out.CDC.Keys, CDCObserved: out.CDC.Observed,
+		CDCPending: out.CDC.Pending,
 		Candidates: out.Candidates, Unresolved: len(out.Unresolved),
 		Converged: out.Converged, Complete: out.Complete,
 	})

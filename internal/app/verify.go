@@ -229,7 +229,8 @@ func (p *verifyProgress) Update(update verify.Progress) {
 		"rows_per_second": update.Rate, "eta": update.ETA.String(),
 		"coverage": update.Coverage, "candidate_rows": update.Candidates,
 		"cdc_keys": update.CDCKeys, "cdc_observed": update.CDCObserved,
-		"unresolved": update.Unresolved,
+		"cdc_pending_rows": update.CDCPending,
+		"unresolved":       update.Unresolved,
 	})
 	if p.store == nil || record == nil {
 		return
@@ -285,15 +286,18 @@ func (p *verifyProgress) record(update verify.Progress) *state.VerifyTable {
 		into.CDCObserved = update.CDCObserved
 	}
 	into.Unresolved = int64(update.Unresolved)
-	if update.Stage == verify.StageDone {
-		into.Converged, into.Complete = update.Converged, update.Complete
-	}
+	into.Converged, into.Complete = update.Converged, update.Complete
 	copied := *into
 	return &copied
 }
 
 func (p *verifyProgress) render(update verify.Progress) {
 	if p.out == nil {
+		return
+	}
+	if update.Stage == verify.StageCDCDeferred || update.Stage == verify.StageCDCRechecking {
+		p.line(fmt.Sprintf("verify %s: %s, %d CDC rows pending (not final divergence)",
+			update.Table, update.Stage, update.CDCPending))
 		return
 	}
 	// The CDC stratum checks rows the heap sample cannot reach, so it reports its
@@ -436,6 +440,21 @@ func cdcSummary(result verify.Result) string {
 	if deletes := result.CDCDeletes(); deletes > 0 {
 		line += fmt.Sprintf(" (%s recorded delete keys; target-only rows ignored)", compactCount(deletes))
 	}
+	var changed, pending, advanced int
+	for _, table := range result.Tables {
+		changed += table.CDC.SourceChanged
+		pending += table.CDC.Pending
+		advanced += table.CDC.Advanced
+	}
+	if changed > 0 {
+		line += fmt.Sprintf("; %d source-changed CDC rows required target advancement", changed)
+	}
+	if advanced > 0 {
+		line += fmt.Sprintf("; %d CDC target rows advanced without matching; accepted as progressing", advanced)
+	}
+	if pending > 0 {
+		line += fmt.Sprintf("; %d CDC rows still pending", pending)
+	}
 	return line
 }
 
@@ -478,7 +497,7 @@ func diffKinds(rows []verify.RowDiff) string {
 	}
 	var parts []string
 	for _, kind := range []verify.DiffKind{
-		verify.DiffSourceOnly, verify.DiffDifferent,
+		verify.DiffSourceOnly, verify.DiffDifferent, verify.DiffTargetStalled,
 	} {
 		if counts[kind] > 0 {
 			parts = append(parts, fmt.Sprintf("%d %s", counts[kind], kind))

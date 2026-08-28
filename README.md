@@ -453,13 +453,13 @@ standard error. A named divergence, or a table stopped early, exits non-zero.
 | `--dir <path>` | required | migration state directory holding the table inventory |
 | `--source <dsn>` | `PGMIGRATE_SOURCE` | source connection string |
 | `--target <dsn>` | `PGMIGRATE_TARGET` | target connection string |
-| `--verify-workers <n>` | `1` | tables checked in parallel. Each one reads the live source, which is why this is not `--workers` |
+| `--verify-workers <n>` | `1` | initial table scans in parallel, plus one worker for deferred CDC key lookups. Each reads the live source, which is why this is not `--workers` |
 | `--verify-sample-rows <n>` | `1000000` | rows per table read from the source and looked up on the target. A table smaller than this is read whole. `0` is rejected: there is no exhaustive mode |
 | `--verify-sample-windows <n>` | `128` | page intervals those rows are drawn from, spread across the heap with the last pinned to its end |
 | `--verify-batch-rows <n>` | `5000` | keys per target lookup statement, clamped down for a very wide key to stay under the bind-parameter limit |
 | `--verify-duty-cycle <fraction>` | `1` | fraction of the wall clock verification may spend querying, sleeping between windows to stay under it. Must be greater than 0 and at most 1 |
-| `--verify-table-timeout <duration>` | `20m` | time one table's check may take. `0` disables it. A table stopped here reports incomplete and cannot report convergence |
-| `--verify-converge-timeout <duration>` | `1m` | how long a row that appears to differ is given to settle against a fixed WAL position before it is reported |
+| `--verify-table-timeout <duration>` | `20m` | active time one table's check may take, including the single CDC recheck, excluding its delay and queue time. `0` disables it. A table stopped here reports incomplete and cannot report convergence |
+| `--verify-converge-timeout <duration>` | `1m` | how long a heap-sample row that appears to differ is given to settle against a fixed WAL position before it is reported; CDC mismatches use the separate one-minute deferred check |
 | `--verify-cdc-rows <n>` | `100000` | applier-recorded keys per table checked alongside the heap sample. `0` falls back to the default |
 
 ### pgmigrate sequences
@@ -692,8 +692,8 @@ names a row.
 
 ### Reading a live source
 
-A row read from a live source, on a target that is still applying, is *expected*
-to differ, and waiting for it to settle would never terminate for a row written
+A heap-sample row read from a live source, on a target that is still applying,
+is *expected* to differ, and waiting for it to settle would never terminate for a row written
 to constantly. What settles it is fixing a position rather than a moment: the
 source rows are re-read, a decodable marker names a WAL position at or after that
 read, and the target rows are read once apply has passed it. A row that still
@@ -707,6 +707,11 @@ rows that already appear to differ, which is normally none. A marker names
 nothing until it reaches disk, so on PostgreSQL 17 and later it is written with
 `pg_logical_emit_message(flush => true)`, and on 16, which has no such argument,
 a small committed message immediately after forces the same flush.
+
+CDC-key mismatches instead use the one-minute deferred check described under
+[Verification](#verification): unchanged source rows require a match or target
+advancement, and changed source rows require target advancement. The heap
+WAL-marker retry above is not used for CDC-key candidates.
 
 ### The target is tuned for a bulk load, and put back
 
@@ -795,10 +800,11 @@ with a collatable partition key, where rows can route to a different partition.
 
 ## Verification
 
-`verify` checks **source → target only**: each checked source row must be present
-on the target with matching column values. Extra target rows do not cause a
-mismatch. It uses two samples, reported separately because they cover different
-rows.
+`verify` checks **source → target only**: extra target rows do not cause a
+mismatch. Heap-sample rows must match their target counterparts. The live CDC
+check also accepts target rows that advanced during its one-minute observation,
+as described below. These two samples are reported separately because they
+cover different rows.
 
 It **samples the heap**: it reads about a million rows from the source and looks
 those exact rows up on the target by key. Both sides return a hash of the whole
@@ -807,24 +813,73 @@ type handling cannot cancel itself out across the comparison, and a missing row
 and a wrongly applied column value are the same finding.
 
 It also **checks the rows replication wrote**, by key, from what the applier
-recorded as it wrote them, using the same recheck rule against a fixed WAL
-position. `--verify-cdc-rows` bounds how many of those keys one table's check
-looks at, and the check reports what it looked at against what the applier saw,
+recorded as it wrote them. `--verify-cdc-rows` bounds how many of those keys one
+table's check looks at, and the check reports what it looked at against what the applier saw,
 so a truncated check says so rather than reading as complete. An empty reservoir
 reports "no applied rows recorded", never "0 checked", because those mean
 opposite things. A relation whose recorded key does not cover the columns
 `verify` keys rows on — the applier keys a change on the replica identity, which
 may differ from the primary key — is skipped with that reason.
 
-The same one-way rule applies to CDC keys and rechecks. A key absent from the
-source is ignored even if the target still holds it, including recorded deletes.
+A CDC key absent from the source at the initial read is ignored even if the
+target still holds it, including recorded deletes.
 If the key was reinserted on the source, its current row must match on the target.
 The reported delete count describes recorded operations, not verified removals.
+
+**CDC mismatches are deferred for at least one minute.** The initial observation
+captures each candidate's source hash and row version (`xmin`), and audits both
+source and target hashes/presence. A dedicated worker rechecks those exact keys
+after the delay while other tables continue scanning. It reads the source, then
+the target, then the source again. If the source changed or disappeared since
+the initial observation, or changed during the target read, **the target must
+have advanced**; the source change alone does not clear the mismatch. Checking
+`xmin` also catches no-op updates and changes reverted to the same contents.
+Source transaction IDs are never compared to target IDs.
+
+For source rows that stayed untouched, matching target hashes count as converged.
+If the target still differs but a row appeared or its hash/`xmin` changed since
+the initial target snapshot, it **advanced**: accept it as progressing and log
+that outcome separately. Advancement is accepted by this live CDC check even
+though row equality has not been established. A target that neither matches nor
+advances is unresolved and fails verification. If the source changed, an
+unchanged target fails as `target_stalled`, even if the source changed to the
+target's old value. A target deletion counts as advancement only if the source
+also disappeared; deleting a target row still required by the source is not
+advancement.
+
+There is **exactly one deferred recheck**, with no retry/defer loop. Advancing
+rows are not queued again. Source changes are counted and flagged in the audit;
+they never grant an automatic skip. Advancing targets are counted separately
+from matched rows.
+The result finishes once those outcomes are recorded. The one-minute delay and
+queue time do not consume `--verify-table-timeout`, but the reads do. Cancellation
+or timeout reports incomplete. `--verify-converge-timeout` only controls the
+separate heap-sample retries.
+
+**Every observed mismatch is audited**, including ones that later converge or
+are accepted as advancing, in `<dir>/log/verify-audit.jsonl`. This append-only JSONL file is
+separate from the controller's bounded output buffer and retained across runs.
+Records carry a run ID, UTC timestamp, table, key, stratum, mismatch kind, row
+presence, hashes, and row versions where applicable. CDC outcome records also
+carry the original source metadata, initial target metadata, and both later
+source reads, a `source_changed` flag, and outcomes `converged`, `advanced`,
+`unresolved`, or `incomplete`. Incomplete outcomes retain the original source
+metadata; earlier records retain the last observed target. Run start/end records
+distinguish clean, divergent, and incomplete runs; an interrupted process may
+leave a start without an end. All initial heap mismatches are logged before the
+heap recheck threshold is applied, and heap recheck observations are logged too.
+
+Audit batches are synced before verification proceeds; a write failure aborts
+the run. The file is created with mode `0600` and contains keys and comparison
+metadata, not full row contents. Keep it on durable storage and treat it as
+sensitive. It is not automatically truncated or rotated.
 
 **Read this for what a pass does and does not mean.** It is a smoke test, not a
 proof: it finds divergence and never proves its absence. It does not enforce
 equal table counts or target → source inclusion, and does not detect unapplied
-deletes. A clean result means the source rows checked matched the target.
+deletes. A passing CDC check may include advancing targets that do not yet match.
+These are reported separately from rows verified equal; source changes do not
+excuse a stalled target.
 
 The row budget is spread over `--verify-sample-windows` evenly spaced places in
 the heap, with the last window pinned to the end of it, because that is where

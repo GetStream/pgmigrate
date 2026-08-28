@@ -478,6 +478,7 @@ func TestCDCStratumRequiresOnlyCurrentSourceRows(t *testing.T) {
 
 	// Now the applier reports what it applied, including the delete.
 	withCDC := base
+	withCDC.CDCRecheckDelay = 10 * time.Millisecond
 	withCDC.CDCRows = 100
 	withCDC.CDCKeys = func(context.Context, string, string) (CDCRecorded, error) {
 		return CDCRecorded{

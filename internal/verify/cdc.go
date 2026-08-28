@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 )
 
 // defaultCDCKeys is how many recorded keys one table's CDC check looks at.
@@ -60,18 +61,31 @@ type CDCResult struct {
 	Candidates int    `json:"candidate_rows,omitempty"`
 	InFlight   int    `json:"in_flight_rows,omitempty"`
 	Skipped    string `json:"skipped,omitempty"`
+	// Pending counts initial differences awaiting the deferred check. They are not
+	// divergence until rechecked; a canceled or incomplete check cannot clear them.
+	Pending        int `json:"pending_rows,omitempty"`
+	pending        []RowDiff
+	baseline       rowSet
+	recheckAt      time.Time
+	targetBaseline rowSet
+	// Advanced counts rows accepted because the target changed during the delay.
+	// These are progressing, not verified equal to the source.
+	Advanced int `json:"advanced_rows,omitempty"`
+	// SourceChanged counts touched source rows. Each requires target advancement,
+	// and contributes to either matched/advanced or unresolved; none is skipped.
+	SourceChanged int `json:"source_changed_rows,omitempty"`
 }
 
 // verifyCDC checks the rows the applier reported writing.
 //
-// The whole check is one call to resolve. That is not a shortcut: resolve already
-// reads both sides by key, fixes a WAL position between the two reads, waits for
-// apply to pass it, and re-reads whatever still differs until the convergence
-// budget runs out. Comparing the two sides once beforehand would only re-find the
-// rows that are legitimately in flight.
+// The first pass snapshots each differing source row, including xmin. A separate
+// worker rechecks it after one minute. Rows touched on the source in that interval
+// require target advancement; a source change alone cannot clear a mismatch.
+// A target that advanced is accepted as progressing even if it does not yet
+// match. A stalled target fails. There is exactly one deferred check, no retries.
 //
 // Like the heap sample, this is a source-to-target check. A recorded key absent
-// from the source produces no difference, regardless of whether the target still
+// from the source at the initial read produces no difference, whether the target still
 // holds it or which operation was recorded. A key reinserted on the source is
 // checked against its current contents, even if it was recorded as a delete.
 func (w *worker) verifyCDC(
@@ -120,13 +134,30 @@ func (w *worker) verifyCDC(
 		Table: table.Schema + "." + table.Name, Stage: StageCDC,
 		CDCKeys: out.CDC.Keys, CDCObserved: out.CDC.Observed,
 	})
-	unresolved, candidates, err := w.resolve(ctx, table, keys)
+	source, err := readRowsVersioned(ctx, w.source, table, keys, w.cfg.BatchRows, true)
 	if err != nil {
 		return nil, err
 	}
-	out.CDC.Candidates = candidates
-	out.CDC.InFlight = candidates - len(unresolved)
-	return unresolved, nil
+	target, err := readRowsVersioned(ctx, w.target, table, keys, w.cfg.BatchRows, true)
+	if err != nil {
+		return nil, err
+	}
+	candidates := compareRows(source, target)
+	out.CDC.Candidates = len(candidates)
+	out.CDC.recheckAt = time.Now().Add(w.cfg.CDCRecheckDelay)
+	out.CDC.baseline = make(rowSet, len(candidates))
+	out.CDC.targetBaseline = make(rowSet, len(candidates))
+	for _, diff := range candidates {
+		id := identity(diff.Key)
+		out.CDC.baseline[id] = source[id]
+		if row, ok := target[id]; ok {
+			out.CDC.targetBaseline[id] = row
+		}
+	}
+	if err := w.auditDiffs(table, "cdc", "deferred", candidates, source, target, nil); err != nil {
+		return nil, err
+	}
+	return candidates, nil
 }
 
 // collectRecorded reads every leaf's reservoir up to the budget.

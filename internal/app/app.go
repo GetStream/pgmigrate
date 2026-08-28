@@ -2348,7 +2348,7 @@ func (a App) Status(ctx context.Context, cfg config.Config) error {
 	}
 }
 
-func verification(ctx context.Context, cfg config.Config, store *state.Store, progressOut io.Writer) (verify.Result, error) {
+func verification(ctx context.Context, cfg config.Config, store *state.Store, progressOut io.Writer) (result verify.Result, runErr error) {
 	tables, err := store.ListTables(ctx)
 	if err != nil {
 		return verify.Result{}, err
@@ -2369,13 +2369,19 @@ func verification(ctx context.Context, cfg config.Config, store *state.Store, pr
 	}
 	boundary := newMarker(cfg, "verify:", capabilities)
 	defer boundary.close()
-	// While the migration is following, a row that differs may simply be in flight.
+	// While the migration is following, a heap-sample row may simply be in flight.
 	// These two hooks are what tell that apart from a defect: mark a source
 	// position, wait for apply to pass it, look again.
 	mark, wait := recheckHooks(cfg, boundary, migration.SlotName, migration.Phase)
+	audit, err := newVerificationAudit(cfg.Dir)
+	if err != nil {
+		return verify.Result{}, err
+	}
+	defer func() { runErr = errors.Join(runErr, audit.finish(result.Complete, result.Converged, runErr)) }()
 	return verify.Run(ctx, verify.Config{
 		Source: connector(cfg.Source), Target: connector(cfg.Target), Tables: verifyTables,
 		Progress:        progress,
+		Audit:           audit.write,
 		Workers:         cfg.VerifyWorkers,
 		SampleRows:      cfg.VerifySampleRows,
 		SampleWindows:   cfg.VerifySampleWindows,
