@@ -2161,6 +2161,7 @@ type applyExpectation struct {
 	description      string
 	expectedRows     int64
 	expectedOrdinals int
+	allowMissingRows bool // Only for DELETEs using a catalog-validated primary key.
 	expectedTag      string
 	progressGuard    bool
 	statement        string
@@ -2362,7 +2363,8 @@ func (p *applyPipeline) sync() error {
 			if ordinalErr != nil && firstErr == nil {
 				firstErr = ordinalErr
 			}
-			if expectation.expectedRows >= 0 && tag.RowsAffected() != expectation.expectedRows && firstErr == nil {
+			if expectation.expectedRows >= 0 && tag.RowsAffected() != expectation.expectedRows &&
+				(!expectation.allowMissingRows || tag.RowsAffected() > expectation.expectedRows) && firstErr == nil {
 				firstErr = divergenceFor(expectation.relation, expectation.kind, fmt.Sprintf(
 					"affected %d rows, expected %d", tag.RowsAffected(), expectation.expectedRows,
 				))
@@ -2446,7 +2448,7 @@ func (expectation applyExpectation) validateOrdinals(reader *pgconn.ResultReader
 		return result
 	}
 	for ordinal, matched := range seen {
-		if !matched {
+		if !matched && !expectation.allowMissingRows {
 			return divergenceFor(expectation.relation, expectation.kind, fmt.Sprintf(
 				"batched replay did not match identity ordinal %d", ordinal,
 			))
@@ -4919,6 +4921,9 @@ func appendPrimaryKeyDeletePredicate(
 ) error {
 	for i, column := range primary {
 		datum := tuple[column.sourceIndex]
+		if datum.Kind == DatumNull {
+			return divergenceFor(relation, ChangeDelete, "primary key contains NULL")
+		}
 		if datum.Kind == DatumUnchangedToast {
 			return divergenceFor(relation, ChangeDelete, "primary key contains unchanged TOAST")
 		}
@@ -4947,6 +4952,9 @@ func batchDeleteIdentityKey(
 	var key strings.Builder
 	for _, column := range identityColumns {
 		datum := (*change.Old)[column.sourceIndex]
+		if column.primary && datum.Kind == DatumNull {
+			return "", divergenceFor(relation, ChangeDelete, "primary key contains NULL")
+		}
 		if datum.Kind == DatumUnchangedToast {
 			return "", divergenceFor(relation, ChangeDelete, "replica identity contains unchanged TOAST")
 		}
@@ -5029,6 +5037,7 @@ func applyDeleteTextStage(
 		relation: relation, kind: ChangeDelete,
 		description:  "staged delete from " + relation.quoted,
 		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
+		allowMissingRows: deleteUsesTargetPrimaryKey(relation, identityColumns),
 	})
 }
 
@@ -5082,6 +5091,7 @@ func applyDeleteValueChunk(
 		relation: relation, kind: ChangeDelete,
 		description: "batch delete from " + relation.quoted, expectedRows: int64(len(changes)),
 		expectedOrdinals: len(changes),
+		allowMissingRows: deleteUsesTargetPrimaryKey(relation, identityColumns),
 	})
 }
 
@@ -5150,6 +5160,7 @@ func applyDeleteArrayChunk(
 		relation: relation, kind: ChangeDelete,
 		description:  "array batch delete from " + relation.quoted,
 		expectedRows: int64(len(changes)), expectedOrdinals: len(changes),
+		allowMissingRows: deleteUsesTargetPrimaryKey(relation, identityColumns),
 	})
 }
 
@@ -5162,7 +5173,8 @@ func applyDelete(replay *applyPipeline, relation *targetRelation, change *Change
 	sql.WriteString(relation.quoted)
 	sql.WriteString(" WHERE ")
 	params := make([]rawParam, 0, len(relation.columns))
-	if primary, safe := primaryKeyDeleteColumns(relation); safe {
+	primary, safe := primaryKeyDeleteColumns(relation)
+	if safe {
 		if err := appendPrimaryKeyDeletePredicate(
 			&sql, &params, relation, primary, *change.Old,
 		); err != nil {
@@ -5176,6 +5188,7 @@ func applyDelete(replay *applyPipeline, relation *targetRelation, change *Change
 	return replay.queue(sql.String(), params, applyExpectation{
 		relation: relation, kind: ChangeDelete,
 		description: "delete from " + relation.quoted, expectedRows: 1,
+		allowMissingRows: safe,
 	})
 }
 

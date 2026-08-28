@@ -96,6 +96,10 @@ func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {
 	if _, err := sourceSQL.Exec(ctx, "CREATE PUBLICATION pgmigrate_cdc_test FOR TABLE cdc_items, cdc_truncated, cdc_truncated_child, cdc_custom, cdc_generated_only, cdc_empty"); err != nil {
 		t.Fatal(err)
 	}
+	// Its later pgoutput DELETE must also replay when the target is already absent.
+	if _, err := sourceSQL.Exec(ctx, "INSERT INTO cdc_items (id, note) VALUES (999, 'source-only')"); err != nil {
+		t.Fatal(err)
+	}
 
 	replication := source.ReplicationConnect(t)
 	slot, err := pglogrepl.CreateReplicationSlot(
@@ -183,6 +187,7 @@ func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {
 		{"UPDATE cdc_empty SET absent = 'set' WHERE id = 1", nil},
 		{"INSERT INTO cdc_empty (id, optional) VALUES (3, '')", nil},
 		{"DELETE FROM cdc_empty WHERE id = 3", nil},
+		{"DELETE FROM cdc_items WHERE id = 999", nil},
 	}
 	for index, statement := range statements {
 		if _, err := sourceSQL.Exec(ctx, statement.sql, statement.args...); err != nil {
@@ -308,6 +313,7 @@ func TestPG17LiveWALStageApplyCrashRetry(t *testing.T) {
 		{"cdc_items", ChangeUpdate, "1"},
 		{"cdc_items", ChangeInsert, "2"},
 		{"cdc_items", ChangeDelete, "2"},
+		{"cdc_items", ChangeDelete, "999"},
 		{"cdc_empty", ChangeDelete, "3"},
 	} {
 		if !samples.saw(want.table, want.kind, want.key) {
@@ -2818,18 +2824,10 @@ func TestPG17PipelinedApplyPreservesAtomicOrderedReplay(t *testing.T) {
 				CommitLSN: 30 + LSN(kind), EndLSN: endLSN,
 				Relations: []Relation{source}, Changes: []Change{change},
 			})
-			if kind == ChangeUpdate {
-				if err != nil {
-					t.Fatalf("missing-row update upsert: %v", err)
-				}
-				assertProgress(t, stream, endLSN)
-				return
+			if err != nil {
+				t.Fatalf("missing-row %s: %v", changeKindName(kind), err)
 			}
-			var divergence *DivergenceError
-			if !errors.As(err, &divergence) {
-				t.Fatalf("zero-row delete error=%v, want divergence", err)
-			}
-			assertProgress(t, stream, 0)
+			assertProgress(t, stream, endLSN)
 		})
 	}
 
