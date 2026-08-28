@@ -53,7 +53,7 @@ func TestCDCDeferredOutcomesAndAudit(t *testing.T) {
 		{name: "unchanged source still missing", initial: `DELETE FROM public.items`, outcome: "unresolved", kind: DiffSourceOnly},
 		{name: "source and target both advance", initial: `UPDATE public.items SET payload='old'`, changeSource: `UPDATE public.items SET payload='newer'`, changeTarget: `UPDATE public.items SET payload='middle'`, outcome: "advanced"},
 		{name: "changed source and matching advanced target", initial: `UPDATE public.items SET payload='old'`, changeSource: `UPDATE public.items SET payload='newer'`, changeTarget: `UPDATE public.items SET payload='newer'`, outcome: "converged"},
-		{name: "changed source matching stalled target still fails", initial: `UPDATE public.items SET payload='old'`, changeSource: `UPDATE public.items SET payload='old'`, outcome: "unresolved", kind: DiffTargetStalled},
+		{name: "changed source matching unchanged target converges", initial: `UPDATE public.items SET payload='old'`, changeSource: `UPDATE public.items SET payload='old'`, outcome: "converged"},
 		{name: "source and target both deleted", initial: `UPDATE public.items SET payload='old'`, changeSource: `DELETE FROM public.items`, changeTarget: `DELETE FROM public.items`, outcome: "advanced"},
 		{name: "source update requires advancement", initial: `UPDATE public.items SET payload='old'`, changeSource: `UPDATE public.items SET payload='newer'`, outcome: "unresolved", kind: DiffTargetStalled},
 		{name: "source deletion requires advancement", initial: `UPDATE public.items SET payload='old'`, changeSource: `DELETE FROM public.items`, outcome: "unresolved", kind: DiffTargetStalled},
@@ -357,6 +357,61 @@ func (q beforeQuery) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.
 	return ctx
 }
 func (q beforeQuery) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func TestCDCAlreadyCaughtUpTargetConvergesAfterInitialReadSkew(t *testing.T) {
+	s, d := pgtest.Start(t, 17), pgtest.Start(t, 17)
+	source, target := s.Connect(t), d.Connect(t)
+	for _, c := range []*pgx.Conn{source, target} {
+		exec(t, c, `CREATE TABLE public.items(id bigint PRIMARY KEY,payload text)`, `INSERT INTO public.items VALUES(1,'old')`)
+	}
+	var cdcStarted, caughtUp atomic.Bool
+	var rechecks atomic.Int32
+	var audit auditRecorder
+	cfg := Config{Source: connector(s.URI), Target: connector(d.URI), Tables: inventoryOf(t, source, "public", "items"), CDCRecheckDelay: time.Millisecond, Audit: audit.record}
+	cfg.CDCKeys = func(context.Context, string, string) (CDCRecorded, error) {
+		cdcStarted.Store(true)
+		return CDCRecorded{Observed: 1, Keys: []CDCKey{{Key: map[string]string{"id": "1"}}}}, nil
+	}
+	cfg.Target = func(ctx context.Context) (*pgx.Conn, error) {
+		config, err := pgx.ParseConfig(d.URI)
+		if err != nil {
+			return nil, err
+		}
+		config.Tracer = beforeQuery{start: func(query string) {
+			if cdcStarted.Load() && strings.Contains(query, "FROM (VALUES") && caughtUp.CompareAndSwap(false, true) {
+				// Replay catches up after the initial source read but before the
+				// initial target read. No target write is needed during the delay.
+				for _, c := range []*pgx.Conn{source, target} {
+					if _, err := c.Exec(ctx, `UPDATE public.items SET payload='new'`); err != nil {
+						t.Error(err)
+					}
+				}
+			}
+		}}
+		return pgx.ConnectConfig(ctx, config)
+	}
+	cfg.Progress = progressFunc(func(p Progress) {
+		if p.Stage == StageCDCRechecking {
+			rechecks.Add(1)
+		}
+	})
+	got, err := Run(context.Background(), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	table := got.Tables[0]
+	if !caughtUp.Load() || !got.Complete || !got.Converged || table.CDC.Candidates != 1 || table.CDC.Pending != 0 || table.CDC.InFlight != 1 || table.CDC.Advanced != 0 || table.CDC.SourceChanged != 1 || len(table.Unresolved) != 0 || rechecks.Load() != 1 {
+		t.Fatalf("already matching target must converge after one recheck: %+v, rechecks=%d", got, rechecks.Load())
+	}
+	events := audit.all()
+	if len(events) != 2 || events[0].Outcome != "deferred" || events[1].Outcome != "converged" || !events[1].SourceChanged {
+		t.Fatalf("missing read-skew audit: %+v", events)
+	}
+	first, last := events[0], events[1]
+	if first.Source.Hash == first.Target.Hash || last.Source.Hash != last.Target.Hash || *last.Source != *last.SourceAfter || *last.Target != *first.Target || *last.PreviousTarget != *first.Target {
+		t.Fatalf("expected stable equal rows with an unchanged target snapshot: %+v", events)
+	}
+}
 
 func TestCDCSourceTouchDuringTargetReadRequiresTargetAdvancement(t *testing.T) {
 	s, d := pgtest.Start(t, 17), pgtest.Start(t, 17)

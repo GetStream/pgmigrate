@@ -709,8 +709,8 @@ nothing until it reaches disk, so on PostgreSQL 17 and later it is written with
 a small committed message immediately after forces the same flush.
 
 CDC-key mismatches instead use the one-minute deferred check described under
-[Verification](#verification): unchanged source rows require a match or target
-advancement, and changed source rows require target advancement. The heap
+[Verification](#verification): a stable source/target match passes, and rows
+that still differ require target advancement even if the source changed. The heap
 WAL-marker retry above is not used for CDC-key candidates.
 
 ### The target is tuned for a bulk load, and put back
@@ -830,20 +830,24 @@ The reported delete count describes recorded operations, not verified removals.
 captures each candidate's source hash and row version (`xmin`), and audits both
 source and target hashes/presence. A dedicated worker rechecks those exact keys
 after the delay while other tables continue scanning. It reads the source, then
-the target, then the source again. If the source changed or disappeared since
-the initial observation, or changed during the target read, **the target must
-have advanced**; the source change alone does not clear the mismatch. Checking
+the target, then the source again. **A matching target passes first**, provided
+the source hash and version stayed stable across the bracketed reads. This also
+passes when the source changed since the initial observation and the target
+already held the matching value in its initial snapshot; no further target
+write is needed. If the rows still differ and the source changed or disappeared
+since the initial observation, or changed during the target read, **the target
+must have advanced**; the source change alone does not clear the mismatch. Checking
 `xmin` also catches no-op updates and changes reverted to the same contents.
 Source transaction IDs are never compared to target IDs.
 
-For source rows that stayed untouched, matching target hashes count as converged.
+Stable matching source/target reads count as converged.
 If the target still differs but a row appeared or its hash/`xmin` changed since
 the initial target snapshot, it **advanced**: accept it as progressing and log
 that outcome separately. Advancement is accepted by this live CDC check even
 though row equality has not been established. A target that neither matches nor
-advances is unresolved and fails verification. If the source changed, an
-unchanged target fails as `target_stalled`, even if the source changed to the
-target's old value. A target deletion counts as advancement only if the source
+advances is unresolved and fails verification. If the source changed and no
+stable match was established, an unchanged target fails as `target_stalled`.
+A target deletion counts as advancement only if the source
 also disappeared; deleting a target row still required by the source is not
 advancement.
 
@@ -879,7 +883,7 @@ proof: it finds divergence and never proves its absence. It does not enforce
 equal table counts or target → source inclusion, and does not detect unapplied
 deletes. A passing CDC check may include advancing targets that do not yet match.
 These are reported separately from rows verified equal; source changes do not
-excuse a stalled target.
+excuse a stalled target that still differs.
 
 The row budget is spread over `--verify-sample-windows` evenly spaced places in
 the heap, with the last window pinned to the end of it, because that is where

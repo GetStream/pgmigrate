@@ -24,8 +24,9 @@ func advancedTarget(key string, previous, current rowSet) bool {
 }
 
 // recheckCDC makes one final decision after the defer interval. Source reads
-// bracket the target read; any source change requires target advancement. Target
-// progress is accepted separately from equality. There are no further retries.
+// bracket the target read; a stable match takes precedence over advancement.
+// Rows that still differ require target progress, even if the source changed.
+// Progress is accepted separately from equality. There are no further retries.
 func (w *worker) recheckCDC(ctx context.Context, out TableResult) (result TableResult, err error) {
 	defer func() {
 		if err != nil || result.CutShort != "" {
@@ -97,12 +98,14 @@ func (w *worker) recheckCDC(ctx context.Context, out TableResult) (result TableR
 		}
 		matched := sourcePresent && present && unchangedSource(currentSource, before) && other.hash == currentSource.hash
 		switch {
+		case matched:
+			// The target may already have caught up between the initial source
+			// and target reads. Equal rows need no further target write.
+			e.Outcome = "converged"
+			out.CDC.InFlight++
 		case e.SourceChanged && !advanced:
 			e.Outcome, e.Kind = "unresolved", DiffTargetStalled
 			unresolved = append(unresolved, RowDiff{Key: key, Kind: e.Kind})
-		case matched:
-			e.Outcome = "converged"
-			out.CDC.InFlight++
 		case advanced:
 			e.Outcome = "advanced"
 			out.CDC.Advanced++
