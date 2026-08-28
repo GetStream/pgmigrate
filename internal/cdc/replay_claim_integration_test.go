@@ -19,6 +19,14 @@ import (
 )
 
 func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
+	for _, version := range []int{2, 5} {
+		t.Run(fmt.Sprint(version), func(t *testing.T) {
+			testReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t, version)
+		})
+	}
+}
+
+func testReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T, version int) {
 	target := pgtest.Start(t, 17)
 	control := target.Connect(t)
 	ctx := context.Background()
@@ -54,8 +62,19 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i := range transactions {
+		if _, err := control.Exec(ctx, "INSERT INTO public.claim_items VALUES ($1, 'old')", fmt.Sprintf("old-%03d", i)); err != nil {
+			t.Fatal(err)
+		}
 		transactions[i] = replayTestTransaction(
 			LSN(1_000+i*2), relation,
+			Change{
+				RelationOID: relation.source.OID, Kind: ChangeDelete,
+				Old: replayTuple(fmt.Sprintf("old-%03d", i), "old"),
+			},
+			Change{
+				RelationOID: relation.source.OID, Kind: ChangeDelete,
+				Old: replayTuple(fmt.Sprintf("missing-%03d", i), "old"),
+			},
 			Change{
 				RelationOID: relation.source.OID, Kind: ChangeInsert,
 				New: replayTuple(fmt.Sprintf("id-%03d-a", i), fmt.Sprintf("value-%03d-a", i)),
@@ -68,13 +87,13 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 		resolved[i] = map[uint32]*targetRelation{relation.source.OID: loaded}
 	}
 	plan, err := buildReplayPlanForGenerationVersion(
-		streamID, generation, generation, 0, 8, transactions, resolved, 2,
+		streamID, generation, generation, 0, 8, transactions, resolved, version,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Claim.PlanVersion != 2 {
-		t.Fatalf("legacy resume fixture plan version=%d, want 2", plan.Claim.PlanVersion)
+	if plan.Claim.PlanVersion != version {
+		t.Fatalf("resume fixture plan version=%d, want %d", plan.Claim.PlanVersion, version)
 	}
 	if !plan.HasParallel || len(plan.Works) < 2 {
 		t.Fatalf("fixture did not produce parallel work: %#v", plan.Steps)
@@ -153,14 +172,14 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 		}
 	}
 	reconstructed, err := buildReplayPlanForGenerationVersion(
-		streamID, generation, generation, 0, 8, transactions, resolved, 2,
+		streamID, generation, generation, 0, 8, transactions, resolved, version,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !replayClaimsEqual(reconstructed.Claim, claim) ||
 		!slices.Equal(reconstructed.Works, plan.Works) {
-		t.Fatal("new executor did not reconstruct the exact active plan-version-2 claim")
+		t.Fatal("new executor did not reconstruct the exact active claim")
 	}
 	reconstructed.Claim = claim
 	plan = reconstructed
@@ -221,7 +240,7 @@ func TestPG17ReplayClaimResumesExactLaneReceiptsAndFinalizesOnce(t *testing.T) {
 
 	assertReplayProgress(
 		t, control, streamID, plan.Claim.EndLSN,
-		int64(len(transactions)), int64(len(transactions)*2),
+		int64(len(transactions)), int64(len(transactions)*4),
 	)
 	if _, exists, err := readReplayClaim(ctx, control, streamID); err != nil || exists {
 		t.Fatalf("finalized claim exists=%t err=%v", exists, err)

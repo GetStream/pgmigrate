@@ -988,7 +988,9 @@ controlled by `PGMIGRATE_CDC_BENCH_TRANSACTIONS` and
   preflight-blocked; foreign and unlogged tables and materialized views produce
   findings and need an operator plan.
 - The target is assumed not to receive independent application traffic before
-  cutover. Replay divergence stops the run.
+  cutover. A DELETE using a catalog-validated primary key is a no-op if its target
+  row is already absent; its source transaction and progress still commit normally.
+  Other replay divergence stops the run. This is not bidirectional conflict resolution.
 - Replay parallelism is conservative. Transactions without a safely comparable
   primary key, or with target behavior that can couple otherwise distinct rows,
   use the ordered serial path. A workload dominated by one hot-key component or
