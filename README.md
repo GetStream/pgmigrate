@@ -575,20 +575,32 @@ restored RDS PostgreSQL snapshot or an Aurora clone. Bulk COPY reads run there.
 The original `--source` still serves metadata queries and WAL, and must retain
 WAL while the snapshot is restored and the copy runs.
 
-Start pgmigrate with the endpoint the restored instance will use:
+Start pgmigrate **once**, with all three DSNs, and leave it running throughout
+snapshot creation and restore:
 
 ```sh
 pgmigrate run --source "$SOURCE_DSN" --copy-source "$CLONE_DSN" \
   --target "$TARGET_DSN" --dir ./migration
 ```
 
-1. Wait for `Source slot ready`. The source now has a slot retaining changes.
-2. Take a **new** RDS snapshot and restore it at `$CLONE_DSN`, or create an Aurora
-   clone. Provision these resources through AWS; pgmigrate waits for the endpoint.
-3. pgmigrate verifies the restored database, reads its recovery LSN, and exports a
+`$CLONE_DSN` must already name the endpoint the restored instance will use; the
+database does not need to be available when the command starts. The current CLI
+cannot accept or change this DSN while running. If you only learn the endpoint
+after AWS provisions the restore, this flow requires arranging a usable endpoint
+in advance; supplying the new endpoint interactively is not implemented.
+
+1. **pgmigrate:** creates the source slot and reports `Source slot ready`, then
+   waits for the copy endpoint. Keep this process running.
+2. **You, through AWS:** take a **new** RDS snapshot and restore it at `$CLONE_DSN`,
+   or create an Aurora clone. Do this after the readiness message, from another
+   terminal or the AWS console. pgmigrate does not create snapshots, provision
+   databases, or perform PITR.
+3. **The same pgmigrate process:** detects and verifies the restored database,
+   reads its recovery LSN, and exports a
    snapshot there for schema and COPY. It follows source WAL from that LSN. Changes
    already in the backup are not replayed; transactions still open at the recovery
-   point are replayed if they later commit. No manual PostgreSQL snapshot ID or LSN is needed.
+   point are replayed if they later commit. No restart or manual PostgreSQL
+   snapshot ID or LSN is needed for this sequence.
 
 Restoring an old snapshot and then creating a source slot leaves a gap. An older
 backup would need point-in-time recovery forward to a position covered by the
