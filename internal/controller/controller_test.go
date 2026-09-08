@@ -492,6 +492,7 @@ func TestControllerConfigurationPersistsNonSecretsAcrossRestart(t *testing.T) {
 	cfg := validControllerConfig(t)
 	cfg.Source = "postgres://source-user:source-password@source/database"
 	cfg.Target = "postgres://target-user:target-password@target/database"
+	cfg.CopySourceFile = "/secrets/initial-copy.dsn"
 	cfg.NoCleanup = true
 	cfg.EndPosition = "0/CAFE"
 	server := newTestServer(t, cfg, "controller-token-secret", noOpActions())
@@ -532,11 +533,15 @@ func TestControllerConfigurationPersistsNonSecretsAcrossRestart(t *testing.T) {
 	restarted := config.FromEnvironment()
 	restarted.Source = "postgres://runtime-source/runtime"
 	restarted.Target = "postgres://runtime-target/runtime"
+	restarted.CopySourceFile = "/secrets/current-copy.dsn"
 	restarted.Dir = cfg.Dir
 	restarted.NoCleanup = false
 	restarted.EndPosition = "0/BEEF"
 	second := newTestServer(t, restarted, "new-runtime-token", noOpActions())
 	loaded := second.configurationSnapshot()
+	if loaded.CopySourceFile != restarted.CopySourceFile {
+		t.Fatal("controller did not preserve the current clone file handoff path")
+	}
 	if loaded.ReplayWorkers != 24 || loaded.ReplayBatchBytes != 4_194_304 || loaded.ReplayBatchChanges != 8192 || loaded.VerifyIgnoreApps != "7,42" {
 		t.Fatalf("persisted replay configuration was not restored: %#v", loaded)
 	}

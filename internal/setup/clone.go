@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/GetStream/pgmigrate/internal/postgres"
@@ -20,13 +22,19 @@ import (
 // snapshot, and the provider's recovery LSN supplies the logical stream boundary.
 // The random publication comment is copied by physical backup and proves this
 // clone was taken after this particular setup attempt, not a previous migration.
-func cloneSnapshot(ctx context.Context, cfg Config, source *pgx.Conn, snapshot *Snapshot) (_ *pgx.Conn, err error) {
+func cloneSnapshot(ctx context.Context, cfg *Config, source *pgx.Conn, snapshot *Snapshot) (_ *pgx.Conn, err error) {
 	marker := "pgmigrate-copy:" + rand.Text()
 	if _, err := source.Exec(ctx, "COMMENT ON PUBLICATION "+quoteIdentifier(snapshot.Publication)+" IS '"+marker+"'"); err != nil {
 		return nil, fmt.Errorf("mark source for cloning: %w", err)
 	}
 	if cfg.CopySourceReady != nil {
 		cfg.CopySourceReady()
+	}
+	if cfg.CopySourceFile != "" {
+		cfg.CopySourceDSN, err = waitCopySourceFile(ctx, cfg.CopySourceFile)
+		if err != nil {
+			return nil, err
+		}
 	}
 	clone, err := waitClone(ctx, cfg.CopySourceDSN)
 	if err != nil {
@@ -199,4 +207,32 @@ func validateCloneLSN(slot, seed, current string) error {
 		return fmt.Errorf("copy-source seed LSN %s is outside retained source interval [%s, %s]; create the clone after slot preparation", seed, slot, current)
 	}
 	return nil
+}
+
+// Read the handoff once: changing the file during COPY must not switch servers
+// underneath the exported snapshot. Missing and empty files mean "not ready".
+func waitCopySourceFile(ctx context.Context, path string) (string, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return "", fmt.Errorf("read copy-source file: %w", err)
+		}
+		if dsn := strings.TrimSpace(string(data)); dsn != "" {
+			if _, err := pgx.ParseConfig(dsn); err != nil {
+				// pgx parse errors can include the complete DSN and password.
+				return "", errors.New("invalid DSN in copy-source file")
+			}
+			return dsn, nil
+		}
+		timer := time.NewTimer(time.Second)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

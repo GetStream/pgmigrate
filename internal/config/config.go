@@ -15,10 +15,11 @@ import (
 )
 
 const (
-	SourceEnv        = "PGMIGRATE_SOURCE"
-	CopySourceEnv    = "PGMIGRATE_COPY_SOURCE"
-	TargetEnv        = "PGMIGRATE_TARGET"
-	ReplayWorkersMax = 64
+	SourceEnv         = "PGMIGRATE_SOURCE"
+	CopySourceEnv     = "PGMIGRATE_COPY_SOURCE"
+	CopySourceFileEnv = "PGMIGRATE_COPY_SOURCE_FILE"
+	TargetEnv         = "PGMIGRATE_TARGET"
+	ReplayWorkersMax  = 64
 )
 
 // ValidateReplayWorkers bounds target connections created by the replay
@@ -39,6 +40,7 @@ func ValidateReplayWorkers(workers int) error {
 type Config struct {
 	Source                 string
 	CopySource             string
+	CopySourceFile         string
 	Target                 string
 	Dir                    string
 	TableFilter            string
@@ -157,6 +159,7 @@ func FromEnvironment() Config {
 	return Config{
 		Source:               os.Getenv(SourceEnv),
 		CopySource:           os.Getenv(CopySourceEnv),
+		CopySourceFile:       os.Getenv(CopySourceFileEnv),
 		Target:               os.Getenv(TargetEnv),
 		Workers:              max(1, runtime.NumCPU()),
 		SplitThreshold:       1 << 30,
@@ -184,6 +187,9 @@ func FromEnvironment() Config {
 // ValidateConnections validates configuration for commands that connect to
 // both PostgreSQL databases.
 func (c Config) ValidateConnections() error {
+	if c.CopySource != "" && c.CopySourceFile != "" {
+		return errors.New("--copy-source and --copy-source-file are mutually exclusive")
+	}
 	var missing []string
 	if strings.TrimSpace(c.Source) == "" {
 		missing = append(missing, "--source or "+SourceEnv)

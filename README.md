@@ -575,32 +575,49 @@ restored RDS PostgreSQL snapshot or an Aurora clone. Bulk COPY reads run there.
 The original `--source` still serves metadata queries and WAL, and must retain
 WAL while the snapshot is restored and the copy runs.
 
-Start pgmigrate **once**, with all three DSNs, and leave it running throughout
-snapshot creation and restore:
+If the restore endpoint is not known yet, start pgmigrate **once** with a path
+for a DSN file. The file can be missing or empty at startup:
 
 ```sh
-pgmigrate run --source "$SOURCE_DSN" --copy-source "$CLONE_DSN" \
-  --target "$TARGET_DSN" --dir ./migration
+pgmigrate run --source "$SOURCE_DSN" --target "$TARGET_DSN" \
+  --copy-source-file /secure/migration/clone.dsn --dir ./migration
 ```
 
-`$CLONE_DSN` must already name the endpoint the restored instance will use; the
-database does not need to be available when the command starts. The current CLI
-cannot accept or change this DSN while running. If you only learn the endpoint
-after AWS provisions the restore, this flow requires arranging a usable endpoint
-in advance; supplying the new endpoint interactively is not implemented.
-
 1. **pgmigrate:** creates the source slot and reports `Source slot ready`, then
-   waits for the copy endpoint. Keep this process running.
-2. **You, through AWS:** take a **new** RDS snapshot and restore it at `$CLONE_DSN`,
-   or create an Aurora clone. Do this after the readiness message, from another
-   terminal or the AWS console. pgmigrate does not create snapshots, provision
-   databases, or perform PITR.
-3. **The same pgmigrate process:** detects and verifies the restored database,
-   reads its recovery LSN, and exports a
-   snapshot there for schema and COPY. It follows source WAL from that LSN. Changes
-   already in the backup are not replayed; transactions still open at the recovery
-   point are replayed if they later commit. No restart or manual PostgreSQL
-   snapshot ID or LSN is needed for this sequence.
+   waits for the file. Keep this process running.
+2. **You, through AWS:** take a **new** RDS snapshot and restore it, or create an
+   Aurora clone. Do this after the readiness message, from another terminal or
+   the AWS console. pgmigrate does not create snapshots, provision databases, or
+   perform PITR.
+3. Once AWS supplies the restored endpoint, put its full connection string in
+   the file. Write a temporary file and rename it so pgmigrate cannot read a
+   partially written DSN:
+
+   ```sh
+   umask 077
+   printf '%s\n' "$CLONE_DSN" > /secure/migration/clone.dsn.tmp
+   mv /secure/migration/clone.dsn.tmp /secure/migration/clone.dsn
+   ```
+
+4. **The same pgmigrate process:** connects to the restore, verifies its
+   provenance, reads its recovery LSN, and exports a snapshot there for schema
+   and COPY. It follows source WAL from that LSN. Changes already in the backup
+   are not replayed; transactions still open at recovery are replayed if they
+   later commit. No restart, placeholder DNS, or manual PostgreSQL snapshot ID
+   or LSN is needed.
+
+`--copy-source-file` also accepts `PGMIGRATE_COPY_SOURCE_FILE`. For a Kubernetes
+controller, mount the Secret directory and pass the path to its DSN key; add the
+key after restore. Do not mount it with `subPath`, which does not receive Secret
+updates. The controller worker reads the file when it reaches slot readiness.
+The DSN is read once per setup attempt, kept in memory, and never saved in
+migration state. Later file changes do not switch an in-progress COPY to another
+database. Use a missing or empty file for each fresh attempt; an old clone will
+fail the provenance check. Cancelling the wait cleans up this attempt's slot and
+publication, so the next attempt needs a new snapshot.
+
+If the endpoint is already known, `--copy-source "$CLONE_DSN"` remains available.
+Use either `--copy-source` or `--copy-source-file`, never both.
 
 Restoring an old snapshot and then creating a source slot leaves a gap. An older
 backup would need point-in-time recovery forward to a position covered by the
