@@ -433,6 +433,15 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		migration.Phase == state.PhaseCutover) {
 		return a.resumePostCopy(ctx, cfg, store, migration, tables)
 	}
+	if migration.Phase == state.PhaseCopy {
+		snapshot, err := readSnapshot(cfg.Dir)
+		if err != nil {
+			return err
+		}
+		if snapshot.CopySource {
+			return a.resumePostCopy(ctx, cfg, store, migration, tables)
+		}
+	}
 	if migration.Phase == state.PhaseSetup || migration.Phase == state.PhaseSchema || migration.Phase == state.PhaseCopy {
 		if err := guardRepeatedBaseCopyFailure(ctx, cfg, store, migration); err != nil {
 			return err
@@ -600,12 +609,6 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 			return fmt.Errorf("schema phase: restore pre-data from %s: %w", archive, err)
 		}
 
-		if err := transition(groupCtx, cfg, store, state.PhaseCopy); err != nil {
-			return err
-		}
-		if err := pauseForCrashTest(groupCtx, state.PhaseCopy); err != nil {
-			return err
-		}
 		var parts []pgcopy.Part
 		for _, table := range snapshotTables {
 			format := pgcopy.ConservativeFormat(table, result.SourceMajor, result.TargetMajor)
@@ -614,6 +617,21 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		runner := pgcopy.Runner{
 			Source: connector(copySource), Target: connector(cfg.Target), Snapshot: holder.Snapshot.Name,
 			Workers: cfg.Workers, State: store, TargetSessionGUCs: sessionGUCs,
+		}
+		if holder.Snapshot.CopySource {
+			plan, err := json.Marshal(parts)
+			if err != nil {
+				return err
+			}
+			if err := store.CompleteStep(groupCtx, "copy.plan", string(plan)); err != nil {
+				return err
+			}
+		}
+		if err := transition(groupCtx, cfg, store, state.PhaseCopy); err != nil {
+			return err
+		}
+		if err := pauseForCrashTest(groupCtx, state.PhaseCopy); err != nil {
+			return err
 		}
 		if err := runner.Run(groupCtx, parts); err != nil {
 			return err
@@ -843,6 +861,27 @@ func (a App) resumePostCopy(
 		return err
 	}
 	defer writer.Close()
+	var copyHolder *setup.Holder
+	var copyParts []pgcopy.Part
+	if migration.Phase == state.PhaseCopy {
+		copyHolder, err = setup.ResumeClone(ctx, setup.Config{
+			SourceDSN: cfg.Source, CopySourceDSN: cfg.CopySource, CopySourceFile: cfg.CopySourceFile,
+		}, snapshot, uint64(recovery.DurableLSN))
+		if err != nil {
+			return err
+		}
+		defer copyHolder.Close(context.Background())
+		copyParts, err = loadCopyPlan(ctx, store)
+		if errors.Is(err, errCopyPlanMissing) {
+			copyParts, err = recoverCopyPlan(ctx, cfg, store, copyHolder)
+		}
+		if err != nil {
+			return err
+		}
+		if err := validateCopyPlan(ctx, copyHolder, copyParts); err != nil {
+			return err
+		}
+	}
 	durable := &cdc.DurableWatermark{}
 	durable.Publish(recovery.DurableLSN)
 	if err := setManualEndPosition(ctx, cfg.EndPosition, cdcDir, durable.Load(), store); err != nil {
@@ -878,6 +917,28 @@ func (a App) resumePostCopy(
 	group.Go(func() error { return followChecks(groupCtx, cfg, store, snapshot.Slot) })
 	group.Go(func() error {
 		phase := migration.Phase
+		if phase == state.PhaseCopy {
+			sessionGUCs, err := tuneTarget(groupCtx, cfg, store)
+			if err != nil {
+				return err
+			}
+			runner := pgcopy.Runner{Source: connector(copyHolder.SnapshotDSN), Target: connector(cfg.Target),
+				Snapshot: copyHolder.Snapshot.Name, Workers: cfg.Workers, State: store, TargetSessionGUCs: sessionGUCs}
+			fmt.Fprintln(a.output(), "Resuming clone COPY with the saved chunk boundaries; committed chunks are retained.")
+			if err := runner.Run(groupCtx, copyParts); err != nil {
+				return err
+			}
+			if err := copyHolder.Close(context.Background()); err != nil {
+				return err
+			}
+			if err := transition(groupCtx, cfg, store, state.PhaseIndexes); err != nil {
+				return err
+			}
+			if err := store.ClearFailedAttempt(groupCtx); err != nil {
+				return err
+			}
+			phase = state.PhaseIndexes
+		}
 		if phase == state.PhaseIndexes {
 			if err := pauseForCrashTest(groupCtx, state.PhaseIndexes); err != nil {
 				return err

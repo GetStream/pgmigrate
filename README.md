@@ -631,12 +631,46 @@ row-level security would filter data. On RDS, it must also be able to create the
 `rds_tools` extension if that extension is not already installed.
 
 Once `status` reports `indexes` or a later phase, the restored instance is no
-longer needed. Restarting during `setup`, `schema`, or `copy` requires a new
-snapshot/clone. Later restarts, verification, and cutover use source and target.
+longer needed. Restarting during `setup` or `schema` requires a new
+snapshot/clone. COPY resumes as described below. Later restarts, verification,
+and cutover use source and target.
 
 Physical recovery and COPY/WAL synchronization are tested on PostgreSQL 16–18.
 The RDS/Aurora seed-LSN functions and managed-service permissions still require
 validation on AWS.
+
+### Resume clone COPY after a stop or crash
+
+Run the same command with the same source, target, clone DSN and `--dir`.
+You can increase concurrency, for example with `--workers 16`. In the controller,
+stop the operation, change Workers, then Run. Keep the clone DSN file populated.
+
+Completed chunks are recorded atomically with their target rows using durable
+commits. Resume checks target receipts even when local state says a chunk is
+complete; a missing receipt causes that chunk to be copied again.
+An unfinished chunk rolls back and is copied again; bytes displayed as in-flight
+are not a checkpoint. Worker count controls scheduling, not saved chunk ranges.
+
+pgmigrate validates the original publication, slot, clone provenance and recovery
+LSN, restores the local CDC log, and checks that the source has not acknowledged
+WAL beyond the recovered log. It exports a new read-only snapshot on the clone
+and checks the saved table layout and ranges before resuming. It does not create
+a new source slot, snapshot or restore. Older runs without a complete saved plan
+can resume only when all persisted ranges can be reconstructed exactly.
+
+Keep the clone free of application writes, DDL and table rewrites, including
+while pgmigrate is stopped. The provenance marker and recovery LSN do **not** prove
+that a privileged client has left the data unchanged. Preserve the entire work
+directory, including every CDC segment; do not edit or selectively restore it.
+The target must remain dedicated to this migration. Missing clone provenance, incompatible plans, or a missing acknowledged CDC
+tail stop resume without deleting COPY progress. The maximum recovered LSN does
+not detect a removed earlier segment; an intact CDC directory is required.
+
+This applies once the run reaches `copy` and has saved its complete plan.
+Stopping during clone preparation still requires the fresh-snapshot procedure.
+A normal COPY directly from a changing source cannot reuse a lost exported
+snapshot and still requires a new base copy.
+
 
 ## Table filters
 
@@ -838,9 +872,9 @@ continues best-effort instead, and `--skip-target-tuning` does not try at all.
 `status` shows an open finding for as long as the target is in its bulk-load
 configuration.
 
-`synchronous_commit=off` is applied to the copy and index-build sessions only,
-never to change apply, because CDC segment pruning keys off applied progress and
-a lost commit could discard a segment still needed for replay.
+COPY forces `synchronous_commit=on` so chunk receipts and their rows survive a
+target crash. Index-build sessions may use `synchronous_commit=off`. Change apply
+also keeps durable commits because CDC pruning depends on applied progress.
 
 ### Replica identity
 
@@ -1068,7 +1102,11 @@ Re-run `pgmigrate run` with the same DSNs, filter, and directory.
 - Controller actions are isolated child processes. If the replay worker exits,
   the controller remains available and a confirmed resume starts a fresh worker
   from the last atomically committed target LSN and replay counters.
-- Restarts from `setup`, `schema`, or `copy` deliberately discard **all**
+- Clone-backed restarts from `copy` retain committed chunks and resume the
+  original CDC stream. Keep the same unchanged clone and durable work directory.
+  You may change `--workers`; saved chunk boundaries stay fixed. A failed
+  validation preserves progress instead of resetting it.
+- Other restarts from `setup`, `schema`, or `copy` deliberately discard **all**
   base-copy progress and start with a fresh slot and snapshot. An exported
   snapshot cannot survive its holder connection, and mixing snapshots would be
   unsafe.
@@ -1089,7 +1127,8 @@ target objects, and refuses to adopt or drop unexpected objects.
 
 ### Restarting a failed base copy
 
-Because a restart from `setup`, `schema`, or `copy` discards the whole base copy,
+For runs that require a new base snapshot, restarting discards the whole base copy.
+Consequently,
 a failure that always happens at the same point can never finish: under a
 supervisor the run keeps re-copying from zero and keeps re-running destructive
 work. `run` therefore records how each attempt died, and refuses to restart the

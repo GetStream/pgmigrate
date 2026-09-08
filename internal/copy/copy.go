@@ -325,15 +325,12 @@ type Runner struct {
 	MaxAttempts    int
 	RetryBackoff   func(attempt int) time.Duration
 	// TargetSessionGUCs are settings applied to every target session used to
-	// write a part. Empty leaves the target's own defaults in place.
+	// write a part. COPY always overrides synchronous_commit to on.
 	TargetSessionGUCs map[string]string
 }
 
 // applyTargetSessionGUCs configures one target session for bulk loading.
 func (r Runner) applyTargetSessionGUCs(ctx context.Context, conn *pgx.Conn) error {
-	if len(r.TargetSessionGUCs) == 0 {
-		return nil
-	}
 	names := make([]string, 0, len(r.TargetSessionGUCs))
 	for name := range r.TargetSessionGUCs {
 		names = append(names, name)
@@ -345,7 +342,9 @@ func (r Runner) applyTargetSessionGUCs(ctx context.Context, conn *pgx.Conn) erro
 			return err
 		}
 	}
-	return nil
+	// SQLite completion can survive a target crash. Its matching rows and
+	// receipt must therefore be durable before COMMIT is acknowledged.
+	return tuning.SetSession(ctx, conn, "synchronous_commit", "on")
 }
 
 // Run copies largest parts first and records completion only after target commit.
@@ -391,10 +390,9 @@ func (r Runner) Run(ctx context.Context, parts []Part) error {
 		go func() {
 			defer wg.Done()
 			for p := range jobs {
-				done, err := r.State.PartCompleted(runCtx, p.Table.OID, p.ID)
-				if err == nil && !done {
-					err = r.copyPartRetry(runCtx, p)
-				}
+				// The target receipt is authoritative, including after a legacy
+				// asynchronous commit was lost in a target crash.
+				err := r.copyPartRetry(runCtx, p)
 				if err != nil && !errors.Is(err, context.Canceled) {
 					err = fmt.Errorf("copy part %s of %s (%d bytes estimated): %w",
 						p.ID, p.Table.Identifier(), p.EstimatedBytes, err)
@@ -726,6 +724,9 @@ func (r Runner) ensureTargetState(ctx context.Context) error {
 		return err
 	}
 	defer conn.Close(context.Background())
+	if _, err := conn.Exec(ctx, "SET synchronous_commit=on"); err != nil {
+		return err
+	}
 	_, err = conn.Exec(ctx, `
 		CREATE SCHEMA IF NOT EXISTS pgmigrate_internal;
 		CREATE TABLE IF NOT EXISTS pgmigrate_internal.copy_tables (
@@ -743,7 +744,29 @@ func (r Runner) ensureTargetState(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("ensure target copy state: %w", err)
 	}
-	return nil
+	// Old releases used asynchronous COPY commits. Before trusting their
+	// visible receipts, wait until all WAL already inserted on this target
+	// is flushed. SET synchronous_commit alone is not a durability barrier.
+	var position string
+	if err := conn.QueryRow(ctx, "SELECT pg_current_wal_insert_lsn()::text").Scan(&position); err != nil {
+		return err
+	}
+	for {
+		var flushed bool
+		if err := conn.QueryRow(ctx, "SELECT pg_current_wal_flush_lsn() >= $1::pg_lsn", position).Scan(&flushed); err != nil {
+			return err
+		}
+		if flushed {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (r Runner) prepareSplitTable(ctx context.Context, table Table) error {
@@ -757,6 +780,9 @@ func (r Runner) prepareSplitTable(ctx context.Context, table Table) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "SET LOCAL synchronous_commit=on"); err != nil {
+		return err
+	}
 	tag, err := tx.Exec(ctx, `
 		INSERT INTO pgmigrate_internal.copy_tables(table_oid) VALUES($1)
 		ON CONFLICT(table_oid) DO NOTHING`, table.OID)
@@ -764,6 +790,13 @@ func (r Runner) prepareSplitTable(ctx context.Context, table Table) error {
 		return err
 	}
 	if tag.RowsAffected() == 1 {
+		var receipts bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT FROM pgmigrate_internal.copy_parts WHERE table_oid=$1)", table.OID).Scan(&receipts); err != nil {
+			return err
+		}
+		if receipts {
+			return errors.New("split table preparation marker is missing but committed chunks exist; refusing to truncate")
+		}
 		if _, err := tx.Exec(ctx, "TRUNCATE TABLE "+table.Identifier()); err != nil {
 			return fmt.Errorf("truncate %s: %w", table.Identifier(), err)
 		}

@@ -93,6 +93,8 @@ def main(directory):
                    "max_replication_slots=10", "-c", "max_wal_senders=10")
     target = start("target")
     wait(lambda: ready(source) and ready(target), "source and target")
+    sql(target, "ALTER SYSTEM SET synchronous_commit='off'")
+    sql(target, "SELECT pg_reload_conf()")
     sql(source, """
         CREATE TABLE items(id integer PRIMARY KEY, value text NOT NULL);
         INSERT INTO items SELECT n, 'seed-' || n FROM generate_series(1,20000) n;
@@ -103,6 +105,9 @@ def main(directory):
         INSERT INTO events VALUES (1,'before'), (101,'before');
         CREATE TABLE keyless(value text);
         INSERT INTO keyless VALUES ('before');
+        INSERT INTO keyless SELECT repeat('duplicate',32) FROM generate_series(1,2000);
+        CREATE TABLE copy_blocker(value text);
+        INSERT INTO copy_blocker VALUES ('blocked');
     """)
     # pg_basebackup connects as the source's superuser on this private test
     # network. The published clone port stays closed until recovery starts; pgmigrate
@@ -146,7 +151,8 @@ def main(directory):
         run = subprocess.Popen([BINARY, "run", *flags, "--copy-source-file", str(copy_source_file),
                                 "--ack-warnings", "--skip-target-tuning",
                                 "--wal-sample-duration", "10ms", "--workers", "4",
-                                "--split-threshold", "65536"], stdout=output, stderr=subprocess.STDOUT)
+                                "--split-threshold", "65536"], stdout=output, stderr=subprocess.STDOUT,
+                                env={**os.environ, "PGMIGRATE_TEST_PAUSE_PHASE": "copy"})
         PROCESSES.append(run)
         def running_until(predicate):
             assert run.poll() is None, log.read_text()
@@ -197,7 +203,87 @@ def main(directory):
         handoff.replace(copy_source_file)
         def following():
             return json.loads(command(BINARY, "status", "--dir", str(state), "--json"))["phase"] == "follow"
-        wait(lambda: running_until(following), "copy and catchup to follow")
+        wait(lambda: running_until(lambda: json.loads(command(BINARY, "status", "--dir", str(state), "--json"))["phase"] == "copy"), "COPY phase")
+        sql(target, """CREATE FUNCTION assert_copy_durable() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF current_setting('synchronous_commit') <> 'on' THEN
+                    RAISE EXCEPTION 'COPY commit must be durable';
+                END IF;
+                RETURN NEW;
+            END $$;
+            CREATE TRIGGER assert_copy_durable BEFORE INSERT ON copy_blocker
+                FOR EACH ROW EXECUTE FUNCTION assert_copy_durable();
+            ALTER TABLE copy_blocker ENABLE ALWAYS TRIGGER assert_copy_durable;""")
+        blocked = open_transaction(target, "LOCK TABLE copy_blocker IN ACCESS EXCLUSIVE MODE")
+        if MAJOR == "18":
+            # The phase boundary is observable before any worker starts. A
+            # crash here must still have a complete durable plan to resume.
+            run.kill()
+            run.wait(timeout=20)
+            run = subprocess.Popen([BINARY, "run", *flags, "--copy-source-file", str(copy_source_file),
+                                    "--ack-warnings", "--skip-target-tuning", "--workers", "4"],
+                                   stdout=output, stderr=subprocess.STDOUT)
+            PROCESSES.append(run)
+        wait(lambda: running_until(lambda: sql(target, "SELECT to_regclass('pgmigrate_internal.copy_parts')") != ""), "COPY receipts table")
+        wait(lambda: running_until(lambda: sql(target, "SELECT count(*) FROM pgmigrate_internal.copy_parts") not in ("0", "")), "at least one committed COPY chunk")
+        receipts = sql(target, "SELECT table_oid,part_id,rows_copied,bytes_copied,xmin::text FROM pgmigrate_internal.copy_parts ORDER BY 1,2")
+        snapshot_before = json.loads((state / "snapshot.json").read_text())
+        wait(lambda: sql(source, "SELECT confirmed_flush_lsn > '" + seed + "'::pg_lsn FROM pg_replication_slots WHERE slot_name='" + snapshot_before["slot"] + "'") == "t", "source acknowledges durable CDC")
+        run.kill()
+        run.wait(timeout=20)
+        # Failed resume must not clean the slot, target rows, or chunk receipts.
+        bad = subprocess.run([BINARY, "run", *flags, "--copy-source", source_dsn,
+                              "--ack-warnings", "--skip-target-tuning"],
+                             stdout=output, stderr=subprocess.STDOUT, timeout=30)
+        assert bad.returncode != 0, "accepted primary as clone"
+        assert receipts == sql(target, "SELECT table_oid,part_id,rows_copied,bytes_copied,xmin::text FROM pgmigrate_internal.copy_parts ORDER BY 1,2")
+        assert snapshot_before == json.loads((state / "snapshot.json").read_text())
+        # Losing acknowledged local CDC must fail closed, even with a valid clone.
+        (state / "cdc").rename(state / "cdc-saved")
+        missing = subprocess.run([BINARY, "run", *flags, "--copy-source", clone_dsn,
+                                  "--ack-warnings", "--skip-target-tuning"],
+                                 stdout=output, stderr=subprocess.STDOUT, timeout=30)
+        assert missing.returncode != 0, "accepted missing acknowledged CDC"
+        assert "advanced beyond locally recovered CDC" in log.read_text(), log.read_text()
+        import shutil
+        shutil.rmtree(state / "cdc")
+        (state / "cdc-saved").rename(state / "cdc")
+        assert receipts == sql(target, "SELECT table_oid,part_id,rows_copied,bytes_copied,xmin::text FROM pgmigrate_internal.copy_parts ORDER BY 1,2")
+        # Simulate a legacy async commit lost on the target while SQLite
+        # retains completion: remove a committed range and its receipt atomically.
+        import sqlite3
+        with sqlite3.connect(state / "state.db") as db:
+            plan = json.loads(db.execute("SELECT detail FROM steps WHERE name='copy.plan'").fetchone()[0])
+        lost = next(p for p in plan if p["Table"]["Name"] == "items" and
+                    sql(target, "SELECT count(*) FROM pgmigrate_internal.copy_parts WHERE table_oid=" + str(p["Table"]["OID"]) + " AND part_id='" + p["ID"] + "'") == "1")
+        sql(target, "BEGIN; DELETE FROM items WHERE " + lost["Predicate"] +
+            "; DELETE FROM pgmigrate_internal.copy_parts WHERE table_oid=" + str(lost["Table"]["OID"]) +
+            " AND part_id='" + lost["ID"] + "'; COMMIT")
+        receipts = sql(target, "SELECT table_oid,part_id,rows_copied,bytes_copied,xmin::text FROM pgmigrate_internal.copy_parts ORDER BY 1,2")
+        if os.environ.get("PGMIGRATE_TEST_LEGACY_PLAN") == "1":
+            import sqlite3
+            with sqlite3.connect(state / "state.db") as db:
+                db.execute("DELETE FROM steps WHERE name='copy.plan'")
+        sql(source, "INSERT INTO items VALUES(30007,'during-copy-downtime')")
+        previous_resumes = log.read_text().count("Resuming clone COPY")
+        run = subprocess.Popen([BINARY, "run", *flags, "--copy-source-file", str(copy_source_file),
+                                "--ack-warnings", "--skip-target-tuning", "--workers", "16"],
+                               stdout=output, stderr=subprocess.STDOUT)
+        PROCESSES.append(run)
+        wait(lambda: running_until(lambda: log.read_text().count("Resuming clone COPY") > previous_resumes), "resumed COPY started")
+        run.terminate()
+        run.wait(timeout=20)
+        finish_transaction(blocked, "ROLLBACK")
+        run = subprocess.Popen([BINARY, "run", *flags, "--copy-source-file", str(copy_source_file),
+                                "--ack-warnings", "--skip-target-tuning", "--workers", "16"],
+                               stdout=output, stderr=subprocess.STDOUT)
+        PROCESSES.append(run)
+        wait(lambda: running_until(following), "resume COPY with 16 workers and catch up")
+        assert "Resuming clone COPY" in log.read_text(), log.read_text()
+        final_receipts = sql(target, "SELECT table_oid,part_id,rows_copied,bytes_copied,xmin::text FROM pgmigrate_internal.copy_parts ORDER BY 1,2")
+        assert set(receipts.splitlines()) <= set(final_receipts.splitlines()), "committed COPY chunks were rewritten"
+        assert snapshot_before == json.loads((state / "snapshot.json").read_text())
+
         snapshot = json.loads((state / "snapshot.json").read_text())
         assert snapshot["copy_source"] and snapshot["consistent_point"] == seed, snapshot
         assert snapshot["slot_consistent_point"] != seed, snapshot
@@ -216,7 +302,7 @@ def main(directory):
         wait(resumed_change, "CDC after resume without clone")
         command(BINARY, "cutover", *flags)
         assert resumed.wait(timeout=30) == 0, log.read_text()
-        for table in ("items", "events", "keyless"):
+        for table in ("items", "events", "keyless", "copy_blocker"):
             query = "SELECT row_to_json(t)::text FROM " + table + " t ORDER BY row_to_json(t)::text"
             assert sql(source, query) == sql(target, query), "exact rows differ: " + table
         assert sql(source, "SELECT count(*) FROM pg_replication_slots WHERE slot_name LIKE 'pgmigrate_slot_%'") == "0"
