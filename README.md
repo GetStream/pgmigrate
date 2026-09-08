@@ -598,7 +598,8 @@ Source and copy-source must have the same database name, PostgreSQL major, and
 storage engine. Keep source DDL frozen. Keep the restored instance unchanged from
 its first startup: no application writes or DDL, and disable restored jobs such as
 pg_cron before startup. The copy reader must see every row; copying fails if
-row-level security would filter data.
+row-level security would filter data. On RDS, it must also be able to create the
+`rds_tools` extension if that extension is not already installed.
 
 Once `status` reports `indexes` or a later phase, the restored instance is no
 longer needed. Restarting during `setup`, `schema`, or `copy` requires a new
