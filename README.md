@@ -568,6 +568,59 @@ large source transactions.
 DDL is neither replicated nor detected, so the source schema must be frozen for
 the whole run. Application writes may continue until you freeze them for cutover.
 
+## Copy from a restored backup or clone
+
+`--copy-source` (`PGMIGRATE_COPY_SOURCE`) reads schema and table data from a
+restored RDS PostgreSQL snapshot or an Aurora clone. Bulk COPY reads run there.
+The original `--source` still serves metadata queries and WAL, and must retain
+WAL while the snapshot is restored and the copy runs.
+
+Start pgmigrate **once**, with all three DSNs, and leave it running throughout
+snapshot creation and restore:
+
+```sh
+pgmigrate run --source "$SOURCE_DSN" --copy-source "$CLONE_DSN" \
+  --target "$TARGET_DSN" --dir ./migration
+```
+
+`$CLONE_DSN` must already name the endpoint the restored instance will use; the
+database does not need to be available when the command starts. The current CLI
+cannot accept or change this DSN while running. If you only learn the endpoint
+after AWS provisions the restore, this flow requires arranging a usable endpoint
+in advance; supplying the new endpoint interactively is not implemented.
+
+1. **pgmigrate:** creates the source slot and reports `Source slot ready`, then
+   waits for the copy endpoint. Keep this process running.
+2. **You, through AWS:** take a **new** RDS snapshot and restore it at `$CLONE_DSN`,
+   or create an Aurora clone. Do this after the readiness message, from another
+   terminal or the AWS console. pgmigrate does not create snapshots, provision
+   databases, or perform PITR.
+3. **The same pgmigrate process:** detects and verifies the restored database,
+   reads its recovery LSN, and exports a
+   snapshot there for schema and COPY. It follows source WAL from that LSN. Changes
+   already in the backup are not replayed; transactions still open at the recovery
+   point are replayed if they later commit. No restart or manual PostgreSQL
+   snapshot ID or LSN is needed for this sequence.
+
+Restoring an old snapshot and then creating a source slot leaves a gap. An older
+backup would need point-in-time recovery forward to a position covered by the
+slot; that workflow is not validated here. Use the fresh-snapshot sequence above.
+
+Source and copy-source must have the same database name, PostgreSQL major, and
+storage engine. Keep source DDL frozen. Keep the restored instance unchanged from
+its first startup: no application writes or DDL, and disable restored jobs such as
+pg_cron before startup. The copy reader must see every row; copying fails if
+row-level security would filter data. On RDS, it must also be able to create the
+`rds_tools` extension if that extension is not already installed.
+
+Once `status` reports `indexes` or a later phase, the restored instance is no
+longer needed. Restarting during `setup`, `schema`, or `copy` requires a new
+snapshot/clone. Later restarts, verification, and cutover use source and target.
+
+Physical recovery and COPY/WAL synchronization are tested on PostgreSQL 16–18.
+The RDS/Aurora seed-LSN functions and managed-service permissions still require
+validation on AWS.
+
 ## Table filters
 
 `--table-filter` takes one `schema.table` glob per line:

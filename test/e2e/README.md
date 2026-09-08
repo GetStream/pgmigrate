@@ -61,3 +61,26 @@ plus an order-independent MD5 digest of canonical JSON rows. It also compares th
 partition tree with its bounds and every index and constraint definition, reading both
 sides on a pinned `search_path` so the two renderings are comparable. Run it only after
 traffic is paused and replication has drained.
+
+## Copy from a physical clone
+
+```sh
+make clone-e2e
+# Select another PostgreSQL version:
+PG_MAJOR=18 make clone-e2e
+```
+
+Requires Docker and Python 3. The default is PostgreSQL 17; 16 and 18 are also
+tested in CI. The fixture uses matching PostgreSQL client tools in Docker and
+removes its containers and volumes on exit.
+
+The test takes a physical backup, replays WAL, and promotes the clone. It checks
+transactions that commit or abort across that boundary, subsequent writes,
+partitions, keyless rows, and exact final row equality. It also stops the clone
+before resuming replication and cutting over.
+
+`TestPGCloneSeedAtCommitEnd` separately checks the exact commit-end boundary;
+copy integration tests reject readers whose row-level security hides rows.
+
+This tests PostgreSQL recovery and CDC. AWS's seed-LSN functions require a separate
+run on RDS or Aurora.

@@ -42,3 +42,28 @@ jobs:
       # Apply, the copy workers, and the CDC handoff are concurrent, and a race
       # between them is not something anyone reproduces by hand twice.
       - run: make race
+
+  clone-e2e:
+    name: Physical clone COPY + source CDC (PG ${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        postgres: [16, 17, 18]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Clone migration, resume, and cutover
+        env:
+          PG_MAJOR: ${{ matrix.postgres }}
+        run: make clone-e2e
+      - name: Exact clone seed boundary
+        env:
+          PGTEST_MAJORS: ${{ matrix.postgres }}
+        run: go test -tags=integration ./internal/cdc -run '^TestPGCloneSeedAtCommitEnd$' -count=1
+      - name: Clone reader and setup regressions
+        if: matrix.postgres == 17
+        run: go test -tags=integration ./internal/copy ./internal/setup -run 'TestPG17(CopyReaderCannotSilentlyApplyRLS|CloneRejectsWrongEndpointAndCleansSetup)$' -count=1

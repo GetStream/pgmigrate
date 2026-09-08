@@ -510,3 +510,74 @@ func connectWithDefaults(ctx context.Context, uri string, defaults map[string]st
 	}
 	return pgx.ConnectConfig(ctx, config)
 }
+
+func TestPG17CopyReaderCannotSilentlyApplyRLS(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	source, target := pgtest.Start(t, 17), pgtest.Start(t, 17)
+	src, dst := source.Connect(t), target.Connect(t)
+	if _, err := src.Exec(ctx, `
+		CREATE ROLE copy_reader LOGIN PASSWORD 'reader';
+		CREATE TABLE rls_keyed(id integer PRIMARY KEY);
+		CREATE TABLE rls_keyless(id integer);
+		INSERT INTO rls_keyed VALUES (1),(2);
+		INSERT INTO rls_keyless VALUES (1),(2);
+		ALTER TABLE rls_keyed ENABLE ROW LEVEL SECURITY;
+		ALTER TABLE rls_keyless ENABLE ROW LEVEL SECURITY;
+		CREATE POLICY subset ON rls_keyed TO copy_reader USING (id=1);
+		CREATE POLICY subset ON rls_keyless TO copy_reader USING (id=1);
+		GRANT SELECT ON rls_keyed, rls_keyless TO copy_reader`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dst.Exec(ctx, "CREATE TABLE rls_keyless(id integer)"); err != nil {
+		t.Fatal(err)
+	}
+	readerConfig, err := pgx.ParseConfig(source.URI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readerConfig.User, readerConfig.Password = "copy_reader", "reader"
+	reader := func(ctx context.Context) (*pgx.Conn, error) { return pgx.ConnectConfig(ctx, readerConfig.Copy()) }
+	conn, err := reader(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var visible int
+	if err := conn.QueryRow(ctx, "SELECT count(*) FROM rls_keyed").Scan(&visible); err != nil || visible != 1 {
+		t.Fatalf("fixture reader sees %d rows, want 1: %v", visible, err)
+	}
+	_ = conn.Close(ctx)
+	tx, err := src.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	var snapshot string
+	if err := tx.QueryRow(ctx, "SELECT pg_export_snapshot()").Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	_, err = InventorySnapshot(ctx, reader, snapshot, func(schema, table string) bool { return table == "rls_keyed" })
+	if err == nil || !strings.Contains(err.Error(), "row-level security") {
+		t.Fatalf("key bounds silently accepted filtered reader: %v", err)
+	}
+	// Keyless inventory does not read rows, so the worker must guard COPY too.
+	tables, err := InventorySnapshot(ctx, reader, snapshot, func(schema, table string) bool { return table == "rls_keyless" })
+	if err != nil || len(tables) != 1 {
+		t.Fatalf("keyless inventory: tables=%v err=%v", tables, err)
+	}
+	store, err := state.Open(ctx, t.TempDir(), state.Fingerprints{Source: "source", Filter: "RLS"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runner := Runner{
+		Source: reader, Target: func(ctx context.Context) (*pgx.Conn, error) { return pgx.Connect(ctx, target.URI) },
+		Snapshot: snapshot, State: store, Workers: 1, MaxAttempts: 1,
+	}
+	if err := runner.Run(ctx, Plan(tables[0], 0, 1, Text)); err == nil || !strings.Contains(err.Error(), "row-level security") {
+		t.Fatalf("COPY silently accepted filtered reader: %v", err)
+	}
+	if err := dst.QueryRow(ctx, "SELECT count(*) FROM rls_keyless").Scan(&visible); err != nil || visible != 0 {
+		t.Fatalf("failed COPY committed %d rows: %v", visible, err)
+	}
+}

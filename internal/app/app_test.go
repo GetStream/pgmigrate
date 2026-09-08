@@ -539,3 +539,10 @@ func TestResolveSupersededIndexFinding(t *testing.T) {
 		}
 	})
 }
+
+func TestPublicationProvenanceCommentIsNotRestored(t *testing.T) {
+	entry := schema.TOCEntry{Description: "COMMENT", Namespace: "-", Tag: "PUBLICATION pgmigrate_pub_test"}
+	if selectedTOCEntry(entry, schema.DumpSelection{}) {
+		t.Fatal("source-only publication comment selected for target restore")
+	}
+}

@@ -99,3 +99,10 @@ func TestValidateReplayWorkers(t *testing.T) {
 		}
 	}
 }
+
+func TestCopySourceEnvironment(t *testing.T) {
+	t.Setenv(config.CopySourceEnv, "postgres://clone/app")
+	if got := config.FromEnvironment().CopySource; got != "postgres://clone/app" {
+		t.Fatalf("CopySource = %q", got)
+	}
+}

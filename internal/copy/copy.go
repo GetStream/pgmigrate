@@ -100,6 +100,11 @@ func InventorySnapshot(ctx context.Context, connect func(context.Context) (*pgx.
 	if _, err := tx.Exec(ctx, "SET TRANSACTION SNAPSHOT "+quoteLiteral(snapshot)); err != nil {
 		return nil, fmt.Errorf("import inventory snapshot: %w", err)
 	}
+	// A separate clone reader may be subject to RLS even when the publisher
+	// bypasses it. Fail instead of silently planning/copying a filtered subset.
+	if _, err := tx.Exec(ctx, "SET LOCAL row_security=off"); err != nil {
+		return nil, err
+	}
 	tables, err := inventory(ctx, tx, selected)
 	if err != nil {
 		return nil, err
@@ -537,6 +542,9 @@ func (r Runner) copyPart(ctx context.Context, p Part) error {
 	// This must remain the first statement in the source transaction.
 	if _, err := stx.Exec(ctx, "SET TRANSACTION SNAPSHOT "+quoteLiteral(r.Snapshot)); err != nil {
 		return fmt.Errorf("import snapshot: %w", err)
+	}
+	if _, err := stx.Exec(ctx, "SET LOCAL row_security=off"); err != nil {
+		return err
 	}
 	if p.Format == Text {
 		if err := pinTextCopyGUCs(ctx, stx); err != nil {
