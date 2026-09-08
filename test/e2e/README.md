@@ -61,3 +61,21 @@ plus an order-independent MD5 digest of canonical JSON rows. It also compares th
 partition tree with its bounds and every index and constraint definition, reading both
 sides on a pinned `search_path` so the two renderings are comparable. Run it only after
 traffic is paused and replication has drained.
+
+## Physical clone COPY with primary CDC
+
+Build pgmigrate, then run `python3 test/e2e/scripts/clone-migration.py` from the
+repository root. Set `PGMIGRATE_BIN` for another binary and `PG_MAJOR` for 16, 17,
+or 18. The matching Docker image supplies pg_dump/pg_restore. `make clone-e2e`
+builds the binary and runs the same test. The fixture uses isolated,
+randomly named Docker containers and removes them and their volumes on exit.
+
+It takes a real `pg_basebackup`, replays WAL on a standby, pauses at a measured
+recovery boundary, and promotes that database into an independent clone. It
+checks pre-clone commits, transactions that start before cloning and commit or
+abort afterward, post-clone INSERT/UPDATE/DELETE, partitions, keyless rows, exact
+source/target row equality, and resume/cutover after shutting down the clone.
+There are no mocked provider functions or synthetic LSNs. This validates the
+PostgreSQL physical recovery/CDC handoff, not AWS's proprietary implementations of
+`logical_seed_lsn()` or `aurora_volume_logical_start_lsn()`; a real AWS acceptance
+run is still needed to certify those managed-service integrations.

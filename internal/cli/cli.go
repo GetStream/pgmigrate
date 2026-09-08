@@ -41,6 +41,7 @@ func NewRootCommand() *cobra.Command {
 
 	flags := root.PersistentFlags()
 	flags.StringVar(&cfg.Source, "source", cfg.Source, "source PostgreSQL connection string (or PGMIGRATE_SOURCE)")
+	flags.StringVar(&cfg.CopySource, "copy-source", cfg.CopySource, "fresh physical clone connection string for schema and COPY (or PGMIGRATE_COPY_SOURCE); create clone after run reports ready")
 	flags.StringVar(&cfg.Target, "target", cfg.Target, "target PostgreSQL connection string (or PGMIGRATE_TARGET)")
 	flags.StringVar(&cfg.Dir, "dir", "", "migration state directory")
 	flags.StringVar(&cfg.TableFilter, "table-filter", "", "path to newline-delimited schema.table globs")

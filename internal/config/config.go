@@ -16,6 +16,7 @@ import (
 
 const (
 	SourceEnv        = "PGMIGRATE_SOURCE"
+	CopySourceEnv    = "PGMIGRATE_COPY_SOURCE"
 	TargetEnv        = "PGMIGRATE_TARGET"
 	ReplayWorkersMax = 64
 )
@@ -37,6 +38,7 @@ func ValidateReplayWorkers(workers int) error {
 // Config contains configuration shared by pgmigrate commands.
 type Config struct {
 	Source                 string
+	CopySource             string
 	Target                 string
 	Dir                    string
 	TableFilter            string
@@ -154,6 +156,7 @@ func (c Config) TuningOverrides() (tuning.Overrides, error) {
 func FromEnvironment() Config {
 	return Config{
 		Source:               os.Getenv(SourceEnv),
+		CopySource:           os.Getenv(CopySourceEnv),
 		Target:               os.Getenv(TargetEnv),
 		Workers:              max(1, runtime.NumCPU()),
 		SplitThreshold:       1 << 30,

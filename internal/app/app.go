@@ -481,12 +481,21 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	}
 	holder, err := setup.Run(ctx, setup.Config{
 		SourceDSN: cfg.Source, TargetDSN: cfg.Target, Dir: cfg.Dir,
+		CopySourceDSN: cfg.CopySource,
+		CopySourceReady: func() {
+			fmt.Fprintln(a.output(), "Source slot ready: create a fresh physical clone now; waiting for --copy-source. Keep the clone free of application writes and DDL.")
+			logEvent(cfg.Dir, "copy_source_ready", nil)
+		},
 		MigrationID: migrationID(cfg.Dir), Tables: toSetup(tables),
 	}, store)
 	if err != nil {
 		return err
 	}
 	defer holder.Close(context.Background())
+	copySource := cfg.Source
+	if cfg.CopySource != "" {
+		copySource = cfg.CopySource
+	}
 	generation := streamGeneration(fingerprint, filter.Fingerprint())
 	if err := recordTargetIdentity(ctx, cfg.Target, fingerprint, filter.Fingerprint(), holder.Snapshot.Slot, generation); err != nil {
 		return err
@@ -558,11 +567,11 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		}
 		archive := filepath.Join(cfg.Dir, "dump", "schema.dump")
 		service := schemaService(cfg, store)
-		snapshotTables, err := pgcopy.InventorySnapshot(groupCtx, connector(cfg.Source), holder.Snapshot.Name, filter.Match)
+		snapshotTables, err := pgcopy.InventorySnapshot(groupCtx, connector(copySource), holder.Snapshot.Name, filter.Match)
 		if err != nil {
 			return err
 		}
-		selection, err := dumpSelection(groupCtx, cfg.Source, holder.Snapshot.Name, snapshotTables)
+		selection, err := dumpSelection(groupCtx, copySource, holder.Snapshot.Name, snapshotTables)
 		if err != nil {
 			return err
 		}
@@ -573,7 +582,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		if err := store.CompleteStep(groupCtx, "schema.selection", string(selectionJSON)); err != nil {
 			return err
 		}
-		if err := service.Dump(groupCtx, cfg.Source, holder.Snapshot.Name, archive); err != nil {
+		if err := service.Dump(groupCtx, copySource, holder.Snapshot.Name, archive); err != nil {
 			return fmt.Errorf("schema phase: dump source archive %s: %w", archive, err)
 		}
 		entries, err := service.List(groupCtx, archive)
@@ -601,7 +610,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 			parts = append(parts, pgcopy.Plan(table, cfg.SplitThreshold, cfg.Workers, format)...)
 		}
 		runner := pgcopy.Runner{
-			Source: connector(cfg.Source), Target: connector(cfg.Target), Snapshot: holder.Snapshot.Name,
+			Source: connector(copySource), Target: connector(cfg.Target), Snapshot: holder.Snapshot.Name,
 			Workers: cfg.Workers, State: store, TargetSessionGUCs: sessionGUCs,
 		}
 		if err := runner.Run(groupCtx, parts); err != nil {
@@ -1107,6 +1116,9 @@ func selectedTOCEntry(entry schema.TOCEntry, selection schema.DumpSelection) boo
 		return tables[qualified(entry.Tag)]
 	case "COMMENT", "ACL":
 		upper := strings.ToUpper(entry.Tag)
+		if strings.HasPrefix(upper, "PUBLICATION ") {
+			return false
+		}
 		for _, prefix := range []string{"TABLE ", "COLUMN "} {
 			if strings.HasPrefix(upper, prefix) {
 				identity := strings.TrimSpace(entry.Tag[len(prefix):])

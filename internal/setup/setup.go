@@ -44,6 +44,9 @@ type Config struct {
 	MigrationID    string
 	Tables         []Table
 	EnableFailover bool
+
+	CopySourceDSN   string
+	CopySourceReady func()
 }
 
 // Snapshot is the durable description written to snapshot.json.
@@ -56,14 +59,19 @@ type Snapshot struct {
 	BackendPID        uint32    `json:"backend_pid"`
 	Failover          bool      `json:"failover"`
 	CreatedAt         time.Time `json:"created_at"`
+
+	CopySource          bool   `json:"copy_source,omitempty"`
+	SlotConsistentPoint string `json:"slot_consistent_point,omitempty"`
 }
 
-// Holder owns the command-idle replication connection. The orchestrator must
+// Holder owns the snapshot-exporting replication connection (or the clone SQL
+// transaction when CopySource is set). The orchestrator must
 // retain it until every copy transaction has imported Snapshot.Name. No method
 // sends traffic on that connection.
 type Holder struct {
 	Snapshot Snapshot
 	repl     *pgconn.PgConn
+	copyConn *pgx.Conn
 	monitor  *pgx.Conn
 	mu       sync.Mutex
 	closed   bool
@@ -133,6 +141,9 @@ func (h *Holder) Close(ctx context.Context) error {
 	if h.repl != nil {
 		result = errors.Join(result, h.repl.Close(ctx))
 	}
+	if h.copyConn != nil {
+		result = errors.Join(result, h.copyConn.Close(ctx))
+	}
 	if h.monitor != nil {
 		result = errors.Join(result, h.monitor.Close(ctx))
 	}
@@ -151,6 +162,11 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 		return nil, errors.New("source DSN, target DSN, directory, and selected tables are required")
 	}
 
+	if cfg.CopySourceDSN != "" {
+		if _, err := pgx.ParseConfig(cfg.CopySourceDSN); err != nil {
+			return nil, fmt.Errorf("parse copy-source DSN: %w", err)
+		}
+	}
 	source, err := postgres.Connect(ctx, cfg.SourceDSN)
 	if err != nil {
 		return nil, fmt.Errorf("connect source setup: %w", err)
@@ -238,7 +254,7 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 		return nil, fmt.Errorf("connect snapshot monitor: %w", err)
 	}
 	defer func() {
-		if !holderOwnsRepl {
+		if !holderOwnsRepl && monitor != nil {
 			_ = monitor.Close(context.Background())
 		}
 	}()
@@ -256,6 +272,28 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 	if snapshot.Name == "" {
 		return nil, errors.New("logical slot did not export a snapshot")
 	}
+	var copyConn *pgx.Conn
+	if cfg.CopySourceDSN != "" {
+		// Only the slot's WAL retention is needed while AWS creates the clone.
+		// Release the unused primary snapshot so it does not pin vacuum.
+		if err := repl.Close(ctx); err != nil {
+			return nil, err
+		}
+		copyConn, err = cloneSnapshot(ctx, cfg, source, &snapshot)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if !holderOwnsRepl {
+				_ = copyConn.Close(context.Background())
+			}
+		}()
+		_ = monitor.Close(context.Background())
+		monitor, err = postgres.Connect(ctx, cfg.CopySourceDSN)
+		if err != nil {
+			return nil, fmt.Errorf("connect clone snapshot monitor: %w", err)
+		}
+	}
 	if err := writeSnapshotAtomic(cfg.Dir, snapshot); err != nil {
 		return nil, err
 	}
@@ -265,7 +303,7 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 	}
 
 	holderOwnsRepl = true
-	return &Holder{Snapshot: snapshot, repl: repl, monitor: monitor}, nil
+	return &Holder{Snapshot: snapshot, repl: repl, monitor: monitor, copyConn: copyConn}, nil
 }
 
 func replicationConnect(ctx context.Context, dsn string) (*pgconn.PgConn, error) {
@@ -586,16 +624,25 @@ func ValidateResume(ctx context.Context, cfg Config, snapshot Snapshot) error {
 			snapshot.Slot, restartLSN, confirmedFlushLSN, walStatus,
 		)
 	}
+	consistentPoint := snapshot.ConsistentPoint
+	if snapshot.CopySource {
+		// Feedback may not have reached the primary before the first restart.
+		// Its slot can still be at creation, earlier than the clone's seed.
+		if err := validateCloneLSN(snapshot.SlotConsistentPoint, snapshot.ConsistentPoint, snapshot.ConsistentPoint); err != nil {
+			return err
+		}
+		consistentPoint = snapshot.SlotConsistentPoint
+	}
 	var positionValid bool
 	if err := conn.QueryRow(ctx,
-		"SELECT $1::pg_lsn >= $2::pg_lsn", confirmedFlushLSN, snapshot.ConsistentPoint,
+		"SELECT $1::pg_lsn >= $2::pg_lsn", confirmedFlushLSN, consistentPoint,
 	).Scan(&positionValid); err != nil {
 		return fmt.Errorf("compare source replication slot resume position: %w", err)
 	}
 	if !positionValid {
 		return fmt.Errorf(
 			"source replication slot %q confirmed position %s precedes its durable consistent point %s; a fresh base copy is required",
-			snapshot.Slot, confirmedFlushLSN, snapshot.ConsistentPoint,
+			snapshot.Slot, confirmedFlushLSN, consistentPoint,
 		)
 	}
 	return nil
