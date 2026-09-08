@@ -5,6 +5,7 @@ package setup_test
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -89,7 +90,7 @@ func TestPG17CloneRejectsWrongEndpointAndCleansSetup(t *testing.T) {
 		defer stop()
 		_, err := setup.Run(waitCtx, setup.Config{
 			SourceDSN: source.URI, TargetDSN: target.URI,
-			CopySourceDSN:   "postgres://app:app@127.0.0.1:1/app?sslmode=disable",
+			CopySourceFile:  filepath.Join(t.TempDir(), "not-yet-created"),
 			CopySourceReady: stop, Dir: t.TempDir(), MigrationID: "cancel",
 			Tables: []setup.Table{{Schema: "public", Name: "clone_test"}},
 		}, &snapshotState{})

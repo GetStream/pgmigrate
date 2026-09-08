@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -55,4 +59,67 @@ func TestRetryCloneConnection(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCopySourceFileHandoff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clone.dsn")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		dsn string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() { dsn, err := waitCopySourceFile(ctx, path); done <- result{dsn, err} }()
+	select {
+	case got := <-done:
+		t.Fatalf("missing file did not wait: %+v", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-done:
+		t.Fatalf("empty file did not wait: %+v", got)
+	case <-time.After(30 * time.Millisecond):
+	}
+	const dsn = "postgres://reader:secret@clone.example/db"
+	if err := os.WriteFile(path+".tmp", []byte(dsn+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path+".tmp", path); err != nil {
+		t.Fatal(err)
+	}
+	got := <-done
+	if got.err != nil || got.dsn != dsn {
+		t.Fatalf("handoff failed: %v", got.err)
+	}
+}
+
+func TestCopySourceFileErrors(t *testing.T) {
+	t.Run("cancel missing file", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		defer cancel()
+		_, err := waitCopySourceFile(ctx, filepath.Join(t.TempDir(), "missing"))
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("got %v", err)
+		}
+	})
+	t.Run("read failure", func(t *testing.T) {
+		_, err := waitCopySourceFile(context.Background(), t.TempDir())
+		if err == nil {
+			t.Fatal("directory accepted")
+		}
+	})
+	t.Run("invalid DSN redacted", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "dsn")
+		if err := os.WriteFile(path, []byte("postgres://reader:secret@clone:invalid/db"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := waitCopySourceFile(context.Background(), path)
+		if err == nil || strings.Contains(err.Error(), "secret") {
+			t.Fatal("invalid DSN must fail without disclosing credentials")
+		}
+	})
 }

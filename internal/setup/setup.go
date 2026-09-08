@@ -46,6 +46,7 @@ type Config struct {
 	EnableFailover bool
 
 	CopySourceDSN   string
+	CopySourceFile  string
 	CopySourceReady func()
 }
 
@@ -70,11 +71,13 @@ type Snapshot struct {
 // sends traffic on that connection.
 type Holder struct {
 	Snapshot Snapshot
-	repl     *pgconn.PgConn
-	copyConn *pgx.Conn
-	monitor  *pgx.Conn
-	mu       sync.Mutex
-	closed   bool
+	// SnapshotDSN is held only in memory; it can contain clone credentials.
+	SnapshotDSN string
+	repl        *pgconn.PgConn
+	copyConn    *pgx.Conn
+	monitor     *pgx.Conn
+	mu          sync.Mutex
+	closed      bool
 }
 
 // Alive checks the holder backend through the separate monitoring connection.
@@ -162,6 +165,9 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 		return nil, errors.New("source DSN, target DSN, directory, and selected tables are required")
 	}
 
+	if cfg.CopySourceDSN != "" && cfg.CopySourceFile != "" {
+		return nil, errors.New("copy-source DSN and file are mutually exclusive")
+	}
 	if cfg.CopySourceDSN != "" {
 		if _, err := pgx.ParseConfig(cfg.CopySourceDSN); err != nil {
 			return nil, fmt.Errorf("parse copy-source DSN: %w", err)
@@ -264,13 +270,13 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 	}
 	snapshotDSN := cfg.SourceDSN
 	var copyConn *pgx.Conn
-	if cfg.CopySourceDSN != "" {
+	if cfg.CopySourceDSN != "" || cfg.CopySourceFile != "" {
 		// Only the slot's WAL retention is needed while AWS creates the clone.
 		// Release the unused primary snapshot so it does not pin vacuum.
 		if err := repl.Close(ctx); err != nil {
 			return nil, err
 		}
-		copyConn, err = cloneSnapshot(ctx, cfg, source, &snapshot)
+		copyConn, err = cloneSnapshot(ctx, &cfg, source, &snapshot)
 		if err != nil {
 			return nil, err
 		}
@@ -299,7 +305,7 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 	}
 
 	holderOwnsRepl = true
-	return &Holder{Snapshot: snapshot, repl: repl, monitor: monitor, copyConn: copyConn}, nil
+	return &Holder{Snapshot: snapshot, SnapshotDSN: snapshotDSN, repl: repl, monitor: monitor, copyConn: copyConn}, nil
 }
 
 func replicationConnect(ctx context.Context, dsn string) (*pgconn.PgConn, error) {

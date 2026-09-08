@@ -481,9 +481,14 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 	}
 	holder, err := setup.Run(ctx, setup.Config{
 		SourceDSN: cfg.Source, TargetDSN: cfg.Target, Dir: cfg.Dir,
-		CopySourceDSN: cfg.CopySource,
+		CopySourceDSN: cfg.CopySource, CopySourceFile: cfg.CopySourceFile,
 		CopySourceReady: func() {
-			fmt.Fprintln(a.output(), "Source slot ready: create a fresh physical clone now; waiting for --copy-source. Keep the clone free of application writes and DDL.")
+			fmt.Fprintln(a.output(), "Source slot ready: create a fresh physical clone now. Keep the clone free of application writes and DDL.")
+			if cfg.CopySourceFile != "" {
+				fmt.Fprintln(a.output(), "Waiting for --copy-source-file to contain the restored database DSN; keep this process running.")
+			} else {
+				fmt.Fprintln(a.output(), "Waiting for --copy-source to become available.")
+			}
 			logEvent(cfg.Dir, "copy_source_ready", nil)
 		},
 		MigrationID: migrationID(cfg.Dir), Tables: toSetup(tables),
@@ -492,10 +497,7 @@ func (a App) Run(ctx context.Context, cfg config.Config) (runErr error) {
 		return err
 	}
 	defer holder.Close(context.Background())
-	copySource := cfg.Source
-	if cfg.CopySource != "" {
-		copySource = cfg.CopySource
-	}
+	copySource := holder.SnapshotDSN
 	generation := streamGeneration(fingerprint, filter.Fingerprint())
 	if err := recordTargetIdentity(ctx, cfg.Target, fingerprint, filter.Fingerprint(), holder.Snapshot.Slot, generation); err != nil {
 		return err

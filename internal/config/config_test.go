@@ -106,3 +106,20 @@ func TestCopySourceEnvironment(t *testing.T) {
 		t.Fatalf("CopySource = %q", got)
 	}
 }
+
+func TestDeferredCopySourceConfiguration(t *testing.T) {
+	t.Setenv(config.CopySourceFileEnv, "/run/secrets/clone.dsn")
+	t.Setenv(config.CopySourceEnv, "")
+	cfg := config.FromEnvironment()
+	cfg.Source, cfg.Target, cfg.Dir = "postgres://source/db", "postgres://target/db", t.TempDir()
+	if cfg.CopySourceFile != "/run/secrets/clone.dsn" {
+		t.Fatal("copy-source file environment ignored")
+	}
+	if err := cfg.ValidateConnections(); err != nil {
+		t.Fatal(err)
+	}
+	cfg.CopySource = "postgres://clone/db"
+	if err := cfg.ValidateConnections(); err == nil {
+		t.Fatal("both copy-source inputs accepted")
+	}
+}

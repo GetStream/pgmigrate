@@ -141,8 +141,9 @@ def main(directory):
         wrapper.chmod(0o700)
     flags = ["--source", source_dsn, "--target", target_dsn, "--dir", str(state),
              "--pg-dump", str(directory / "pg_dump"), "--pg-restore", str(directory / "pg_restore")]
+    copy_source_file = directory / "copy-source.dsn"
     with log.open("w") as output:
-        run = subprocess.Popen([BINARY, "run", *flags, "--copy-source", clone_dsn,
+        run = subprocess.Popen([BINARY, "run", *flags, "--copy-source-file", str(copy_source_file),
                                 "--ack-warnings", "--skip-target-tuning",
                                 "--wal-sample-duration", "10ms", "--workers", "4",
                                 "--split-threshold", "65536"], stdout=output, stderr=subprocess.STDOUT)
@@ -186,6 +187,14 @@ def main(directory):
             DELETE FROM items WHERE id=6;
             UPDATE events SET value='after-clone' WHERE id=101;
             INSERT INTO keyless VALUES('after-clone');""")
+        # The endpoint is supplied only AFTER promotion, while the original
+        # pgmigrate process is still waiting. No placeholder DNS or restart.
+        assert not copy_source_file.exists()
+        assert json.loads(command(BINARY, "status", "--dir", str(state), "--json"))["phase"] == "setup"
+        handoff = directory / "copy-source.tmp"
+        handoff.write_text(clone_dsn + "\n")
+        handoff.chmod(0o600)
+        handoff.replace(copy_source_file)
         def following():
             return json.loads(command(BINARY, "status", "--dir", str(state), "--json"))["phase"] == "follow"
         wait(lambda: running_until(following), "copy and catchup to follow")
