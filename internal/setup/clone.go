@@ -5,6 +5,8 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"time"
 
 	"github.com/GetStream/pgmigrate/internal/postgres"
@@ -121,10 +123,10 @@ func waitClone(ctx context.Context, dsn string) (*pgx.Conn, error) {
 			_ = conn.Close(context.Background())
 		}
 		cancel()
-		// An endpoint may not exist yet, or its database may still be starting.
-		// Authentication/authorization/configuration errors need operator action.
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code != "57P03" {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if err != nil && !retryCloneConnection(err) {
 			return nil, fmt.Errorf("connect copy-source: %w", err)
 		}
 		timer := time.NewTimer(2 * time.Second)
@@ -135,6 +137,18 @@ func waitClone(ctx context.Context, dsn string) (*pgx.Conn, error) {
 		case <-timer.C:
 		}
 	}
+}
+
+// Only endpoint availability errors are transient. Retrying TLS or client
+// configuration errors forever hides the cause and retains source WAL forever.
+func retryCloneConnection(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "57P03" // server is still starting
+	}
+	var networkError net.Error
+	return errors.As(err, &networkError) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func cloneSeedLSN(ctx context.Context, source, clone *pgx.Conn) (string, error) {

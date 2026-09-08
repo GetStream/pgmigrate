@@ -79,5 +79,8 @@ transactions that commit or abort across that boundary, subsequent writes,
 partitions, keyless rows, and exact final row equality. It also stops the clone
 before resuming replication and cutting over.
 
+`TestPGCloneSeedAtCommitEnd` separately checks the exact commit-end boundary;
+copy integration tests reject readers whose row-level security hides rows.
+
 This tests PostgreSQL recovery and CDC. AWS's seed-LSN functions require a separate
 run on RDS or Aurora.

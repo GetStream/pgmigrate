@@ -249,16 +249,6 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 	if err := postgres.EnsureProgressTable(ctx, target); err != nil {
 		return nil, fmt.Errorf("create target progress table: %w", err)
 	}
-	monitor, err := postgres.Connect(ctx, cfg.SourceDSN)
-	if err != nil {
-		return nil, fmt.Errorf("connect snapshot monitor: %w", err)
-	}
-	defer func() {
-		if !holderOwnsRepl && monitor != nil {
-			_ = monitor.Close(context.Background())
-		}
-	}()
-
 	snapshot := Snapshot{
 		SourceFingerprint: fingerprint,
 		Publication:       publication,
@@ -272,6 +262,7 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 	if snapshot.Name == "" {
 		return nil, errors.New("logical slot did not export a snapshot")
 	}
+	snapshotDSN := cfg.SourceDSN
 	var copyConn *pgx.Conn
 	if cfg.CopySourceDSN != "" {
 		// Only the slot's WAL retention is needed while AWS creates the clone.
@@ -288,12 +279,17 @@ func Run(ctx context.Context, cfg Config, state SnapshotState) (_ *Holder, err e
 				_ = copyConn.Close(context.Background())
 			}
 		}()
-		_ = monitor.Close(context.Background())
-		monitor, err = postgres.Connect(ctx, cfg.CopySourceDSN)
-		if err != nil {
-			return nil, fmt.Errorf("connect clone snapshot monitor: %w", err)
-		}
+		snapshotDSN = cfg.CopySourceDSN
 	}
+	monitor, err := postgres.Connect(ctx, snapshotDSN)
+	if err != nil {
+		return nil, fmt.Errorf("connect snapshot monitor: %w", err)
+	}
+	defer func() {
+		if !holderOwnsRepl {
+			_ = monitor.Close(context.Background())
+		}
+	}()
 	if err := writeSnapshotAtomic(cfg.Dir, snapshot); err != nil {
 		return nil, err
 	}

@@ -60,3 +60,10 @@ jobs:
         env:
           PG_MAJOR: ${{ matrix.postgres }}
         run: make clone-e2e
+      - name: Exact clone seed boundary
+        env:
+          PGTEST_MAJORS: ${{ matrix.postgres }}
+        run: go test -tags=integration ./internal/cdc -run '^TestPGCloneSeedAtCommitEnd$' -count=1
+      - name: Clone reader and setup regressions
+        if: matrix.postgres == 17
+        run: go test -tags=integration ./internal/copy ./internal/setup -run 'TestPG17(CopyReaderCannotSilentlyApplyRLS|CloneRejectsWrongEndpointAndCleansSetup)$' -count=1

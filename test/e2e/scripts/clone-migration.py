@@ -166,8 +166,8 @@ def main(directory):
         wait(lambda: subprocess.call(["docker", "exec", clone, "test", "-f", "/tmp/standby-ready"],
                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0,
              "real physical backup and recovery")
-        # A transaction ending immediately before recovery is paused exercises
-        # the inclusive recovery/exclusive logical-stream boundary.
+        # Include this commit in recovery before promoting. Exact equality
+        # with Commit.EndLSN is tested by TestPGCloneSeedAtCommitEnd.
         sql(source, "INSERT INTO items VALUES(30004,'last-replayed')")
         end = sql(source, "SELECT pg_current_wal_flush_lsn()")
         wait(lambda: sql(clone, "SELECT pg_last_wal_replay_lsn() >= '" + end + "'::pg_lsn") == "t",

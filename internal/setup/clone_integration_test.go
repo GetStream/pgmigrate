@@ -26,6 +26,7 @@ func TestPG17CloneRejectsWrongEndpointAndCleansSetup(t *testing.T) {
 	for _, test := range []struct{ name, dsn, want string }{
 		{"unrelated", clone.URI, "stale or unrelated"},
 		{"primary", source.URI, "no physical recovery seed LSN"},
+		{"TLS", strings.Replace(clone.URI, "sslmode=disable", "sslmode=require", 1), "server refused TLS connection"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			state := &snapshotState{}
