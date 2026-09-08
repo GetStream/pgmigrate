@@ -62,20 +62,22 @@ partition tree with its bounds and every index and constraint definition, readin
 sides on a pinned `search_path` so the two renderings are comparable. Run it only after
 traffic is paused and replication has drained.
 
-## Physical clone COPY with primary CDC
+## Copy from a physical clone
 
-Build pgmigrate, then run `python3 test/e2e/scripts/clone-migration.py` from the
-repository root. Set `PGMIGRATE_BIN` for another binary and `PG_MAJOR` for 16, 17,
-or 18. The matching Docker image supplies pg_dump/pg_restore. `make clone-e2e`
-builds the binary and runs the same test. The fixture uses isolated,
-randomly named Docker containers and removes them and their volumes on exit.
+```sh
+make clone-e2e
+# Select another PostgreSQL version:
+PG_MAJOR=18 make clone-e2e
+```
 
-It takes a real `pg_basebackup`, replays WAL on a standby, pauses at a measured
-recovery boundary, and promotes that database into an independent clone. It
-checks pre-clone commits, transactions that start before cloning and commit or
-abort afterward, post-clone INSERT/UPDATE/DELETE, partitions, keyless rows, exact
-source/target row equality, and resume/cutover after shutting down the clone.
-There are no mocked provider functions or synthetic LSNs. This validates the
-PostgreSQL physical recovery/CDC handoff, not AWS's proprietary implementations of
-`logical_seed_lsn()` or `aurora_volume_logical_start_lsn()`; a real AWS acceptance
-run is still needed to certify those managed-service integrations.
+Requires Docker and Python 3. The default is PostgreSQL 17; 16 and 18 are also
+tested in CI. The fixture uses matching PostgreSQL client tools in Docker and
+removes its containers and volumes on exit.
+
+The test takes a physical backup, replays WAL, and promotes the clone. It checks
+transactions that commit or abort across that boundary, subsequent writes,
+partitions, keyless rows, and exact final row equality. It also stops the clone
+before resuming replication and cutting over.
+
+This tests PostgreSQL recovery and CDC. AWS's seed-LSN functions require a separate
+run on RDS or Aurora.

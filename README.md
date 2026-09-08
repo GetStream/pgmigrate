@@ -568,50 +568,30 @@ large source transactions.
 DDL is neither replicated nor detected, so the source schema must be frozen for
 the whole run. Application writes may continue until you freeze them for cutover.
 
-## Copy from an RDS clone
+## Copy from a clone
 
-`--source` remains the original database for the replication slot, WAL, verification,
-and cutover. Optional `--copy-source` (or `PGMIGRATE_COPY_SOURCE`) supplies schema and
-bulk COPY from a **fresh, untouched physical clone**:
+Use `--copy-source` (or `PGMIGRATE_COPY_SOURCE`) to copy schema and table data
+from a fresh RDS PostgreSQL or Aurora PostgreSQL clone. WAL continues to come
+from `--source`.
+
+Start pgmigrate **before creating the clone**:
 
 ```sh
 pgmigrate run --source "$SOURCE_DSN" --copy-source "$CLONE_DSN" \
   --target "$TARGET_DSN" --dir ./migration
 ```
 
-Start the command **before taking the clone**. When it prints `Source slot ready`,
-create the RDS snapshot and restore it to the clone endpoint (or create an Aurora
-clone). The endpoint may initially be unavailable; pgmigrate waits for it and for
-recovery to finish. Provisioning the AWS instance remains an AWS operation; no AWS
-credentials, manually exported snapshot, or manually chosen LSN are needed by
-pgmigrate. Keep enough source WAL capacity for both clone creation and migration.
+When `Source slot ready` appears, create the clone in AWS at the supplied endpoint.
+pgmigrate waits for it, checks its recovery position, and coordinates COPY with
+source WAL automatically. No manual snapshot ID or LSN is needed.
 
-The tool stamps its publication with a fresh marker, requires that marker in the
-clone, reads the provider's seed LSN, and checks that the source slot retains the
-required stream. It then exports a **clone-local** repeatable-read snapshot for
-inventory, pg_dump, and every COPY worker. CDC starts at the clone seed on the
-original source; transactions committed before the seed are already in the copy,
-while transactions still open at that boundary are replayed when they commit.
-The primary's exported snapshot is released before waiting for the clone.
+Use an untouched clone of the same database, PostgreSQL major, and storage engine.
+Do not allow application writes or DDL on the clone. An older clone cannot be used:
+the source slot must exist before the clone is taken. AWS provisioning is separate
+from pgmigrate.
 
-Supported seed providers are RDS PostgreSQL's `rds_tools.logical_seed_lsn()`
-(`rds_tools` is enabled on the clone if needed), Aurora PostgreSQL's
-`aurora_volume_logical_start_lsn()`, and upstream PostgreSQL's
-`pg_last_wal_replay_lsn()` on a freshly promoted physical clone. The upstream
-value disappears on restart, so that clone must not restart before setup accepts
-it. Source and clone must use the same database name, PostgreSQL major and storage
-engine. RDS-to-Aurora clones, logical dumps, and arbitrary old clones are unsupported.
-See [AWS's RDS seeded replication procedure](https://aws.amazon.com/blogs/database/migrating-amazon-rds-for-postgresql-to-amazon-aurora-using-seeded-logical-replication/)
-and [Aurora's clone procedure](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraPostgreSQL.MajorVersionUpgrade.html).
-
-The clone must have **no application writes, DDL, or active subscriptions** from
-restoration until COPY finishes. A seed LSN describes the restored data, not any
-later changes made on the clone; pgmigrate cannot infer or repair those changes.
-Source DDL must remain frozen as in a normal migration. A failed/interrupted base
-copy follows the existing restart policy: a new slot and a **new clone** are
-required. Once COPY finishes, resume and cutover need only the original source and
-target; the clone can be removed. The controller UI does not expose clone setup;
-use the CLI for this workflow.
+The clone can be deleted after COPY finishes. Restarting an incomplete COPY
+requires a new clone; restarting after COPY needs only the source and target.
 
 ## Table filters
 
